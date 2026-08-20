@@ -7,11 +7,12 @@ Required pre-release checks:
 
 ```bash
 cargo fmt --all -- --check
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo check --workspace --all-features --locked
+cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo audit
 cargo deny check
+cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/mesh-coverage.lcov --fail-under-lines 45
 ```
 
 Release folders are produced with:
@@ -37,6 +38,11 @@ The release folder must include:
 - `docs/`
 - `config/`
 
+Native participant-client installers are produced from the release binary with
+`scripts/package-linux.sh`, `scripts/package-macos.sh`, and
+`scripts/package-windows.ps1`. Each packager validates the resulting DEB, PKG,
+or MSI structure before it is uploaded.
+
 Before publishing a public release:
 
 - Generate and publish SHA-256 checksums for every binary and packaged archive.
@@ -51,8 +57,8 @@ GitHub release process:
 - Pushing a `v*` tag runs `.github/workflows/release.yml`.
 - The workflow builds Windows x86_64, Linux x86_64, and macOS arm64 release
   artifacts.
-- Each artifact is packaged with documentation/config examples and a `.sha256`
-  checksum.
+- Each platform publishes both a full archive and a native participant-client
+  installer (DEB, MSI, or PKG), with a `.sha256` checksum for each.
 - The workflow creates a draft prerelease so checksums, release notes, and
   signing status can be reviewed before publishing.
 

@@ -68,6 +68,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "async-trait"
+version = "0.1.92"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,6 +662,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1032,13 +1049,18 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mesh"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
+ "mesh-ai",
  "mesh-core",
+ "mesh-gpu",
  "mesh-ledger",
+ "mesh-model",
  "mesh-protocol",
+ "mesh-transport",
  "reqwest",
  "serde",
  "serde_json",
@@ -1048,16 +1070,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-ai"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "mesh-gpu",
+ "mesh-model",
+ "mesh-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mesh-coordinator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "mesh-ai",
  "mesh-core",
+ "mesh-gpu",
  "mesh-ledger",
+ "mesh-model",
  "mesh-protocol",
+ "reqwest",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -1067,11 +1106,12 @@ dependencies = [
 
 [[package]]
 name = "mesh-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
  "ed25519-dalek",
+ "mesh-gpu",
  "mesh-protocol",
  "rand_core 0.6.4",
  "serde",
@@ -1080,8 +1120,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-gpu"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "mesh-integration-tests"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "mesh-core",
@@ -1095,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-ledger"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1112,8 +1162,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-model"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "mesh-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1123,8 +1186,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-transport"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bytes",
+ "mesh-model",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "mesh-validator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",

@@ -4,13 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 mesh-core = { path = "../mesh-core" }
+mesh-ai = { path = "../mesh-ai" }
+mesh-gpu = { path = "../mesh-gpu" }
 mesh-ledger = { path = "../mesh-ledger" }
+mesh-model = { path = "../mesh-model" }
 mesh-protocol = { path = "../mesh-protocol" }
 rusqlite.workspace = true
 serde_json.workspace = true
@@ -18,3 +22,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+serde.workspace = true

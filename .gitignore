@@ -8,3 +8,4 @@ dist/
 validator-*.db
 .validator-*/
 validators.json
+*.profraw

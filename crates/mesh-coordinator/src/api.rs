@@ -4,7 +4,16 @@ use axum::{
     extract::{Path, State},
     routing::{get, post},
 };
+use mesh_ai::{
+    FailInferenceRequest, FailInferenceResponse, InferenceAssignment, InferenceJobStatus,
+    NodeProfile, PlanRequest, PlanResponse, PollInferenceRequest, PollInferenceResponse,
+    PromptOutput, RegisterModelRequest, RegisterModelResponse, ReportInferenceRequest,
+    ReportInferenceResponse, SubmitInferenceRequest, SubmitInferenceResponse,
+    fail_inference_body_hash, plan_body_hash, plan_parallelism, rank_candidates,
+    register_model_body_hash, report_inference_body_hash, submit_inference_body_hash,
+};
 use mesh_core::compute::{split_work, verify_work, work_cost_mcu};
+use mesh_gpu::{BackendKind, DeviceCapability};
 use mesh_ledger::{
     network::LedgerNetwork,
     types::{
@@ -13,6 +22,7 @@ use mesh_ledger::{
     },
     validate::claim_key,
 };
+use mesh_model::ModelManifest;
 use mesh_protocol::{
     BalanceResponse, DEFAULT_LEASE_SECONDS, HeartbeatRequest, JobStatusResponse,
     NetworkStatsResponse, NodeCapabilities, NodeStatusResponse, PollRequest, PollResponse,
@@ -23,6 +33,7 @@ use mesh_protocol::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -44,11 +55,504 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/nodes/{id}/balance", get(balance))
         .route("/v1/nodes/{id}", get(node_status))
         .route("/v1/network/stats", get(network_stats))
+        .route("/v1/ai/models", get(list_models))
+        .route("/v1/ai/models/register", post(register_model))
+        .route("/v1/ai/models/{model}/{revision}", get(get_model))
+        .route("/v1/ai/plan", post(plan_ai))
+        .route("/v1/ai/jobs/submit", post(submit_inference))
+        .route("/v1/ai/jobs/{id}", get(inference_status))
+        .route("/v1/ai/work/poll", post(poll_inference))
+        .route("/v1/ai/work/result", post(report_inference))
+        .route("/v1/ai/work/fail", post(fail_inference))
         .with_state(state)
 }
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn register_model(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterModelRequest>,
+) -> Result<Json<RegisterModelResponse>, ApiError> {
+    req.manifest
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let body_hash = register_model_body_hash(&req.manifest).map_err(ApiError::internal)?;
+    let digest = req
+        .manifest
+        .digest()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let json = serde_json::to_string(&req.manifest).map_err(ApiError::internal)?;
+    let conn = state.db.lock().map_err(ApiError::internal)?;
+    authenticate_known_node(&conn, &req.auth, "register_model", &body_hash)?;
+    conn.execute(
+        "INSERT INTO model_manifests(manifest_digest,model_id,revision,manifest_json,publisher_node_id,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(model_id,revision) DO UPDATE SET manifest_digest=excluded.manifest_digest,
+           manifest_json=excluded.manifest_json,publisher_node_id=excluded.publisher_node_id,created_at=excluded.created_at",
+        params![digest, req.manifest.model_id, req.manifest.revision, json, req.auth.node_id, now_unix()],
+    ).map_err(ApiError::internal)?;
+    Ok(Json(RegisterModelResponse {
+        manifest_digest: digest,
+        model_id: req.manifest.model_id,
+        revision: req.manifest.revision,
+    }))
+}
+
+async fn list_models(State(state): State<AppState>) -> Result<Json<Vec<ModelManifest>>, ApiError> {
+    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let mut statement = conn
+        .prepare("SELECT manifest_json FROM model_manifests ORDER BY model_id,revision")
+        .map_err(ApiError::internal)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(ApiError::internal)?;
+    let mut manifests = Vec::new();
+    for row in rows {
+        manifests.push(
+            serde_json::from_str(&row.map_err(ApiError::internal)?).map_err(ApiError::internal)?,
+        );
+    }
+    Ok(Json(manifests))
+}
+
+async fn get_model(
+    State(state): State<AppState>,
+    Path((model, revision)): Path<(String, String)>,
+) -> Result<Json<ModelManifest>, ApiError> {
+    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT manifest_json FROM model_manifests WHERE model_id=?1 AND revision=?2",
+            params![model, revision],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    let json = json.ok_or_else(|| ApiError::not_found("model revision not found"))?;
+    Ok(Json(
+        serde_json::from_str(&json).map_err(ApiError::internal)?,
+    ))
+}
+
+async fn plan_ai(
+    State(state): State<AppState>,
+    Json(req): Json<PlanRequest>,
+) -> Result<Json<PlanResponse>, ApiError> {
+    let body_hash = plan_body_hash(&req).map_err(ApiError::internal)?;
+    let (manifest, nodes) = {
+        let conn = state.db.lock().map_err(ApiError::internal)?;
+        authenticate_known_node(&conn, &req.auth, "plan_ai", &body_hash)?;
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT manifest_json FROM model_manifests WHERE model_id=?1 AND revision=?2",
+                params![req.model_id, req.revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ApiError::internal)?;
+        let manifest: ModelManifest = serde_json::from_str(
+            &json.ok_or_else(|| ApiError::not_found("model revision not found"))?,
+        )
+        .map_err(ApiError::internal)?;
+        let digest = manifest.digest().map_err(ApiError::internal)?;
+        let all_chunks: std::collections::BTreeSet<_> = manifest
+            .chunks
+            .iter()
+            .map(|chunk| chunk.sha256.clone())
+            .collect();
+        let mut statement = conn
+            .prepare(
+                "SELECT node_id,capabilities_json FROM nodes WHERE last_seen>=?1 AND node_id!=?2",
+            )
+            .map_err(ApiError::internal)?;
+        let rows = statement
+            .query_map(params![now_unix() - 30, req.auth.node_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(ApiError::internal)?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            let (node_id, capabilities_json) = row.map_err(ApiError::internal)?;
+            let capabilities: NodeCapabilities =
+                serde_json::from_str(&capabilities_json).map_err(ApiError::internal)?;
+            if !capabilities.ai_runtime_ready {
+                continue;
+            }
+            let devices = capabilities
+                .gpus
+                .iter()
+                .filter_map(protocol_gpu_to_device)
+                .collect();
+            let cached_chunks = if capabilities.cached_model_manifests.contains(&digest) {
+                all_chunks.clone()
+            } else {
+                Default::default()
+            };
+            nodes.push(NodeProfile {
+                node_id,
+                devices,
+                cached_chunks,
+                network_latency_ms: (capabilities.coordinator_latency_micros as f64 / 1000.0)
+                    .max(0.1),
+                bandwidth_mbps: (capabilities.model_bandwidth_kbps as f64 / 1000.0).max(0.001),
+                load_fraction: (capabilities.accelerator_load_permille.min(1000) as f64) / 1000.0,
+                recent_failures: 0,
+                online: true,
+            });
+        }
+        (manifest, nodes)
+    };
+    let candidates = rank_candidates(&manifest, &req.requirements, &nodes, &req.excluded_nodes);
+    if candidates.is_empty() {
+        return Err(ApiError::conflict("no eligible AI devices are online"));
+    }
+    let plan = plan_parallelism(&candidates, req.layer_count, &req.requirements)
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    Ok(Json(PlanResponse {
+        manifest_digest: manifest.digest().map_err(ApiError::internal)?,
+        candidates,
+        plan,
+    }))
+}
+
+fn protocol_gpu_to_device(gpu: &mesh_protocol::GpuCapability) -> Option<DeviceCapability> {
+    let backend = match gpu.backend.to_ascii_lowercase().as_str() {
+        "cuda" => BackendKind::Cuda,
+        "rocm" | "hip" => BackendKind::Rocm,
+        "metal" => BackendKind::Metal,
+        "cpu" => BackendKind::Cpu,
+        _ => return None,
+    };
+    Some(DeviceCapability {
+        stable_id: gpu.stable_id.clone(),
+        backend,
+        vendor: gpu.vendor.clone(),
+        name: gpu.name.clone(),
+        memory_bytes: gpu.memory_mb.map(|mb| mb * 1024 * 1024),
+        driver_version: gpu.driver_version.clone(),
+        compute_version: gpu.compute_version.clone(),
+        supports_fp16: gpu.supports_fp16,
+        supports_bf16: gpu.supports_bf16,
+        supports_int8: gpu.supports_int8,
+    })
+}
+
+async fn submit_inference(
+    State(state): State<AppState>,
+    Json(req): Json<SubmitInferenceRequest>,
+) -> Result<Json<SubmitInferenceResponse>, ApiError> {
+    req.validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let body_hash = submit_inference_body_hash(&req).map_err(ApiError::internal)?;
+    let mut conn = state.db.lock().map_err(ApiError::internal)?;
+    authenticate_known_node(&conn, &req.auth, "submit_inference", &body_hash)?;
+    let (manifest, nodes, seed_peers) =
+        ai_context(&conn, &req.auth.node_id, &req.model_id, &req.revision)?;
+    let digest = manifest.digest().map_err(ApiError::internal)?;
+    let candidates = rank_candidates(&manifest, &req.requirements, &nodes, &Default::default());
+    if candidates.is_empty() {
+        return Err(ApiError::conflict("no eligible AI devices are online"));
+    }
+    let plan = plan_parallelism(&candidates, req.layer_count, &req.requirements)
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    let job_id = format!("ai_{}", Uuid::new_v4().simple());
+    let transaction = conn.transaction().map_err(ApiError::internal)?;
+    transaction.execute(
+        "INSERT INTO ai_jobs(job_id,requester_node_id,request_json,plan_json,manifest_digest,status,created_at)
+         VALUES(?1,?2,?3,?4,?5,'pending',?6)",
+        params![job_id, req.auth.node_id, serde_json::to_string(&req).map_err(ApiError::internal)?,
+            serde_json::to_string(&plan).map_err(ApiError::internal)?, digest, now_unix()],
+    ).map_err(ApiError::internal)?;
+    for (index, batch) in plan.batches.iter().enumerate() {
+        let prompts = (batch.batch_start..batch.batch_end)
+            .map(|prompt_index| (prompt_index, req.prompts[prompt_index as usize].clone()))
+            .collect();
+        let assignment = InferenceAssignment {
+            assignment_id: format!("aiasg_{}_{}", &job_id[3..19], index),
+            job_id: job_id.clone(),
+            manifest: manifest.clone(),
+            seed_peers: seed_peers.clone(),
+            prompts,
+            max_tokens: req.max_tokens,
+            temperature_milli: req.temperature_milli,
+            seed: req.seed,
+            device_id: batch.device_id.clone(),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+        };
+        transaction.execute(
+            "INSERT INTO ai_assignments(assignment_id,job_id,assigned_node_id,assignment_json,status)
+             VALUES(?1,?2,?3,?4,'pending')",
+            params![assignment.assignment_id, job_id, batch.node_id, serde_json::to_string(&assignment).map_err(ApiError::internal)?],
+        ).map_err(ApiError::internal)?;
+    }
+    transaction.commit().map_err(ApiError::internal)?;
+    Ok(Json(SubmitInferenceResponse {
+        job_id,
+        manifest_digest: digest,
+        assignments: plan.batches.len() as u32,
+        plan,
+    }))
+}
+
+async fn poll_inference(
+    State(state): State<AppState>,
+    Json(req): Json<PollInferenceRequest>,
+) -> Result<Json<PollInferenceResponse>, ApiError> {
+    let conn = state.db.lock().map_err(ApiError::internal)?;
+    authenticate_known_node(&conn, &req.auth, "poll_inference", &empty_body_hash())?;
+    let now = now_unix();
+    conn.execute("UPDATE ai_assignments SET status='pending',lease_until=NULL WHERE status='leased' AND lease_until<?1", params![now]).map_err(ApiError::internal)?;
+    let row: Option<(String, String)> = conn.query_row(
+        "SELECT assignment_id,assignment_json FROM ai_assignments WHERE assigned_node_id=?1 AND status='pending' ORDER BY rowid LIMIT 1",
+        params![req.auth.node_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(ApiError::internal)?;
+    let Some((assignment_id, json)) = row else {
+        return Ok(Json(PollInferenceResponse { assignment: None }));
+    };
+    let updated = conn.execute(
+        "UPDATE ai_assignments SET status='leased',lease_until=?2 WHERE assignment_id=?1 AND status='pending'",
+        params![assignment_id, now + DEFAULT_LEASE_SECONDS],
+    ).map_err(ApiError::internal)?;
+    if updated == 0 {
+        return Ok(Json(PollInferenceResponse { assignment: None }));
+    }
+    Ok(Json(PollInferenceResponse {
+        assignment: Some(serde_json::from_str(&json).map_err(ApiError::internal)?),
+    }))
+}
+
+async fn report_inference(
+    State(state): State<AppState>,
+    Json(req): Json<ReportInferenceRequest>,
+) -> Result<Json<ReportInferenceResponse>, ApiError> {
+    if req.outputs.is_empty() {
+        return Err(ApiError::bad_request("outputs are empty"));
+    }
+    for output in &req.outputs {
+        output
+            .validate()
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    }
+    let body_hash = report_inference_body_hash(&req).map_err(ApiError::internal)?;
+    let mut conn = state.db.lock().map_err(ApiError::internal)?;
+    authenticate_known_node(&conn, &req.auth, "report_inference", &body_hash)?;
+    let row: Option<(String, String, String)> = conn.query_row(
+        "SELECT job_id,assignment_json,status FROM ai_assignments WHERE assignment_id=?1 AND assigned_node_id=?2",
+        params![req.assignment_id, req.auth.node_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional().map_err(ApiError::internal)?;
+    let Some((job_id, assignment_json, status)) = row else {
+        return Err(ApiError::not_found("AI assignment not found"));
+    };
+    if status != "leased" {
+        return Err(ApiError::conflict(
+            "AI assignment is not leased to this node",
+        ));
+    }
+    let assignment: InferenceAssignment =
+        serde_json::from_str(&assignment_json).map_err(ApiError::internal)?;
+    let expected: std::collections::BTreeSet<_> =
+        assignment.prompts.iter().map(|(index, _)| *index).collect();
+    let actual: std::collections::BTreeSet<_> = req
+        .outputs
+        .iter()
+        .map(|output| output.prompt_index)
+        .collect();
+    if actual != expected || actual.len() != req.outputs.len() {
+        return Err(ApiError::conflict(
+            "output indexes do not match the assignment",
+        ));
+    }
+    let transaction = conn.transaction().map_err(ApiError::internal)?;
+    transaction.execute(
+        "UPDATE ai_assignments SET status='completed',outputs_json=?2,lease_until=NULL,completed_at=?3 WHERE assignment_id=?1",
+        params![req.assignment_id, serde_json::to_string(&req.outputs).map_err(ApiError::internal)?, now_unix()],
+    ).map_err(ApiError::internal)?;
+    let remaining: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM ai_assignments WHERE job_id=?1 AND status!='completed'",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    if remaining == 0 {
+        transaction
+            .execute(
+                "UPDATE ai_jobs SET status='completed',completed_at=?2 WHERE job_id=?1",
+                params![job_id, now_unix()],
+            )
+            .map_err(ApiError::internal)?;
+    }
+    transaction.commit().map_err(ApiError::internal)?;
+    Ok(Json(ReportInferenceResponse {
+        accepted: true,
+        job_completed: remaining == 0,
+    }))
+}
+
+async fn fail_inference(
+    State(state): State<AppState>,
+    Json(req): Json<FailInferenceRequest>,
+) -> Result<Json<FailInferenceResponse>, ApiError> {
+    if req.reason.is_empty() || req.reason.len() > 4096 {
+        return Err(ApiError::bad_request("invalid failure reason"));
+    }
+    let body_hash = fail_inference_body_hash(&req).map_err(ApiError::internal)?;
+    let conn = state.db.lock().map_err(ApiError::internal)?;
+    authenticate_known_node(&conn, &req.auth, "fail_inference", &body_hash)?;
+    let row: Option<(String, String, String, String, i64)> = conn.query_row(
+        "SELECT a.job_id,j.request_json,a.assignment_json,a.failed_nodes_json,a.failure_count FROM ai_assignments a JOIN ai_jobs j ON j.job_id=a.job_id WHERE a.assignment_id=?1 AND a.assigned_node_id=?2",
+        params![req.assignment_id, req.auth.node_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).optional().map_err(ApiError::internal)?;
+    let Some((_job_id, request_json, assignment_json, failed_nodes_json, failures)) = row else {
+        return Err(ApiError::not_found("AI assignment not found"));
+    };
+    let original: SubmitInferenceRequest =
+        serde_json::from_str(&request_json).map_err(ApiError::internal)?;
+    let (manifest, nodes, _) = ai_context(
+        &conn,
+        &original.auth.node_id,
+        &original.model_id,
+        &original.revision,
+    )?;
+    let mut excluded: std::collections::BTreeSet<String> =
+        serde_json::from_str(&failed_nodes_json).map_err(ApiError::internal)?;
+    excluded.insert(req.auth.node_id.clone());
+    let next = rank_candidates(&manifest, &original.requirements, &nodes, &excluded)
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::conflict("no failover AI device is available"))?;
+    let mut assignment: InferenceAssignment =
+        serde_json::from_str(&assignment_json).map_err(ApiError::internal)?;
+    assignment.device_id.clone_from(&next.device_id);
+    conn.execute(
+        "UPDATE ai_assignments SET assigned_node_id=?2,assignment_json=?3,failed_nodes_json=?4,status='pending',lease_until=NULL,failure_count=failure_count+1 WHERE assignment_id=?1",
+        params![req.assignment_id, next.node_id, serde_json::to_string(&assignment).map_err(ApiError::internal)?, serde_json::to_string(&excluded).map_err(ApiError::internal)?],
+    ).map_err(ApiError::internal)?;
+    Ok(Json(FailInferenceResponse {
+        rerouted_to: next.node_id,
+        attempt: failures as u32 + 2,
+    }))
+}
+
+async fn inference_status(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<InferenceJobStatus>, ApiError> {
+    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM ai_jobs WHERE job_id=?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    let status = status.ok_or_else(|| ApiError::not_found("AI job not found"))?;
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ai_assignments WHERE job_id=?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    let completed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ai_assignments WHERE job_id=?1 AND status='completed'",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT outputs_json FROM ai_assignments WHERE job_id=?1 AND outputs_json IS NOT NULL",
+        )
+        .map_err(ApiError::internal)?;
+    let rows = statement
+        .query_map(params![job_id], |row| row.get::<_, String>(0))
+        .map_err(ApiError::internal)?;
+    let mut outputs: Vec<PromptOutput> = Vec::new();
+    for row in rows {
+        outputs.extend(
+            serde_json::from_str::<Vec<PromptOutput>>(&row.map_err(ApiError::internal)?)
+                .map_err(ApiError::internal)?,
+        );
+    }
+    outputs.sort_by_key(|output| output.prompt_index);
+    Ok(Json(InferenceJobStatus {
+        job_id,
+        status,
+        total_assignments: total as u32,
+        completed_assignments: completed as u32,
+        outputs,
+    }))
+}
+
+fn ai_context(
+    conn: &Connection,
+    requester_node_id: &str,
+    model_id: &str,
+    revision: &str,
+) -> Result<(ModelManifest, Vec<NodeProfile>, Vec<String>), ApiError> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT manifest_json FROM model_manifests WHERE model_id=?1 AND revision=?2",
+            params![model_id, revision],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    let manifest: ModelManifest =
+        serde_json::from_str(&json.ok_or_else(|| ApiError::not_found("model revision not found"))?)
+            .map_err(ApiError::internal)?;
+    let digest = manifest.digest().map_err(ApiError::internal)?;
+    let all_chunks: std::collections::BTreeSet<_> = manifest
+        .chunks
+        .iter()
+        .map(|chunk| chunk.sha256.clone())
+        .collect();
+    let mut statement = conn
+        .prepare("SELECT node_id,capabilities_json FROM nodes WHERE last_seen>=?1 AND node_id!=?2")
+        .map_err(ApiError::internal)?;
+    let rows = statement
+        .query_map(params![now_unix() - 30, requester_node_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(ApiError::internal)?;
+    let mut nodes = Vec::new();
+    let mut seed_peers = Vec::new();
+    for row in rows {
+        let (node_id, json) = row.map_err(ApiError::internal)?;
+        let capabilities: NodeCapabilities =
+            serde_json::from_str(&json).map_err(ApiError::internal)?;
+        if !capabilities.ai_runtime_ready {
+            continue;
+        }
+        let cached = capabilities.cached_model_manifests.contains(&digest);
+        if cached && let Some(url) = &capabilities.model_seed_url {
+            seed_peers.push(url.clone());
+        }
+        nodes.push(NodeProfile {
+            node_id,
+            devices: capabilities
+                .gpus
+                .iter()
+                .filter_map(protocol_gpu_to_device)
+                .collect(),
+            cached_chunks: if cached {
+                all_chunks.clone()
+            } else {
+                Default::default()
+            },
+            network_latency_ms: (capabilities.coordinator_latency_micros as f64 / 1000.0).max(0.1),
+            bandwidth_mbps: (capabilities.model_bandwidth_kbps as f64 / 1000.0).max(0.001),
+            load_fraction: capabilities.accelerator_load_permille.min(1000) as f64 / 1000.0,
+            recent_failures: 0,
+            online: true,
+        });
+    }
+    Ok((manifest, nodes, seed_peers))
 }
 
 async fn register(
@@ -736,6 +1240,221 @@ fn cache_balance(state: &AppState, node_id: &str, balance: i64) -> Result<(), Ap
     )
     .map_err(ApiError::internal)?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod ai_api_tests {
+    use super::*;
+    use mesh_ai::{
+        FailInferenceRequest, InferenceRequirements, PollInferenceRequest, PromptOutput,
+        RegisterModelRequest, ReportInferenceRequest, SubmitInferenceRequest,
+        fail_inference_body_hash, register_model_body_hash, report_inference_body_hash,
+        submit_inference_body_hash,
+    };
+    use mesh_core::identity::NodeIdentity;
+    use mesh_model::{ChunkRef, ModelFormat, sha256};
+    use mesh_protocol::{RegisterRequest, register_body_hash};
+    use serde::{Serialize, de::DeserializeOwned};
+    use std::fs;
+
+    #[tokio::test]
+    async fn distributed_ai_job_reroutes_and_completes() {
+        let root = std::env::temp_dir().join(format!("mesh-ai-api-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("coordinator.db");
+        let state = AppState {
+            db: Arc::new(Mutex::new(
+                crate::db::open(db_path.to_str().unwrap()).unwrap(),
+            )),
+            ledger: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let base = format!("http://{address}");
+        let requester = NodeIdentity::load_or_create(&root.join("requester")).unwrap();
+        let worker_a = NodeIdentity::load_or_create(&root.join("worker-a")).unwrap();
+        let worker_b = NodeIdentity::load_or_create(&root.join("worker-b")).unwrap();
+        register_test_node(&base, &requester, test_capabilities(false, 0)).await;
+        register_test_node(&base, &worker_a, test_capabilities(true, 1_000)).await;
+        register_test_node(&base, &worker_b, test_capabilities(true, 2_000)).await;
+
+        let manifest = ModelManifest {
+            schema_version: 1,
+            model_id: "tiny".into(),
+            revision: "v1".into(),
+            format: ModelFormat::Gguf,
+            architecture: "llama".into(),
+            parameter_count: Some(1),
+            tensor_dtype: Some("q4".into()),
+            total_size_bytes: 1,
+            chunks: vec![ChunkRef {
+                index: 0,
+                sha256: sha256(b"x"),
+                size_bytes: 1,
+            }],
+            metadata: Default::default(),
+        };
+        let hash = register_model_body_hash(&manifest).unwrap();
+        let publish = RegisterModelRequest {
+            auth: requester.auth("register_model", &hash),
+            manifest: manifest.clone(),
+        };
+        let _: RegisterModelResponse = post(&base, "/v1/ai/models/register", &publish).await;
+
+        let mut submit = SubmitInferenceRequest {
+            auth: requester.auth("unused", &empty_body_hash()),
+            model_id: "tiny".into(),
+            revision: "v1".into(),
+            prompts: vec!["hello".into()],
+            max_tokens: 4,
+            temperature_milli: 0,
+            seed: 7,
+            requirements: InferenceRequirements {
+                required_backends: [BackendKind::Cuda].into_iter().collect(),
+                minimum_memory_bytes: 1,
+                needs_fp16: true,
+                needs_bf16: false,
+                needs_int8: false,
+                batch_size: 1,
+                pipeline_stages: 1,
+                tensor_parallelism: 1,
+            },
+            layer_count: 2,
+        };
+        submit.auth = requester.auth(
+            "submit_inference",
+            &submit_inference_body_hash(&submit).unwrap(),
+        );
+        let submitted: SubmitInferenceResponse = post(&base, "/v1/ai/jobs/submit", &submit).await;
+        assert_eq!(submitted.assignments, 1);
+
+        let poll_a = PollInferenceRequest {
+            auth: worker_a.auth("poll_inference", &empty_body_hash()),
+        };
+        let leased: PollInferenceResponse = post(&base, "/v1/ai/work/poll", &poll_a).await;
+        let assignment = leased.assignment.unwrap();
+        let mut failure = FailInferenceRequest {
+            auth: worker_a.auth("unused", &empty_body_hash()),
+            assignment_id: assignment.assignment_id.clone(),
+            reason: "device lost".into(),
+        };
+        failure.auth = worker_a.auth(
+            "fail_inference",
+            &fail_inference_body_hash(&failure).unwrap(),
+        );
+        let rerouted: FailInferenceResponse = post(&base, "/v1/ai/work/fail", &failure).await;
+        assert_eq!(rerouted.rerouted_to, worker_b.node_id());
+
+        let poll_b = PollInferenceRequest {
+            auth: worker_b.auth("poll_inference", &empty_body_hash()),
+        };
+        let leased: PollInferenceResponse = post(&base, "/v1/ai/work/poll", &poll_b).await;
+        assert_eq!(
+            leased.assignment.unwrap().assignment_id,
+            assignment.assignment_id
+        );
+        let output = PromptOutput {
+            prompt_index: 0,
+            text: "world".into(),
+            output_sha256: mesh_protocol::hash_bytes(b"world"),
+            duration_ms: 1,
+        };
+        let mut report = ReportInferenceRequest {
+            auth: worker_b.auth("unused", &empty_body_hash()),
+            assignment_id: assignment.assignment_id,
+            outputs: vec![output.clone()],
+        };
+        report.auth = worker_b.auth(
+            "report_inference",
+            &report_inference_body_hash(&report).unwrap(),
+        );
+        let accepted: ReportInferenceResponse = post(&base, "/v1/ai/work/result", &report).await;
+        assert!(accepted.job_completed);
+        let status: InferenceJobStatus =
+            reqwest::get(format!("{base}/v1/ai/jobs/{}", submitted.job_id))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(status.outputs, vec![output]);
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn register_test_node(
+        base: &str,
+        identity: &NodeIdentity,
+        capabilities: NodeCapabilities,
+    ) {
+        let public_key_b64 = identity.public_key_b64();
+        let hash = register_body_hash(&public_key_b64, &capabilities).unwrap();
+        let request = RegisterRequest {
+            auth: identity.auth("register", &hash),
+            public_key_b64,
+            capabilities,
+        };
+        let _: RegisterResponse = post(base, "/v1/nodes/register", &request).await;
+    }
+
+    fn test_capabilities(ai_ready: bool, latency: u64) -> NodeCapabilities {
+        NodeCapabilities {
+            protocol_version: mesh_protocol::PROTOCOL_VERSION,
+            hostname: "test".into(),
+            os: "test".into(),
+            arch: "test".into(),
+            cpu_brand: "test".into(),
+            logical_cpus: 1,
+            total_memory_bytes: 1024,
+            cpu_benchmark_score: 1,
+            gpus: if ai_ready {
+                vec![mesh_protocol::GpuCapability {
+                    stable_id: format!("gpu-{latency}"),
+                    vendor: "nvidia".into(),
+                    name: "test".into(),
+                    backend: "cuda".into(),
+                    memory_mb: Some(1024),
+                    driver_version: None,
+                    compute_version: Some("8.0".into()),
+                    supports_fp16: true,
+                    supports_bf16: true,
+                    supports_int8: true,
+                    benchmark_bytes_per_second: Some(1),
+                    benchmark_p95_micros: Some(1),
+                }]
+            } else {
+                Vec::new()
+            },
+            model_seed_url: ai_ready.then(|| format!("http://seed-{latency}")),
+            cached_model_manifests: Vec::new(),
+            coordinator_latency_micros: latency,
+            model_bandwidth_kbps: 100_000,
+            accelerator_load_permille: 0,
+            ai_runtime_ready: ai_ready,
+        }
+    }
+
+    async fn post<T: Serialize + ?Sized, R: DeserializeOwned>(
+        base: &str,
+        path: &str,
+        body: &T,
+    ) -> R {
+        let response = reqwest::Client::new()
+            .post(format!("{base}{path}"))
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {text}");
+        serde_json::from_str(&text).unwrap()
+    }
 }
 async fn authoritative_balance(
     state: &AppState,

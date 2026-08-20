@@ -1,49 +1,51 @@
 # Implementation Status
 
-## Functional source paths present
+## MESH Compute Core
 
-| Area | Status | Notes |
+| Area | Status | Evidence |
 |---|---|---|
-| Rust workspace | Implemented | 6 crates |
-| Node Ed25519 identity | Implemented | file-backed key |
-| Replay-resistant API auth | Implemented | timestamp + nonce |
-| CPU hardware discovery | Implemented | sysinfo |
-| GPU discovery | Partial | NVIDIA + Apple detection only |
-| Declarative workload runtime | Implemented | PrimeCount |
-| Multi-worker execution | Implemented | Tokio worker loops |
-| Scheduler leases/requeue | Implemented | SQLite |
-| Requester self-work exclusion | Implemented | scheduler + validator + audit invariant |
-| Local CU ledger | Implemented | development fallback |
-| Quorum ledger | Implemented | validators + certificates |
-| Escrow accounting | Implemented | job escrow accounts |
-| Community issuance cap | Implemented | validator-set policy |
-| Validator vote lock | Implemented | persistent per-height lock |
-| Duplicate reward prevention | Implemented | settlement claim keys |
-| Signed provider work metadata | Implemented | protocol v2 |
-| Reward-to-reservation binding | Implemented | validators split root workload |
-| Validator sync | Implemented | certificate catch-up |
-| Participant ledger mirror | Implemented | `mesh ledger-sync` |
-| Full offline ledger audit | Implemented | `mesh ledger-audit` |
-| TLS in binary | Not implemented | use reverse proxy today |
-| Full BFT view-change consensus | Not implemented | next production milestone |
-| Membership rotation/epochs | Not implemented | static pinned set today |
-| Coordinator/ledger crash saga | Implemented for reservation/reward intents | durable exact transaction + signed claim reconciliation; multi-coordinator BFT liveness remains |
-| CUDA compute runtime | Not implemented | discovery only |
-| ROCm runtime | Not implemented | roadmap |
-| Metal compute runtime | Not implemented | roadmap |
-| P2P model distribution | Not implemented | roadmap |
-| Distributed LLM inference | Not implemented | roadmap |
-| Consumer installers | Not implemented | build-release scripts included |
+| Identity and replay-resistant authentication | Implemented | Ed25519 signatures, timestamp/nonce checks, replay tests |
+| Declarative CPU workload execution | Implemented | `PrimeCount`, sharding, deterministic verification |
+| Work leases and failure requeue | Implemented | Coordinator SQLite state and process tests |
+| Contribution-first CU accounting | Implemented | Reservation/escrow/reward invariants |
+| Replicated validator ledger | Implemented | Hash-linked entries and quorum certificates |
+| Crash-safe settlement intents | Implemented | Recovery integration test |
+| Client mirror and offline audit | Implemented | Validator quorum sync/audit commands |
+| BFT leader/view change | Not implemented | Static validator coordination remains |
+| Validator membership epochs | Not implemented | Validator set is pinned |
 
-## Validation status of this archive
+## MESH AI
 
-Static repository validation was performed while generating the package:
+| Component | Status | Evidence / boundary |
+|---|---|---|
+| Model registry | Implemented | Local and coordinator SQLite registries; authenticated publication |
+| Content-addressed chunks | Implemented | SHA-256 paths, atomic import, deduplication, read verification |
+| Peer-to-peer model seeding | Implemented | Peer HTTP server/client, integrity checks, rarest-first planner |
+| CUDA backend | Implemented adapter | NVIDIA discovery; feature-gated llama.cpp adapter; requires a CUDA llama.cpp build |
+| ROCm backend | Implemented adapter | ROCm discovery; feature-gated llama.cpp adapter; requires a HIP/ROCm llama.cpp build |
+| Metal backend | Implemented adapter | Metal discovery; feature-gated llama.cpp adapter; requires macOS and a Metal llama.cpp build |
+| GGUF manifests | Implemented | Schema and magic-header validation |
+| Safetensors manifests | Implemented | Schema and header-length validation |
+| GPU capability benchmark | Implemented | Capability report, host-transfer baseline, real-model `llama-bench` adapter |
+| Latency-aware scheduler | Implemented | Backend/VRAM/dtype/cache/RTT/bandwidth/load/failure scoring |
+| Batch parallelism | Implemented end-to-end | Distributed prompt assignments executed by participant daemons |
+| Pipeline parallelism | Implemented control/data plane | Complete layer plans and ordered tensor transport; partial-layer kernels require a runtime plugin |
+| Model/tensor parallelism | Implemented control/data plane | Contiguous ranks and tensor transport; collective kernels require a runtime plugin |
+| Tensor transport | Implemented | Checksums, ordered delivery, replay/window checks, HTTP route failover |
+| Failure-aware rerouting | Implemented | Persistent failed-node exclusions and device-correct reassignment |
 
-- required files present,
-- JSON configuration parses,
-- Cargo TOML files parse,
-- workspace crate paths exist,
-- source/archive checksum generation,
-- no generated target/build directory included.
+## Distribution
 
-The generation environment did **not** provide `cargo`/`rustc`, so compiler verification is intentionally left as the first Codex CLI task. See `CODEX_HANDOFF.md`.
+| Component | Status | Evidence / boundary |
+|---|---|---|
+| Windows installer | Implemented | WiX-built MSI, ICE validation, administrative extraction, client execution smoke test |
+| macOS installer | Implemented | Native PKG, payload inspection, extracted client execution smoke test |
+| Linux installer | Implemented | Native DEB, metadata/content validation, extracted client execution smoke test |
+| Release integrity | Implemented | Per-artifact SHA-256 checksums and CycloneDX SBOM |
+| Platform signing | Deployment configuration required | Installers are unsigned until release signing identities are supplied |
+
+## Verification
+
+The workspace is pinned to Rust 1.97.1. CI runs format, check, tests, and Clippy on Windows, Linux, and macOS; separately compiles/tests CUDA, ROCm, and Metal adapter features; enforces measured coverage; audits dependencies; checks policy; emits per-crate CycloneDX SBOMs; and extracts/runs every native installer.
+
+Hardware claims are deliberately scoped. Unit and process tests prove MESH-owned logic. Actual GPU execution also requires the matching device, driver, and backend-enabled llama.cpp binaries. A platform that was not physically exercised is never reported as hardware-validated.

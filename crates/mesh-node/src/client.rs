@@ -1,5 +1,13 @@
 use anyhow::{Context, Result, bail};
+use mesh_ai::{
+    FailInferenceRequest, FailInferenceResponse, InferenceJobStatus, PlanRequest, PlanResponse,
+    PollInferenceRequest, PollInferenceResponse, RegisterModelRequest, RegisterModelResponse,
+    ReportInferenceRequest, ReportInferenceResponse, SubmitInferenceRequest,
+    SubmitInferenceResponse, fail_inference_body_hash, plan_body_hash, register_model_body_hash,
+    report_inference_body_hash, submit_inference_body_hash,
+};
 use mesh_core::identity::NodeIdentity;
+use mesh_model::ModelManifest;
 use mesh_protocol::{
     BalanceResponse, ErrorResponse, HeartbeatRequest, JobStatusResponse, NetworkStatsResponse,
     NodeCapabilities, NodeStatusResponse, PollRequest, PollResponse, RegisterRequest,
@@ -110,6 +118,71 @@ impl MeshClient {
 
     pub async fn network_stats(&self) -> Result<NetworkStatsResponse> {
         self.get("/v1/network/stats").await
+    }
+
+    pub async fn register_model(&self, manifest: &ModelManifest) -> Result<RegisterModelResponse> {
+        let body_hash = register_model_body_hash(manifest)?;
+        let request = RegisterModelRequest {
+            auth: self.identity.auth("register_model", &body_hash),
+            manifest: manifest.clone(),
+        };
+        self.post("/v1/ai/models/register", &request).await
+    }
+
+    pub async fn plan_ai(&self, mut request: PlanRequest) -> Result<PlanResponse> {
+        let body_hash = plan_body_hash(&request)?;
+        request.auth = self.identity.auth("plan_ai", &body_hash);
+        self.post("/v1/ai/plan", &request).await
+    }
+
+    pub async fn submit_inference(
+        &self,
+        mut request: SubmitInferenceRequest,
+    ) -> Result<SubmitInferenceResponse> {
+        let body_hash = submit_inference_body_hash(&request)?;
+        request.auth = self.identity.auth("submit_inference", &body_hash);
+        self.post("/v1/ai/jobs/submit", &request).await
+    }
+
+    pub async fn poll_inference(&self) -> Result<PollInferenceResponse> {
+        let request = PollInferenceRequest {
+            auth: self.identity.auth("poll_inference", &empty_body_hash()),
+        };
+        self.post("/v1/ai/work/poll", &request).await
+    }
+
+    pub async fn report_inference(
+        &self,
+        assignment_id: String,
+        outputs: Vec<mesh_ai::PromptOutput>,
+    ) -> Result<ReportInferenceResponse> {
+        let mut request = ReportInferenceRequest {
+            auth: self.identity.auth("unused", &empty_body_hash()),
+            assignment_id,
+            outputs,
+        };
+        let body_hash = report_inference_body_hash(&request)?;
+        request.auth = self.identity.auth("report_inference", &body_hash);
+        self.post("/v1/ai/work/result", &request).await
+    }
+
+    pub async fn fail_inference(
+        &self,
+        assignment_id: String,
+        reason: String,
+    ) -> Result<FailInferenceResponse> {
+        let mut request = FailInferenceRequest {
+            auth: self.identity.auth("unused", &empty_body_hash()),
+            assignment_id,
+            reason,
+        };
+        let body_hash = fail_inference_body_hash(&request)?;
+        request.auth = self.identity.auth("fail_inference", &body_hash);
+        self.post("/v1/ai/work/fail", &request).await
+    }
+
+    pub async fn inference_status(&self, job_id: &str) -> Result<InferenceJobStatus> {
+        self.get(&format!("/v1/ai/jobs/{job_id}")).await
     }
 
     async fn post<TReq: serde::Serialize + ?Sized, TResp: DeserializeOwned>(

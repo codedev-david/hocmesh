@@ -670,6 +670,12 @@ fn capabilities() -> NodeCapabilities {
         total_memory_bytes: 8 * 1024 * 1024 * 1024,
         cpu_benchmark_score: 1_000,
         gpus: Vec::new(),
+        model_seed_url: None,
+        cached_model_manifests: Vec::new(),
+        coordinator_latency_micros: 0,
+        model_bandwidth_kbps: 100_000,
+        accelerator_load_permille: 0,
+        ai_runtime_ready: false,
     }
 }
 
@@ -677,6 +683,7 @@ fn build_bins(workspace: &Path) -> Result<()> {
     run_ok(
         Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
             .arg("build")
+            .arg("--ignore-rust-version")
             .arg("--workspace")
             .arg("--bins")
             .current_dir(workspace),

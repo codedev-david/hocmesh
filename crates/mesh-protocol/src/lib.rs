@@ -4,16 +4,24 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const AUTH_MAX_CLOCK_SKEW_SECS: i64 = 300;
 pub const DEFAULT_LEASE_SECONDS: i64 = 900;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GpuCapability {
+    pub stable_id: String,
     pub vendor: String,
     pub name: String,
     pub backend: String,
     pub memory_mb: Option<u64>,
+    pub driver_version: Option<String>,
+    pub compute_version: Option<String>,
+    pub supports_fp16: bool,
+    pub supports_bf16: bool,
+    pub supports_int8: bool,
+    pub benchmark_bytes_per_second: Option<u64>,
+    pub benchmark_p95_micros: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +35,18 @@ pub struct NodeCapabilities {
     pub total_memory_bytes: u64,
     pub cpu_benchmark_score: u64,
     pub gpus: Vec<GpuCapability>,
+    #[serde(default)]
+    pub model_seed_url: Option<String>,
+    #[serde(default)]
+    pub cached_model_manifests: Vec<String>,
+    #[serde(default)]
+    pub coordinator_latency_micros: u64,
+    #[serde(default)]
+    pub model_bandwidth_kbps: u64,
+    #[serde(default)]
+    pub accelerator_load_permille: u16,
+    #[serde(default)]
+    pub ai_runtime_ready: bool,
 }
 
 /// Replay-resistant request authentication. The nonce must be unique per node

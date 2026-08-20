@@ -85,6 +85,42 @@ fn init_schema(conn: &Connection) -> Result<()> {
             updated_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_ledger_intents_status ON ledger_intents(status);
+
+        CREATE TABLE IF NOT EXISTS model_manifests (
+            manifest_digest TEXT PRIMARY KEY,
+            model_id TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            manifest_json TEXT NOT NULL,
+            publisher_node_id TEXT NOT NULL REFERENCES nodes(node_id),
+            created_at INTEGER NOT NULL,
+            UNIQUE(model_id, revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_manifests_model ON model_manifests(model_id);
+
+        CREATE TABLE IF NOT EXISTS ai_jobs (
+            job_id TEXT PRIMARY KEY,
+            requester_node_id TEXT NOT NULL REFERENCES nodes(node_id),
+            request_json TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            manifest_digest TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS ai_assignments (
+            assignment_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES ai_jobs(job_id) ON DELETE CASCADE,
+            assigned_node_id TEXT NOT NULL REFERENCES nodes(node_id),
+            assignment_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            lease_until INTEGER,
+            outputs_json TEXT,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            failed_nodes_json TEXT NOT NULL DEFAULT '[]',
+            completed_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_assignments_node_status ON ai_assignments(assigned_node_id,status);
+        CREATE INDEX IF NOT EXISTS idx_ai_assignments_lease ON ai_assignments(lease_until);
         "#,
     )?;
     Ok(())

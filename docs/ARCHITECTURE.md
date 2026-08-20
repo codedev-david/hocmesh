@@ -96,7 +96,7 @@ Control + small work data -> coordinator HTTP API
 Ledger -> validators
 ```
 
-Future MESH AI:
+MESH AI:
 
 ```text
 Control plane -> scheduler/federation
@@ -133,14 +133,14 @@ model cache inventory
 thermal/power policy
 ```
 
-## Parallelism roadmap
+## Parallelism implementation order
 
 Recommended order:
 
 1. task parallelism — implemented for deterministic CPU work,
-2. batch inference — independent prompts across GPUs,
-3. pipeline/model parallelism — layers across low-latency peers,
-4. hybrid pipeline + batching,
-5. selective tensor parallelism only for sufficiently fast links.
+2. batch inference — implemented end-to-end across GPU workers,
+3. pipeline/model parallel planning — implemented for low-latency peers,
+4. ordered activation/tensor transport with route failover — implemented,
+5. partial-layer and collective kernels — supplied by compatible runtime plugins.
 
 WAN tensor parallelism should not be assumed to outperform a single local GPU simply because aggregate FLOPS are larger. Communication is a first-class scheduling constraint.

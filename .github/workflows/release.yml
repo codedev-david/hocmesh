@@ -19,23 +19,26 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: linux-x86_64
             archive: tar.gz
+            features: mesh-gpu/cuda,mesh-gpu/rocm
           - os: windows-latest
             target: windows-x86_64
             archive: zip
+            features: mesh-gpu/cuda
           - os: macos-latest
             target: macos-arm64
             archive: tar.gz
+            features: mesh-gpu/metal
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
       - name: Build release binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --features ${{ matrix.features }} --locked
       - name: Assemble release folder
         shell: pwsh
         run: |
@@ -60,32 +63,60 @@ jobs:
             tar -czf "$env:DIST.tar.gz" "$env:DIST"
             "ARCHIVE=$env:DIST.tar.gz" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
+      - name: Build Linux installer
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          installer=$(./scripts/package-linux.sh target/release/mesh "${{ github.event.inputs.version || github.ref_name }}" dist amd64 | tail -1)
+          echo "INSTALLER=$installer" >> "$GITHUB_ENV"
+      - name: Build macOS installer
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          installer=$(./scripts/package-macos.sh target/release/mesh "${{ github.event.inputs.version || github.ref_name }}" dist | tail -1)
+          echo "INSTALLER=$installer" >> "$GITHUB_ENV"
+      - name: Install WiX
+        if: runner.os == 'Windows'
+        run: dotnet tool install --global wix --version 6.0.2
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version || github.ref_name }}"
+          ./scripts/package-windows.ps1 -Binary target/release/mesh.exe -Version $version -OutputDirectory dist
+          $installer = (Resolve-Path "dist/mesh-$($version.TrimStart('v'))-x86_64.msi").Path
+          "INSTALLER=$installer" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Generate checksums
         shell: pwsh
         run: |
-          $hash = Get-FileHash -Algorithm SHA256 $env:ARCHIVE
-          "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $env:ARCHIVE)" | Out-File -Encoding ascii "$env:ARCHIVE.sha256"
+          foreach ($artifact in @($env:ARCHIVE, $env:INSTALLER)) {
+            $hash = Get-FileHash -Algorithm SHA256 $artifact
+            "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $artifact)" | Out-File -Encoding ascii "$artifact.sha256"
+          }
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mesh-${{ matrix.target }}
           path: |
             ${{ env.ARCHIVE }}
             ${{ env.ARCHIVE }}.sha256
+            ${{ env.INSTALLER }}
+            ${{ env.INSTALLER }}.sha256
+          if-no-files-found: error
 
   publish:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.version || github.ref_name }}
           name: MESH ${{ github.event.inputs.version || github.ref_name }}
           draft: true
           prerelease: true
           files: |
-            artifacts/**/*.{zip,tar.gz,sha256}
+            artifacts/**/*.{zip,tar.gz,msi,pkg,deb,sha256}

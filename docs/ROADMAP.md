@@ -5,7 +5,7 @@
 - Rust workspace split by responsibility.
 - Native participant/coordinator/validator binaries.
 - Ed25519 identities.
-- Signed protocol v2 requests with nonces.
+- Signed protocol v3 requests with nonces and AI capability advertisements.
 - Hardware discovery and CPU benchmarking.
 - Declarative CPU work.
 - Multi-worker task parallelism.
@@ -106,7 +106,7 @@
 - Temperature/power limits.
 - Bandwidth caps.
 - Signed auto-update.
-- MSI/PKG/DEB/RPM packaging.
+- RPM packaging (MSI, PKG, and DEB are shipped by the release workflow).
 
 ## North-star demonstration
 

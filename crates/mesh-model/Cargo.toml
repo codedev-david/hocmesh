@@ -1,5 +1,5 @@
 [package]
-name = "mesh-ledger"
+name = "mesh-model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,14 +8,11 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-base64.workspace = true
-ed25519-dalek.workspace = true
-mesh-core = { path = "../mesh-core" }
-mesh-protocol = { path = "../mesh-protocol" }
-reqwest.workspace = true
+hex.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
 uuid.workspace = true
-tokio.workspace = true

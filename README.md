@@ -8,9 +8,9 @@ There is **no payment system, token, cryptocurrency, market, or purchasable cred
 
 > Contribute first. Compute later.
 
-This repository is a Rust implementation of the MESH Compute Core plus the security foundation for the future MESH AI layer.
+This repository is a Rust implementation of MESH Compute Core and the MESH AI control/data-plane architecture.
 
-## What is implemented in v0.2
+## What is implemented in v0.3
 
 This repository contains working source for three native Rust programs:
 
@@ -50,10 +50,17 @@ Implemented architecture:
 - Crash-safe coordinator ledger intents with startup/manual recovery.
 - Signed validator claim proofs for reservation/reward reconciliation.
 - Per-process ledger proposal serialization to reduce same-height races.
+- SQLite-backed network model registry.
+- GGUF/safetensors manifests and SHA-256 content-addressed model chunks.
+- HTTP peer model seeding with rarest-first multi-peer planning.
+- CUDA, ROCm, and Metal discovery and feature-gated llama.cpp adapters.
+- Latency/cache/capability-aware AI scheduling and all three parallelism planners.
+- Checksum-bound tensor framing, ordered delivery, replay rejection, and route failover.
+- Distributed batch inference with leases, results, status, and worker rerouting.
 
-## Important scope boundary
+## Runtime boundary
 
-MESH Compute Core v0.2 is designed to be a real executable distributed-compute MVP, but **distributed LLM layer/tensor execution is not claimed to be complete**.
+MESH v0.3 executes independent distributed inference batches through a user-supplied, backend-enabled llama.cpp runtime. Pipeline and tensor/model plans and transport are implemented; actual partial-layer kernels require a compatible runtime plugin because stock llama.cpp does not expose them.
 
 The current executable workload is deterministic CPU prime-range computation. The architecture deliberately proves the harder control-plane primitives first:
 
@@ -66,7 +73,7 @@ The current executable workload is deterministic CPU prime-range computation. Th
 7. verification,
 8. fault recovery.
 
-The future `MESH AI` layer should add CUDA/ROCm/Metal execution, model manifests, content-addressed model chunks, model/pipeline partitioning, activation transport, GPU-aware scheduling, and distributed inference.
+See `docs/MESH_AI.md` for commands, interfaces, validation, and hardware/runtime boundaries.
 
 See `docs/FULL_ORIGINAL_SPEC.md` and `docs/ROADMAP.md`.
 
@@ -248,7 +255,28 @@ Windows PowerShell:
 ./scripts/install-user.ps1
 ```
 
-These scripts compile only the `mesh` participant client and copy it to a per-user binary directory. They are not MSI/PKG installers; native OS installer packaging remains on the roadmap.
+These scripts compile only the `mesh` participant client and copy it to a per-user binary directory. Tagged GitHub releases additionally provide native Windows MSI, macOS PKG, and Linux DEB installers. To build installers locally from an existing release binary:
+
+```bash
+./scripts/package-linux.sh target/release/mesh "$(cat VERSION)" dist amd64
+./scripts/package-macos.sh target/release/mesh "$(cat VERSION)" dist
+```
+
+```powershell
+dotnet tool install --global wix --version 6.0.2
+./scripts/package-windows.ps1 -Binary target/release/mesh.exe -Version (Get-Content VERSION -Raw).Trim() -OutputDirectory dist
+```
+
+Install a downloaded release package with the native platform tool:
+
+```bash
+sudo apt install ./mesh_0.3.0_amd64.deb
+sudo installer -pkg ./mesh-0.3.0.pkg -target /
+```
+
+```powershell
+Start-Process msiexec.exe -Wait -ArgumentList '/i', '.\mesh-0.3.0-x86_64.msi'
+```
 
 ---
 
@@ -740,9 +768,9 @@ This is intentionally expensive verification for an MVP. Future workload types n
 
 ---
 
-# Planned MESH AI layer
+# MESH AI layer
 
-The architecture is intended to grow into:
+The implemented architecture is:
 
 ```text
 MESH AI
@@ -766,7 +794,7 @@ MESH AI
 MESH Compute Core
 ```
 
-The first AI milestone should be **batch inference across independent GPUs**, not WAN tensor parallelism. The second should be pipeline/model partitioning across a small low-latency cluster.
+Batch inference and authenticated scheduling/rerouting run end to end. Pipeline and model/tensor planning plus ordered tensor transport are implemented as the control/data plane; actual partial-layer and collective kernels remain the responsibility of the configured backend runtime.
 
 ---
 
@@ -774,18 +802,17 @@ The first AI milestone should be **batch inference across independent GPUs**, no
 
 This repository intentionally documents the remaining work instead of disguising it.
 
-1. The code needs a full compile/test/Clippy pass in a Rust-equipped environment after handoff.
-2. Validator membership rotation/epochs are not yet implemented.
-3. Consensus is a quorum-certified linear log, not a complete BFT view-change protocol.
-4. The coordinator is still the centralized scheduler, although accounting is independently replicated.
-5. Public TLS is expected to be provided by a reverse proxy rather than the binaries directly.
-6. GPU execution is not yet implemented.
-7. Work verification currently recomputes deterministic CPU work.
-8. Community issuance authorization is bounded by validator policy but does not yet require a separate governance key/proposal process.
-9. Key storage is file-based rather than OS hardware-backed.
-10. No automatic MSI/PKG/DEB installer is included yet; release scripts produce native binaries and a distribution folder.
-11. NAT-friendly P2P model/data transport is a future layer.
-12. Coordinator crash recovery for certified reservations/rewards is implemented through durable ledger intents and `mesh-coordinator recover`; a full multi-coordinator BFT view-change protocol remains a production blocker.
+1. Validator membership rotation/epochs are not yet implemented.
+2. Consensus is a quorum-certified linear log, not a complete BFT view-change protocol.
+3. The coordinator is still the centralized scheduler, although accounting is independently replicated.
+4. Public TLS is expected to be provided by a reverse proxy rather than the binaries directly.
+5. CUDA, ROCm, and Metal execution delegates to a configured llama.cpp-compatible process; native in-process kernels are not bundled.
+6. Work verification currently recomputes deterministic CPU work.
+7. Community issuance authorization is bounded by validator policy but does not yet require a separate governance key/proposal process.
+8. Key storage is file-based rather than OS hardware-backed.
+9. Installers are unsigned until platform signing identities are configured in the release environment.
+10. P2P model seeding uses authenticated HTTP peers; NAT traversal and peer discovery remain deployment concerns.
+11. Coordinator crash recovery for certified reservations/rewards is implemented through durable ledger intents and `mesh-coordinator recover`; a full multi-coordinator BFT view-change protocol remains a production blocker.
 
 These are specifically called out in `CODEX_HANDOFF.md` as next engineering targets.
 

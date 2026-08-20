@@ -11,7 +11,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
@@ -19,33 +19,161 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check
-        run: cargo check --workspace
+        run: cargo check --workspace --all-features --locked
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features --locked
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
       - name: Install cargo audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit dependencies
         run: cargo audit
       - name: Install cargo deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Check dependency policy
         run: cargo deny check
       - name: Install cargo cyclonedx
-        run: cargo install cargo-cyclonedx --locked
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
       - name: Generate SBOM
-        run: cargo cyclonedx --format json --output-cdx target/mesh-sbom.cdx.json
+        run: |
+          cargo cyclonedx --all --all-features --format json --override-filename mesh-sbom
+          mkdir -p target/sbom
+          count=0
+          for bom in crates/*/mesh-sbom.json; do
+            test -s "$bom"
+            jq -e '.bomFormat == "CycloneDX" and (.metadata.component.name | length > 0) and (.dependencies | length > 0)' "$bom" >/dev/null
+            crate=$(basename "$(dirname "$bom")")
+            mv "$bom" "target/sbom/$crate.cdx.json"
+            count=$((count + 1))
+          done
+          test "$count" -eq 11
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: mesh-sbom-cyclonedx-json
-          path: target/mesh-sbom.cdx.json
+          name: mesh-workspace-sbom-cyclonedx-json
+          path: target/sbom/*.cdx.json
+          if-no-files-found: error
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Measure workspace coverage
+        run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/mesh-coverage.lcov --fail-under-lines 45
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mesh-coverage-lcov
+          path: target/mesh-coverage.lcov
+          if-no-files-found: error
+
+  gpu-backend-contracts:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            feature: cuda
+          - os: ubuntu-latest
+            feature: cuda
+          - os: ubuntu-latest
+            feature: rocm
+          - os: macos-latest
+            feature: metal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Compile backend adapter
+        run: cargo check -p mesh-gpu --features ${{ matrix.feature }} --locked
+      - name: Test backend contract
+        run: cargo test -p mesh-gpu --features ${{ matrix.feature }} --locked
+
+  native-installers:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            kind: deb
+            features: mesh-gpu/cuda,mesh-gpu/rocm
+          - os: windows-latest
+            kind: msi
+            features: mesh-gpu/cuda
+          - os: macos-latest
+            kind: pkg
+            features: mesh-gpu/metal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Build client
+        run: cargo build --release -p mesh --features ${{ matrix.features }} --locked
+      - name: Install WiX
+        if: matrix.kind == 'msi'
+        run: dotnet tool install --global wix --version 6.0.2
+      - name: Build and validate DEB
+        if: matrix.kind == 'deb'
+        shell: bash
+        run: ./scripts/package-linux.sh target/release/mesh "$(cat VERSION)" dist amd64
+      - name: Build and validate PKG
+        if: matrix.kind == 'pkg'
+        shell: bash
+        run: ./scripts/package-macos.sh target/release/mesh "$(cat VERSION)" dist
+      - name: Build and validate MSI
+        if: matrix.kind == 'msi'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Binary target/release/mesh.exe -Version (Get-Content VERSION -Raw).Trim() -OutputDirectory dist
+      - name: Execute client extracted from DEB
+        if: matrix.kind == 'deb'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/mesh-deb"
+          dpkg-deb --extract dist/*.deb "$RUNNER_TEMP/mesh-deb"
+          "$RUNNER_TEMP/mesh-deb/usr/bin/mesh" --version
+      - name: Execute client extracted from PKG
+        if: matrix.kind == 'pkg'
+        shell: bash
+        run: |
+          pkgutil --expand-full dist/*.pkg "$RUNNER_TEMP/mesh-pkg"
+          client=$(find "$RUNNER_TEMP/mesh-pkg" -type f -path '*/usr/local/bin/mesh' -print -quit)
+          test -n "$client"
+          "$client" --version
+      - name: Execute client extracted from MSI
+        if: matrix.kind == 'msi'
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path dist/*.msi).Path
+          $extract = Join-Path $env:RUNNER_TEMP "mesh-msi"
+          $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/a', $msi, '/qn', "TARGETDIR=$extract")
+          if ($process.ExitCode -ne 0) { throw "MSI administrative extraction failed: $($process.ExitCode)" }
+          $client = Get-ChildItem $extract -Filter mesh.exe -Recurse | Select-Object -First 1
+          if (-not $client) { throw "mesh.exe is absent from MSI" }
+          & $client.FullName --version
+      - name: Smoke-test packaged client
+        shell: pwsh
+        run: |
+          $artifact = Get-ChildItem dist -File | Select-Object -First 1
+          if (-not $artifact -or $artifact.Length -le 0) { throw "installer artifact is missing or empty" }
+          Get-FileHash -Algorithm SHA256 $artifact.FullName
+      - name: Upload installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: mesh-client-${{ matrix.kind }}
+          path: dist/*
+          if-no-files-found: error

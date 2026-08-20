@@ -1,4 +1,4 @@
-# MESH Protocol v2
+# MESH Protocol v3
 
 ## Authentication
 
@@ -14,7 +14,7 @@ signature_b64
 Canonical signed message:
 
 ```text
-mesh-v2|ACTION|NODE_ID|TIMESTAMP|NONCE|BODY_HASH
+mesh-v3|ACTION|NODE_ID|TIMESTAMP|NONCE|BODY_HASH
 ```
 
 The server verifies:

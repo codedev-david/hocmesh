@@ -7,11 +7,15 @@ members = [
     "crates/mesh-coordinator",
     "crates/mesh-validator",
     "crates/mesh-integration-tests",
+    "crates/mesh-model",
+    "crates/mesh-gpu",
+    "crates/mesh-ai",
+    "crates/mesh-transport",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 authors = ["MESH Contributors"]
@@ -35,3 +39,5 @@ tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18", features = ["v4"] }
+async-trait = "0.1"
+bytes = "1.10"

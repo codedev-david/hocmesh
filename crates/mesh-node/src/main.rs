@@ -4,13 +4,17 @@ mod daemon;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use client::MeshClient;
+use mesh_ai::{InferenceRequirements, PlanRequest, SubmitInferenceRequest};
 use mesh_core::{hardware, identity::NodeIdentity};
+use mesh_gpu::{InferenceBackend, InferenceRequest, LlamaCppBackend};
 use mesh_ledger::{
     network::LedgerNetwork, store::LedgerStore, types::ValidatorSet,
     validate::validate_validator_set,
 };
+use mesh_model::{ChunkStore, ModelFormat, ModelRegistry, manifest_for_file};
 use mesh_protocol::WorkSpec;
-use std::{fs, path::PathBuf};
+use mesh_transport::{HttpPeerSource, SeedServerState, seed_from_peer, seed_router};
+use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -36,10 +40,110 @@ enum Command {
         workers: Option<usize>,
         #[arg(long, default_value_t = 750)]
         poll_ms: u64,
+        #[arg(long)]
+        ai_runtime: Option<PathBuf>,
+        #[arg(long, default_value_t = 999)]
+        gpu_layers: u32,
+        #[arg(long)]
+        model_seed_listen: Option<String>,
+        #[arg(long)]
+        model_seed_url: Option<String>,
     },
     Status,
     Balance,
     Benchmark,
+    GpuInfo,
+    ModelImport {
+        path: PathBuf,
+        #[arg(long)]
+        model_id: String,
+        #[arg(long, default_value = "main")]
+        revision: String,
+        #[arg(long)]
+        format: String,
+        #[arg(long)]
+        architecture: String,
+        #[arg(long, default_value_t = mesh_model::DEFAULT_CHUNK_SIZE)]
+        chunk_size: usize,
+    },
+    ModelList,
+    ModelPublish {
+        #[arg(long)]
+        model_id: String,
+        #[arg(long, default_value = "main")]
+        revision: String,
+    },
+    ModelSeed {
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        model_id: String,
+        #[arg(long, default_value = "main")]
+        revision: String,
+    },
+    ModelServe {
+        #[arg(long, default_value = "127.0.0.1:8090")]
+        listen: String,
+    },
+    Infer {
+        #[arg(long)]
+        model_id: String,
+        #[arg(long, default_value = "main")]
+        revision: String,
+        #[arg(long)]
+        runtime: PathBuf,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 128)]
+        max_tokens: u32,
+        #[arg(long, default_value_t = 0)]
+        gpu_layers: u32,
+    },
+    AiPlan {
+        #[arg(long)]
+        model_id: String,
+        #[arg(long, default_value = "main")]
+        revision: String,
+        #[arg(long, default_value = "cuda")]
+        backend: String,
+        #[arg(long, default_value_t = 1)]
+        minimum_memory_mb: u64,
+        #[arg(long, default_value_t = 1)]
+        batch_size: u32,
+        #[arg(long, default_value_t = 1)]
+        pipeline_stages: u32,
+        #[arg(long, default_value_t = 1)]
+        tensor_parallelism: u32,
+        #[arg(long)]
+        layers: u32,
+    },
+    AiSubmit {
+        #[arg(long)]
+        model_id: String,
+        #[arg(long, default_value = "main")]
+        revision: String,
+        #[arg(long, required = true)]
+        prompt: Vec<String>,
+        #[arg(long, default_value = "cuda")]
+        backend: String,
+        #[arg(long, default_value_t = 1)]
+        minimum_memory_mb: u64,
+        #[arg(long, default_value_t = 1)]
+        pipeline_stages: u32,
+        #[arg(long, default_value_t = 1)]
+        tensor_parallelism: u32,
+        #[arg(long)]
+        layers: u32,
+        #[arg(long, default_value_t = 128)]
+        max_tokens: u32,
+        #[arg(long, default_value_t = 0)]
+        temperature_milli: u32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    AiJob {
+        job_id: String,
+    },
     SubmitPrime {
         #[arg(long)]
         start: u64,
@@ -92,10 +196,33 @@ async fn main() -> Result<()> {
             let r = client.register(&caps).await?;
             print_registration(&r, &caps);
         }
-        Command::Daemon { workers, poll_ms } => {
-            let caps = hardware::detect_capabilities(true);
+        Command::Daemon {
+            workers,
+            poll_ms,
+            ai_runtime,
+            gpu_layers,
+            model_seed_listen,
+            model_seed_url,
+        } => {
+            let cached_model_manifests = model_registry(&cli.home)?
+                .list()?
+                .iter()
+                .map(mesh_model::ModelManifest::digest)
+                .collect::<Result<Vec<_>>>()?;
+            let mut caps = hardware::detect_capabilities_with_models(
+                true,
+                model_seed_url,
+                cached_model_manifests,
+            );
+            caps.ai_runtime_ready = ai_runtime.is_some() && !caps.gpus.is_empty();
             let workers = workers.unwrap_or_else(|| caps.logical_cpus.saturating_sub(1).max(1));
-            daemon::run(client, caps, workers, poll_ms).await?;
+            let ai = ai_runtime.map(|runtime| daemon::AiWorkerConfig {
+                home: cli.home.clone(),
+                runtime,
+                gpu_layers,
+                seed_listen: model_seed_listen,
+            });
+            daemon::run(client, caps, workers, poll_ms, ai).await?;
         }
         Command::Status => {
             let s = client.node_status().await?;
@@ -133,6 +260,247 @@ async fn main() -> Result<()> {
             "MESH CPU benchmark: {} candidate integers/second",
             hardware::benchmark_cpu()
         ),
+        Command::GpuInfo => {
+            let devices = mesh_gpu::discover_devices();
+            if devices.is_empty() {
+                println!("No CUDA, ROCm, or Metal devices detected.");
+            }
+            for device in devices {
+                let report = mesh_gpu::benchmark_memory(&device, 32 * 1024 * 1024, 16);
+                println!(
+                    "{}: {} via {:?}, memory={:?} MiB, throughput={:.2} GiB/s, p95={:.3} ms",
+                    device.stable_id,
+                    device.name,
+                    device.backend,
+                    device.memory_bytes.map(|bytes| bytes / 1024 / 1024),
+                    report.throughput_units_per_second / 1024.0 / 1024.0 / 1024.0,
+                    report.latency_p95_ms
+                );
+            }
+        }
+        Command::ModelImport {
+            path,
+            model_id,
+            revision,
+            format,
+            architecture,
+            chunk_size,
+        } => {
+            let format = parse_model_format(&format)?;
+            let store = model_store(&cli.home)?;
+            let manifest = manifest_for_file(
+                &store,
+                &path,
+                model_id,
+                revision,
+                format,
+                architecture,
+                chunk_size,
+            )?;
+            let first = store.read(&manifest.chunks[0].sha256)?;
+            mesh_model::validate_format_header(format, &first)?;
+            let registry = model_registry(&cli.home)?;
+            let digest = registry.register(&manifest)?;
+            println!(
+                "Imported {}@{}: {} bytes, {} chunks, manifest {}",
+                manifest.model_id,
+                manifest.revision,
+                manifest.total_size_bytes,
+                manifest.chunks.len(),
+                digest
+            );
+        }
+        Command::ModelList => {
+            for manifest in model_registry(&cli.home)?.list()? {
+                println!(
+                    "{}@{} {:?} {} bytes {}",
+                    manifest.model_id,
+                    manifest.revision,
+                    manifest.format,
+                    manifest.total_size_bytes,
+                    manifest.digest()?
+                );
+            }
+        }
+        Command::ModelPublish { model_id, revision } => {
+            client
+                .register(&hardware::detect_capabilities(false))
+                .await?;
+            let manifest = model_registry(&cli.home)?
+                .get(&model_id, &revision)?
+                .context("model revision is not registered")?;
+            let response = client.register_model(&manifest).await?;
+            println!(
+                "Published {}@{} as {}",
+                response.model_id, response.revision, response.manifest_digest
+            );
+        }
+        Command::ModelSeed {
+            peer,
+            model_id,
+            revision,
+        } => {
+            let source = HttpPeerSource::new(peer)?;
+            let store = model_store(&cli.home)?;
+            let manifest = seed_from_peer(&source, &store, &model_id, &revision).await?;
+            let digest = model_registry(&cli.home)?.register(&manifest)?;
+            println!(
+                "Seeded {}@{} with verified manifest {}",
+                model_id, revision, digest
+            );
+        }
+        Command::ModelServe { listen } => {
+            let store = Arc::new(model_store(&cli.home)?);
+            let manifests = model_registry(&cli.home)?.list()?;
+            let state = SeedServerState::new(store, manifests)?;
+            let listener = tokio::net::TcpListener::bind(&listen).await?;
+            println!("Serving verified model chunks on http://{listen}");
+            axum::serve(listener, seed_router(state)).await?;
+        }
+        Command::Infer {
+            model_id,
+            revision,
+            runtime,
+            prompt,
+            max_tokens,
+            gpu_layers,
+        } => {
+            let registry = model_registry(&cli.home)?;
+            let manifest = registry
+                .get(&model_id, &revision)?
+                .context("model revision is not registered")?;
+            anyhow::ensure!(
+                manifest.format == ModelFormat::Gguf,
+                "llama.cpp runtime currently requires GGUF"
+            );
+            let materialized = cli
+                .home
+                .join("models")
+                .join(format!("{}.gguf", manifest.digest()?));
+            if !materialized.exists() {
+                fs::create_dir_all(materialized.parent().unwrap())?;
+                model_store(&cli.home)?.materialize(&manifest, &materialized)?;
+            }
+            let device = mesh_gpu::discover_devices().into_iter().next().unwrap_or(
+                mesh_gpu::DeviceCapability {
+                    stable_id: "cpu".into(),
+                    backend: mesh_gpu::BackendKind::Cpu,
+                    vendor: "cpu".into(),
+                    name: "CPU".into(),
+                    memory_bytes: Some(hardware::detect_capabilities(false).total_memory_bytes),
+                    driver_version: None,
+                    compute_version: None,
+                    supports_fp16: false,
+                    supports_bf16: false,
+                    supports_int8: true,
+                },
+            );
+            let backend = LlamaCppBackend::new(runtime, device, gpu_layers)?;
+            let output = backend.infer(
+                &materialized,
+                &InferenceRequest {
+                    prompt,
+                    max_tokens,
+                    temperature_milli: 0,
+                    seed: 0,
+                },
+            )?;
+            print!("{}", output.text);
+        }
+        Command::AiPlan {
+            model_id,
+            revision,
+            backend,
+            minimum_memory_mb,
+            batch_size,
+            pipeline_stages,
+            tensor_parallelism,
+            layers,
+        } => {
+            client
+                .register(&hardware::detect_capabilities(false))
+                .await?;
+            let request = PlanRequest {
+                auth: mesh_protocol::AuthProof {
+                    node_id: String::new(),
+                    timestamp: 0,
+                    nonce_b64: String::new(),
+                    signature_b64: String::new(),
+                },
+                model_id,
+                revision,
+                requirements: InferenceRequirements {
+                    required_backends: [parse_backend(&backend)?].into_iter().collect(),
+                    minimum_memory_bytes: minimum_memory_mb * 1024 * 1024,
+                    needs_fp16: false,
+                    needs_bf16: false,
+                    needs_int8: false,
+                    batch_size,
+                    pipeline_stages,
+                    tensor_parallelism,
+                },
+                layer_count: layers,
+                excluded_nodes: BTreeSet::new(),
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&client.plan_ai(request).await?)?
+            );
+        }
+        Command::AiSubmit {
+            model_id,
+            revision,
+            prompt,
+            backend,
+            minimum_memory_mb,
+            pipeline_stages,
+            tensor_parallelism,
+            layers,
+            max_tokens,
+            temperature_milli,
+            seed,
+        } => {
+            client
+                .register(&hardware::detect_capabilities(false))
+                .await?;
+            let request = SubmitInferenceRequest {
+                auth: mesh_protocol::AuthProof {
+                    node_id: String::new(),
+                    timestamp: 0,
+                    nonce_b64: String::new(),
+                    signature_b64: String::new(),
+                },
+                model_id,
+                revision,
+                requirements: InferenceRequirements {
+                    required_backends: [parse_backend(&backend)?].into_iter().collect(),
+                    minimum_memory_bytes: minimum_memory_mb * 1024 * 1024,
+                    needs_fp16: false,
+                    needs_bf16: false,
+                    needs_int8: false,
+                    batch_size: prompt.len() as u32,
+                    pipeline_stages,
+                    tensor_parallelism,
+                },
+                prompts: prompt,
+                max_tokens,
+                temperature_milli,
+                seed,
+                layer_count: layers,
+            };
+            let response = client.submit_inference(request).await?;
+            println!(
+                "Submitted AI job {} with {} assignments using manifest {}\n{}",
+                response.job_id,
+                response.assignments,
+                response.manifest_digest,
+                serde_json::to_string_pretty(&response.plan)?
+            );
+        }
+        Command::AiJob { job_id } => {
+            let status = client.inference_status(&job_id).await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
         Command::SubmitPrime { start, end, shards } => {
             let r = client
                 .submit(WorkSpec::PrimeCount { start, end }, shards)
@@ -236,6 +604,33 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn model_store(home: &std::path::Path) -> Result<ChunkStore> {
+    ChunkStore::open(home.join("model-cache"))
+}
+
+fn model_registry(home: &std::path::Path) -> Result<ModelRegistry> {
+    fs::create_dir_all(home)?;
+    ModelRegistry::open(home.join("model-registry.db"))
+}
+
+fn parse_model_format(value: &str) -> Result<ModelFormat> {
+    match value.to_ascii_lowercase().as_str() {
+        "gguf" => Ok(ModelFormat::Gguf),
+        "safetensors" => Ok(ModelFormat::Safetensors),
+        _ => anyhow::bail!("format must be gguf or safetensors"),
+    }
+}
+
+fn parse_backend(value: &str) -> Result<mesh_gpu::BackendKind> {
+    match value.to_ascii_lowercase().as_str() {
+        "cuda" => Ok(mesh_gpu::BackendKind::Cuda),
+        "rocm" | "hip" => Ok(mesh_gpu::BackendKind::Rocm),
+        "metal" => Ok(mesh_gpu::BackendKind::Metal),
+        "cpu" => Ok(mesh_gpu::BackendKind::Cpu),
+        _ => anyhow::bail!("backend must be cuda, rocm, metal, or cpu"),
+    }
 }
 
 fn load_set(path: &str) -> Result<ValidatorSet> {

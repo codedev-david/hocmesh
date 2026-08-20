@@ -1,0 +1,11 @@
+Package: mesh-compute-client
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCHITECTURE@
+Depends: libc6 (>= 2.35)
+Maintainer: MESH Contributors
+Homepage: https://github.com/codedev-david/mesh
+Description: MESH distributed AI compute client
+ Provides authenticated compute participation, model chunk storage and seeding,
+ GPU capability discovery, AI scheduling, and inference execution.
