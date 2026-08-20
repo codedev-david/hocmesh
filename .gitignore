@@ -1,0 +1,10 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+.mesh/
+node-*/
+dist/
+validator-*.db
+.validator-*/
+validators.json

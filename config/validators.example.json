@@ -1,0 +1,10 @@
+{
+  "threshold": 3,
+  "community_issuance_limit_mcu": 1000000000,
+  "members": [
+    {"validator_id":"REPLACE_FROM_validator_1_id","url":"http://127.0.0.1:9101","public_key_b64":"REPLACE"},
+    {"validator_id":"REPLACE_FROM_validator_2_id","url":"http://127.0.0.1:9102","public_key_b64":"REPLACE"},
+    {"validator_id":"REPLACE_FROM_validator_3_id","url":"http://127.0.0.1:9103","public_key_b64":"REPLACE"},
+    {"validator_id":"REPLACE_FROM_validator_4_id","url":"http://127.0.0.1:9104","public_key_b64":"REPLACE"}
+  ]
+}
