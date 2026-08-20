@@ -46,6 +46,16 @@ Before publishing a public release:
 - Keep validator membership files out of generic release artifacts unless they
   are explicitly intended as a public deployment policy.
 
+GitHub release process:
+
+- Pushing a `v*` tag runs `.github/workflows/release.yml`.
+- The workflow builds Windows x86_64, Linux x86_64, and macOS arm64 release
+  artifacts.
+- Each artifact is packaged with documentation/config examples and a `.sha256`
+  checksum.
+- The workflow creates a draft prerelease so checksums, release notes, and
+  signing status can be reviewed before publishing.
+
 Reproducible-build notes:
 
 - Do not build from a dirty worktree for public artifacts.

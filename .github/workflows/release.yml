@@ -1,0 +1,91 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            archive: tar.gz
+          - os: windows-latest
+            target: windows-x86_64
+            archive: zip
+          - os: macos-latest
+            target: macos-arm64
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Build release binaries
+        run: cargo build --release --workspace
+      - name: Assemble release folder
+        shell: pwsh
+        run: |
+          $dist = "mesh-${{ github.event.inputs.version || github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force $dist, "$dist/docs", "$dist/config" | Out-Null
+          Copy-Item README.md, CODEX_HANDOFF.md, LICENSE, VERSION -Destination $dist
+          Copy-Item docs/*.md -Destination "$dist/docs"
+          Copy-Item config/*.json -Destination "$dist/config"
+          if (Test-Path target/release/mesh.exe) {
+            Copy-Item target/release/mesh.exe, target/release/mesh-coordinator.exe, target/release/mesh-validator.exe -Destination $dist
+          } else {
+            Copy-Item target/release/mesh, target/release/mesh-coordinator, target/release/mesh-validator -Destination $dist
+          }
+          "DIST=$dist" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Create archive
+        shell: pwsh
+        run: |
+          if ("${{ matrix.archive }}" -eq "zip") {
+            Compress-Archive -Path "$env:DIST/*" -DestinationPath "$env:DIST.zip"
+            "ARCHIVE=$env:DIST.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            tar -czf "$env:DIST.tar.gz" "$env:DIST"
+            "ARCHIVE=$env:DIST.tar.gz" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash -Algorithm SHA256 $env:ARCHIVE
+          "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $env:ARCHIVE)" | Out-File -Encoding ascii "$env:ARCHIVE.sha256"
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: MESH ${{ github.event.inputs.version || github.ref_name }}
+          draft: true
+          prerelease: true
+          files: |
+            artifacts/**/*.{zip,tar.gz,sha256}
