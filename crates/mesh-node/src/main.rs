@@ -767,3 +767,89 @@ fn probe_url(listen: &str) -> String {
     }
     format!("http://{address}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--probe-listen` is a *bind* address; what peers need is somewhere to
+    /// send to. A wildcard bind is not an address anyone can dial, so it has
+    /// to be turned into one before it is advertised.
+    #[test]
+    fn a_wildcard_bind_is_advertised_as_a_dialable_address() {
+        assert_eq!(probe_url("0.0.0.0:8646"), "http://127.0.0.1:8646");
+        assert_eq!(probe_url("[::]:8646"), "http://127.0.0.1:8646");
+    }
+
+    /// Anything already specific is left alone, scheme and all.
+    #[test]
+    fn an_address_that_is_already_reachable_is_left_alone() {
+        assert_eq!(probe_url("127.0.0.1:8646"), "http://127.0.0.1:8646");
+        assert_eq!(
+            probe_url("mesh.example.org:8646"),
+            "http://mesh.example.org:8646"
+        );
+        assert_eq!(
+            probe_url("http://mesh.example.org"),
+            "http://mesh.example.org"
+        );
+        assert_eq!(
+            probe_url("https://mesh.example.org"),
+            "https://mesh.example.org"
+        );
+    }
+
+    /// An operator's shell will hand us whitespace sooner or later, and a URL
+    /// with a stray space in it fails at the far end, where it is unhelpful.
+    #[test]
+    fn surrounding_whitespace_never_reaches_the_advertised_url() {
+        assert_eq!(probe_url("  0.0.0.0:8646\n"), "http://127.0.0.1:8646");
+        assert_eq!(probe_url(" example.org:1 "), "http://example.org:1");
+    }
+
+    /// Operators type these by hand, so case is not a signal.
+    #[test]
+    fn model_formats_and_backends_are_matched_case_insensitively() {
+        assert!(matches!(
+            parse_model_format("GGUF").unwrap(),
+            ModelFormat::Gguf
+        ));
+        assert!(matches!(
+            parse_model_format("SafeTensors").unwrap(),
+            ModelFormat::Safetensors
+        ));
+        assert!(matches!(
+            parse_backend("CUDA").unwrap(),
+            mesh_gpu::BackendKind::Cuda
+        ));
+        // `hip` is what AMD's own tooling calls it; both names mean ROCm.
+        for name in ["rocm", "hip"] {
+            assert!(matches!(
+                parse_backend(name).unwrap(),
+                mesh_gpu::BackendKind::Rocm
+            ));
+        }
+    }
+
+    /// A typo has to be a refusal, not a silent fallback to some default that
+    /// then fails much later with an error about the wrong thing.
+    #[test]
+    fn an_unknown_format_or_backend_is_refused_with_the_choices() {
+        let error = parse_model_format("onnx").unwrap_err().to_string();
+        assert!(error.contains("gguf"), "{error}");
+        assert!(error.contains("safetensors"), "{error}");
+
+        let error = parse_backend("opencl").unwrap_err().to_string();
+        for choice in ["cuda", "rocm", "metal", "cpu"] {
+            assert!(error.contains(choice), "{error} should mention {choice}");
+        }
+    }
+
+    /// The whole CLI is the operator's only interface. clap can only check
+    /// this at runtime, so it has to be checked somewhere.
+    #[test]
+    fn the_command_line_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+}

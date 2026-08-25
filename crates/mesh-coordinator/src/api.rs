@@ -1691,6 +1691,105 @@ mod ai_api_tests {
         assert!(status.is_success(), "{status}: {text}");
         serde_json::from_str(&text).unwrap()
     }
+
+    /// Scheduling on the coordinator's own view of latency sends work to
+    /// whoever is nearest the coordinator. When both ends are placed, the
+    /// distance that matters is requester-to-worker, and nothing else.
+    #[test]
+    fn a_placed_pair_is_scored_on_the_distance_between_them() {
+        let requester = NetworkCoordinate {
+            vector_micros: [0, 0, 0],
+            height_micros: 0,
+            error_permille: 100,
+        };
+        // Far from the requester, but the coordinator sees it as next door.
+        let mut worker = test_capabilities(false, 1_000);
+        worker.network_coordinate = Some(NetworkCoordinate {
+            vector_micros: [40_000, 0, 0],
+            height_micros: 2_000,
+            error_permille: 200,
+        });
+
+        let scored = scoring_latency_ms(Some(&requester), &worker);
+        assert!((scored - 42.0).abs() < 0.001, "{scored}");
+    }
+
+    /// Most of the mesh is unplaced most of the time - a node that has never
+    /// probed anyone, a requester that never will. The coordinator's own
+    /// measurement is the honest fallback, not a refusal to schedule.
+    #[test]
+    fn an_unplaced_end_falls_back_to_what_the_coordinator_measured() {
+        let placed = NetworkCoordinate {
+            vector_micros: [0, 0, 0],
+            height_micros: 0,
+            error_permille: 100,
+        };
+        let mut worker = test_capabilities(false, 25_000);
+        worker.network_coordinate = Some(placed);
+
+        // A requester who has never been placed.
+        assert!((scoring_latency_ms(None, &worker) - 25.0).abs() < 0.001);
+
+        // A worker who has never been placed.
+        let unplaced = test_capabilities(false, 25_000);
+        assert!((scoring_latency_ms(Some(&placed), &unplaced) - 25.0).abs() < 0.001);
+    }
+
+    /// A coordinate is a number a node chose for itself. One that is out of
+    /// range would let a worker claim to be next to everybody, so scheduling
+    /// has to fall back to what the coordinator measured itself.
+    #[test]
+    fn a_worker_cannot_score_itself_with_an_implausible_coordinate() {
+        let requester = NetworkCoordinate {
+            vector_micros: [0, 0, 0],
+            height_micros: 0,
+            error_permille: 100,
+        };
+        let claimed = [
+            // Right on top of the requester, but claiming impossible confidence.
+            NetworkCoordinate {
+                vector_micros: [0, 0, 0],
+                height_micros: 0,
+                error_permille: 1_001,
+            },
+            // Inside the confidence bound, but off the edge of the map.
+            NetworkCoordinate {
+                vector_micros: [90_000_000, 0, 0],
+                height_micros: 0,
+                error_permille: 10,
+            },
+        ];
+
+        for coordinate in claimed {
+            let mut worker = test_capabilities(false, 25_000);
+            worker.network_coordinate = Some(coordinate);
+            let scored = scoring_latency_ms(Some(&requester), &worker);
+            assert!(
+                (scored - 25.0).abs() < 0.001,
+                "{coordinate:?} scored {scored}, but must not be trusted"
+            );
+        }
+    }
+
+    /// Scoring divides by latency, so a zero would make one node infinitely
+    /// attractive and starve every other. Nothing is ever free.
+    #[test]
+    fn latency_never_scores_as_zero() {
+        let origin = NetworkCoordinate {
+            vector_micros: [0, 0, 0],
+            height_micros: 0,
+            error_permille: 0,
+        };
+        let mut worker = test_capabilities(false, 0);
+        assert_eq!(scoring_latency_ms(None, &worker), 0.1);
+
+        worker.network_coordinate = Some(origin);
+        assert_eq!(
+            scoring_latency_ms(Some(&origin), &worker),
+            0.1,
+            "two nodes in the same place are still not the same node"
+        );
+    }
 }
 async fn authoritative_balance(
     state: &AppState,

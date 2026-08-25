@@ -235,3 +235,85 @@ async fn decode<T: DeserializeOwned>(response: Response) -> Result<T> {
     }
     serde_json::from_str(&text).with_context(|| format!("decoding coordinator response: {text}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh_core::identity::NodeIdentity;
+    use mesh_protocol::PeerSample;
+
+    /// A client pointed at `router`, with a throwaway identity.
+    async fn client_for(router: axum::Router, tag: &str) -> (MeshClient, std::path::PathBuf) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let home = std::env::temp_dir().join(format!("mesh-client-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let identity = NodeIdentity::load_or_create(&home).unwrap();
+        (MeshClient::new(format!("http://{address}"), identity), home)
+    }
+
+    /// The peer sample is the whole bootstrap directory a node gets, so it has
+    /// to arrive intact - an endpoint it cannot dial is a peer it cannot use.
+    #[tokio::test]
+    async fn a_peer_sample_arrives_with_the_endpoints_it_was_sent_with() {
+        let router = axum::Router::new().route(
+            "/v1/network/peers",
+            axum::routing::get(|| async {
+                axum::Json(PeerSampleResponse {
+                    peers: vec![PeerSample {
+                        node_id: "peer-a".to_string(),
+                        probe_endpoint: "http://10.0.0.7:8646".to_string(),
+                        coordinate: None,
+                    }],
+                })
+            }),
+        );
+        let (client, home) = client_for(router, "peers").await;
+
+        let sample = client.peers().await.unwrap();
+        assert_eq!(sample.peers.len(), 1);
+        assert_eq!(sample.peers[0].node_id, "peer-a");
+        assert_eq!(sample.peers[0].probe_endpoint, "http://10.0.0.7:8646");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// When the coordinator explains itself, the operator should read the
+    /// coordinator's words, not a generic transport failure.
+    #[tokio::test]
+    async fn a_coordinator_error_reaches_the_operator_as_written() {
+        let router = axum::Router::new().route(
+            "/v1/network/peers",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(ErrorResponse {
+                        error: "directory unavailable".to_string(),
+                    }),
+                )
+            }),
+        );
+        let (client, home) = client_for(router, "error").await;
+
+        let error = client.peers().await.unwrap_err().to_string();
+        assert!(error.contains("503"), "{error}");
+        assert!(error.contains("directory unavailable"), "{error}");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// A reply that cannot be read has to say so and show what arrived - a
+    /// proxy's error page is the usual culprit and looks nothing like a bug
+    /// in the coordinator.
+    #[tokio::test]
+    async fn an_unreadable_reply_shows_what_actually_arrived() {
+        let router = axum::Router::new().route(
+            "/v1/network/peers",
+            axum::routing::get(|| async { "<html>gateway timeout</html>" }),
+        );
+        let (client, home) = client_for(router, "garbage").await;
+
+        let error = client.peers().await.unwrap_err().to_string();
+        assert!(error.contains("gateway timeout"), "{error}");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+}

@@ -98,3 +98,126 @@ pub fn apply_limits(caps: &mut NodeCapabilities, limits: &ResourceLimits) {
         caps.ai_runtime_ready = false;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_gpu() -> GpuCapability {
+        GpuCapability {
+            stable_id: "gpu-0".into(),
+            vendor: "test".into(),
+            name: "Test GPU".into(),
+            backend: "cpu".into(),
+            memory_mb: Some(8_192),
+            driver_version: None,
+            compute_version: None,
+            supports_fp16: true,
+            supports_bf16: false,
+            supports_int8: true,
+            benchmark_bytes_per_second: None,
+            benchmark_p95_micros: None,
+        }
+    }
+
+    /// A machine with known hardware, before any operator limit is applied.
+    fn a_machine() -> NodeCapabilities {
+        let mut caps = detect_capabilities(false);
+        caps.logical_cpus = 16;
+        caps.total_memory_bytes = 32_000_000_000;
+        caps.gpus = vec![a_gpu()];
+        caps.ai_runtime_ready = true;
+        caps
+    }
+
+    /// What the mesh is told is the operator's share, not the machine. The
+    /// detected totals stay put so the share can be recomputed if the limits
+    /// change; only the advertised slice moves.
+    #[test]
+    fn limits_shrink_what_is_advertised_not_what_was_detected() {
+        let mut caps = a_machine();
+        apply_limits(
+            &mut caps,
+            &ResourceLimits {
+                cpu_percent: 25,
+                gpu_percent: 60,
+                memory_percent: 50,
+            },
+        );
+
+        assert_eq!(caps.shared_logical_cpus, 4);
+        assert_eq!(caps.shared_memory_bytes, 16_000_000_000);
+        assert_eq!(caps.shared_gpu_percent, 60);
+        assert_eq!(caps.logical_cpus, 16, "the machine did not change size");
+        assert_eq!(caps.total_memory_bytes, 32_000_000_000);
+        assert_eq!(caps.gpus.len(), 1, "a lent GPU is still advertised");
+        assert!(caps.ai_runtime_ready);
+    }
+
+    /// Lending no GPU has to mean the mesh never learns there is one. Leaving
+    /// the GPU in the advertisement would keep the node eligible for AI work
+    /// it has been told not to do, and would disclose hardware the operator
+    /// deliberately kept back.
+    #[test]
+    fn a_withheld_gpu_is_not_advertised_at_all() {
+        let mut caps = a_machine();
+        apply_limits(
+            &mut caps,
+            &ResourceLimits {
+                cpu_percent: 50,
+                gpu_percent: 0,
+                memory_percent: 50,
+            },
+        );
+
+        assert!(
+            caps.gpus.is_empty(),
+            "a GPU nobody may use is nobody's business"
+        );
+        assert!(
+            !caps.ai_runtime_ready,
+            "a node with no GPU to lend must not be offered AI work"
+        );
+        assert_eq!(caps.shared_gpu_percent, 0);
+        assert_eq!(caps.shared_logical_cpus, 8, "the CPU share is unaffected");
+    }
+
+    /// `mesh init` and the daemon both apply limits to a freshly detected
+    /// machine, and an operator may change them and restart. Applying twice
+    /// must land in the same place, or the share would ratchet downwards.
+    #[test]
+    fn applying_the_same_limits_twice_changes_nothing() {
+        let limits = ResourceLimits {
+            cpu_percent: 30,
+            gpu_percent: 40,
+            memory_percent: 30,
+        };
+        let mut once = a_machine();
+        apply_limits(&mut once, &limits);
+        let mut twice = once.clone();
+        apply_limits(&mut twice, &limits);
+        assert_eq!(once, twice);
+    }
+
+    /// A tiny share of a big machine still has to be able to do one thing at
+    /// a time, and a generous share must never promise more than exists.
+    #[test]
+    fn the_worker_count_stays_between_one_and_the_whole_machine() {
+        for (cpu_percent, cpus, expected) in [(1u8, 16usize, 1usize), (100, 16, 16), (50, 1, 1)] {
+            let mut caps = a_machine();
+            caps.logical_cpus = cpus;
+            apply_limits(
+                &mut caps,
+                &ResourceLimits {
+                    cpu_percent,
+                    gpu_percent: 50,
+                    memory_percent: 50,
+                },
+            );
+            assert_eq!(
+                caps.shared_logical_cpus, expected,
+                "{cpu_percent}% of {cpus} CPUs"
+            );
+        }
+    }
+}

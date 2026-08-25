@@ -38,6 +38,7 @@ pub struct ProximityConfig {
     pub probe_listen: Option<String>,
 }
 
+/// Run the node until the operator interrupts it.
 pub async fn run(
     client: MeshClient,
     capabilities: NodeCapabilities,
@@ -45,6 +46,34 @@ pub async fn run(
     poll_ms: u64,
     ai: Option<AiWorkerConfig>,
     proximity: ProximityConfig,
+) -> Result<()> {
+    run_until(
+        client,
+        capabilities,
+        workers,
+        poll_ms,
+        ai,
+        proximity,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+    )
+    .await
+}
+
+/// The daemon itself, stopping when `shutdown` completes.
+///
+/// Production waits on ctrl-c. Taking the signal as an argument is what makes
+/// the teardown below observable: a test can end the run on demand and then
+/// check that the servers this spawned are really gone.
+async fn run_until<S: std::future::Future<Output = ()>>(
+    client: MeshClient,
+    capabilities: NodeCapabilities,
+    workers: usize,
+    poll_ms: u64,
+    ai: Option<AiWorkerConfig>,
+    proximity: ProximityConfig,
+    shutdown: S,
 ) -> Result<()> {
     let registered = client.register(&capabilities).await?;
     println!("MESH node {} registered", registered.node_id);
@@ -91,6 +120,7 @@ pub async fn run(
         tracker,
         capabilities.clone(),
         proximity.home,
+        PROXIMITY_INTERVAL,
     ));
 
     let mut workers_set = JoinSet::new();
@@ -118,7 +148,7 @@ pub async fn run(
     }
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown => {
             println!("Shutdown requested; stopping MESH node.");
         }
         result = workers_set.join_next() => {
@@ -311,17 +341,21 @@ async fn worker_loop(client: MeshClient, worker_id: usize, poll_ms: u64) -> Resu
 /// coordinate. Nothing it is told is taken as a position - a peer's claim is
 /// only ever an anchor to measure against, weighted by the confidence the peer
 /// itself reports.
+///
+/// `period` is `PROXIMITY_INTERVAL` in production; taking it as an argument
+/// lets a test watch the loop tick instead of taking the schedule on trust.
 async fn proximity_loop(
     client: MeshClient,
     tracker: Arc<Mutex<Vivaldi>>,
     capabilities: Arc<RwLock<NodeCapabilities>>,
     home: PathBuf,
+    period: Duration,
 ) {
     let http = reqwest::Client::new();
     // What we last measured to each peer, so the peer can fit itself against
     // us on the next exchange without spending a probe of its own.
     let mut measured: HashMap<String, u64> = HashMap::new();
-    let mut interval = tokio::time::interval(PROXIMITY_INTERVAL);
+    let mut interval = tokio::time::interval(period);
 
     loop {
         interval.tick().await;
@@ -354,6 +388,13 @@ async fn proximity_round(
     home: &Path,
     measured: &mut HashMap<String, u64>,
 ) -> bool {
+    // A poisoned position can never be read or written again, so there is
+    // nothing left for this pass to measure into. Checking once, here, keeps
+    // that failure loud instead of letting it look like a quiet empty round.
+    if tracker.is_poisoned() {
+        tracing::error!("proximity lock poisoned; stopping measurement");
+        return false;
+    }
     let self_id = client.node_id();
     let peers = match client.peers().await {
         Ok(response) => response.peers,
@@ -427,19 +468,26 @@ async fn proximity_round(
 mod proximity_tests {
     use super::*;
     use mesh_core::identity::NodeIdentity;
-    use mesh_protocol::{NetworkCoordinate, PeerSample, PeerSampleResponse};
+    use mesh_protocol::{NetworkCoordinate, PeerSample, PeerSampleResponse, ProbeResponse};
     use mesh_transport::{ProbeState, probe_router};
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::task::JoinHandle;
 
-    /// A node arrives with no place in the network and has to earn one by
-    /// measuring. This is that whole path: ask who is out there, time a real
-    /// round trip to them, and end up with a coordinate worth advertising.
-    #[tokio::test]
-    async fn a_node_measures_its_way_onto_the_map() {
-        let root = std::env::temp_dir().join(format!("mesh-prox-e2e-{}", std::process::id()));
+    static SCRATCH: AtomicUsize = AtomicUsize::new(0);
+
+    /// A scratch home no other test shares.
+    fn scratch(tag: &str) -> PathBuf {
+        let slot = SCRATCH.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("mesh-{tag}-{}-{slot}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        root
+    }
 
-        // A peer that already knows roughly where it sits and will serve probes.
+    /// A peer that has already fitted itself, so probing it teaches us
+    /// something instead of two unplaced nodes staring at each other.
+    fn fitted_anchor() -> Vivaldi {
         let mut anchor = Vivaldi::seeded(b"anchor");
         let far = NetworkCoordinate {
             vector_micros: [40_000, 0, 0],
@@ -449,63 +497,151 @@ mod proximity_tests {
         for _ in 0..25 {
             anchor.observe(&far, 60_000);
         }
-        let anchor_id = "anchor-node".to_string();
-        let probe_state = ProbeState::new(anchor_id.clone(), Arc::new(Mutex::new(anchor)));
-        let probe_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let probe_address = probe_listener.local_addr().unwrap();
-        let probe_server = tokio::spawn(async move {
-            axum::serve(probe_listener, probe_router(probe_state))
-                .await
-                .unwrap()
-        });
+        anchor
+    }
 
-        // A stand-in for the coordinator's directory lookup, which is the only
-        // thing a measurement pass asks of it.
-        let sample = PeerSampleResponse {
-            peers: vec![PeerSample {
-                node_id: anchor_id,
-                probe_endpoint: format!("http://{probe_address}"),
-                coordinate: None,
-            }],
-        };
-        let directory = axum::Router::new().route(
-            "/v1/network/peers",
-            axum::routing::get(move || {
-                let sample = sample.clone();
-                async move { axum::Json(sample) }
+    /// Serve the real probe endpoint on an ephemeral port.
+    async fn serve_probes(node_id: &str, position: Vivaldi) -> (SocketAddr, JoinHandle<()>) {
+        let state = ProbeState::new(node_id.to_string(), Arc::new(Mutex::new(position)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, probe_router(state)).await.unwrap() });
+        (address, server)
+    }
+
+    /// A probe endpoint that answers without offering a position, and counts
+    /// its callers - so a test can show who was, and was not, asked.
+    async fn counting_probes(node_id: &str) -> (SocketAddr, Arc<AtomicUsize>, JoinHandle<()>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let id = node_id.to_string();
+        let router = axum::Router::new().route(
+            "/v1/proximity/probe",
+            axum::routing::post(move |_: axum::Json<serde_json::Value>| {
+                let counter = counter.clone();
+                let id = id.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(ProbeResponse {
+                        node_id: id,
+                        coordinate: None,
+                    })
+                }
             }),
         );
-        let dir_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dir_address = dir_listener.local_addr().unwrap();
-        let dir_server =
-            tokio::spawn(async move { axum::serve(dir_listener, directory).await.unwrap() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (address, calls, server)
+    }
 
-        let home = root.join("node");
-        let identity = NodeIdentity::load_or_create(&home).unwrap();
-        let client = MeshClient::new(format!("http://{dir_address}"), identity);
-        let tracker = Arc::new(Mutex::new(Vivaldi::load_or_seeded(&home, b"node")));
-        let capabilities = Arc::new(RwLock::new(mesh_core::hardware::detect_capabilities(false)));
-        assert!(
-            capabilities.read().unwrap().network_coordinate.is_none(),
-            "a node that has measured nothing must not claim a position"
+    /// A stand-in for the coordinator's directory lookup, the only thing a
+    /// measurement pass asks of it. Counting the calls is what tells a single
+    /// pass apart from a loop that keeps running.
+    async fn serve_directory(peers: Vec<PeerSample>) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let router = axum::Router::new().route(
+            "/v1/network/peers",
+            axum::routing::get(move || {
+                let peers = peers.clone();
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(PeerSampleResponse { peers })
+                }
+            }),
         );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{address}"), calls, server)
+    }
 
-        let http = reqwest::Client::new();
+    /// The measuring side: a fresh identity with no position and nothing yet
+    /// worth advertising, pointed at `directory`.
+    fn measuring_node(
+        home: &Path,
+        directory: String,
+    ) -> (
+        MeshClient,
+        Arc<Mutex<Vivaldi>>,
+        Arc<RwLock<NodeCapabilities>>,
+    ) {
+        let identity = NodeIdentity::load_or_create(home).unwrap();
+        let client = MeshClient::new(directory, identity);
+        let tracker = Arc::new(Mutex::new(Vivaldi::load_or_seeded(home, b"node")));
+        let mut caps = mesh_core::hardware::detect_capabilities(false);
+        caps.network_coordinate = None;
+        (client, tracker, Arc::new(RwLock::new(caps)))
+    }
+
+    /// One measurement pass, with the plumbing every test shares.
+    async fn round(
+        client: &MeshClient,
+        tracker: &Arc<Mutex<Vivaldi>>,
+        capabilities: &Arc<RwLock<NodeCapabilities>>,
+        home: &Path,
+        measured: &mut HashMap<String, u64>,
+    ) -> bool {
+        proximity_round(
+            &reqwest::Client::new(),
+            client,
+            tracker,
+            capabilities,
+            home,
+            measured,
+        )
+        .await
+    }
+
+    /// Leave a lock in the state a panicking holder would leave it in.
+    fn poison<T: Send + 'static>(lock: &Arc<Mutex<T>>) {
+        let held = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("poisoned on purpose");
+        })
+        .join();
+        assert!(lock.is_poisoned());
+    }
+
+    /// The same, for the capability snapshot the daemon advertises from.
+    fn poison_rw<T: Send + Sync + 'static>(lock: &Arc<RwLock<T>>) {
+        let held = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.write().unwrap();
+            panic!("poisoned on purpose");
+        })
+        .join();
+        assert!(lock.is_poisoned());
+    }
+
+    /// A node arrives with no place in the network and has to earn one by
+    /// measuring. This is that whole path: ask who is out there, time a real
+    /// round trip to them, and end up with a coordinate worth advertising.
+    #[tokio::test]
+    async fn a_node_measures_its_way_onto_the_map() {
+        let root = scratch("prox-e2e");
+        let (probe_address, probe_server) = serve_probes("anchor-node", fitted_anchor()).await;
+        let (directory, lookups, dir_server) = serve_directory(vec![PeerSample {
+            node_id: "anchor-node".to_string(),
+            probe_endpoint: format!("http://{probe_address}"),
+            coordinate: None,
+        }])
+        .await;
+        let home = root.join("node");
+        let (client, tracker, capabilities) = measuring_node(&home, directory);
+
         let mut measured = HashMap::new();
         for _ in 0..5 {
             assert!(
-                proximity_round(
-                    &http,
-                    &client,
-                    &tracker,
-                    &capabilities,
-                    &home,
-                    &mut measured
-                )
-                .await,
+                round(&client, &tracker, &capabilities, &home, &mut measured).await,
                 "an ordinary measurement pass must not stop the loop"
             );
         }
+        assert_eq!(lookups.load(Ordering::SeqCst), 5);
 
         let placed = capabilities.read().unwrap().network_coordinate;
         assert!(
@@ -525,5 +661,321 @@ mod proximity_tests {
         probe_server.abort();
         dir_server.abort();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The coordinator is not the authority on where a node sits, so losing it
+    /// costs this pass and nothing more. The loop has to survive to try again.
+    #[tokio::test]
+    async fn a_coordinator_that_cannot_be_asked_costs_only_this_pass() {
+        let root = scratch("prox-nodir");
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = dead.local_addr().unwrap();
+        drop(dead);
+        let home = root.join("node");
+        let (client, tracker, capabilities) = measuring_node(&home, format!("http://{address}"));
+
+        let mut measured = HashMap::new();
+        measured.insert("someone".to_string(), 9_000);
+        assert!(
+            round(&client, &tracker, &capabilities, &home, &mut measured).await,
+            "a coordinator that is down must not end the measurement loop"
+        );
+        assert!(
+            capabilities.read().unwrap().network_coordinate.is_none(),
+            "a pass that measured nothing must not advertise a position"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Probing yourself would fold your own position back into itself and read
+    /// as confirmation. The sample can name us, so the pass has to skip us.
+    #[tokio::test]
+    async fn a_node_never_probes_itself() {
+        let root = scratch("prox-self");
+        let home = root.join("node");
+        let self_id = NodeIdentity::load_or_create(&home).unwrap().node_id();
+        let (probe_address, probes, probe_server) = counting_probes(&self_id).await;
+        let (directory, _, dir_server) = serve_directory(vec![PeerSample {
+            node_id: self_id.clone(),
+            probe_endpoint: format!("http://{probe_address}"),
+            coordinate: None,
+        }])
+        .await;
+        let (client, tracker, capabilities) = measuring_node(&home, directory);
+        assert_eq!(client.node_id(), self_id);
+
+        let mut measured = HashMap::new();
+        assert!(round(&client, &tracker, &capabilities, &home, &mut measured).await);
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "a node must never spend a probe on itself"
+        );
+        assert!(measured.is_empty());
+        assert!(capabilities.read().unwrap().network_coordinate.is_none());
+
+        probe_server.abort();
+        dir_server.abort();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// What we last measured to a peer is reported back to it, so it can fit
+    /// itself without spending a probe. If the peer stops answering, that
+    /// number has to go: a remembered round trip is not evidence of a live one.
+    #[tokio::test]
+    async fn a_peer_that_stops_answering_is_forgotten_not_guessed() {
+        let root = scratch("prox-gone");
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = dead.local_addr().unwrap();
+        drop(dead);
+        let (directory, _, dir_server) = serve_directory(vec![PeerSample {
+            node_id: "gone".to_string(),
+            probe_endpoint: format!("http://{address}"),
+            coordinate: None,
+        }])
+        .await;
+        let home = root.join("node");
+        let (client, tracker, capabilities) = measuring_node(&home, directory);
+
+        let mut measured = HashMap::from([("gone".to_string(), 12_345u64)]);
+        assert!(
+            round(&client, &tracker, &capabilities, &home, &mut measured).await,
+            "an unreachable peer costs the pass, not the loop"
+        );
+        assert!(
+            !measured.contains_key("gone"),
+            "a failed probe must retract the round trip, not keep reporting it"
+        );
+        assert!(
+            capabilities.read().unwrap().network_coordinate.is_none(),
+            "a peer we could not reach cannot place us"
+        );
+
+        dir_server.abort();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A peer may answer a probe without offering a position - it may not have
+    /// one yet. That is a usable round trip and an unusable anchor, and the
+    /// pass has to take the first without inventing the second.
+    #[tokio::test]
+    async fn a_peer_with_no_position_yet_is_timed_but_not_fitted_against() {
+        let root = scratch("prox-nopos");
+        let (probe_address, probes, probe_server) = counting_probes("shy").await;
+        let (directory, _, dir_server) = serve_directory(vec![PeerSample {
+            node_id: "shy".to_string(),
+            probe_endpoint: format!("http://{probe_address}"),
+            coordinate: None,
+        }])
+        .await;
+        let home = root.join("node");
+        let (client, tracker, capabilities) = measuring_node(&home, directory);
+
+        let mut measured = HashMap::new();
+        assert!(round(&client, &tracker, &capabilities, &home, &mut measured).await);
+        assert!(
+            probes.load(Ordering::SeqCst) > 0,
+            "the peer was reachable, so it must have been probed"
+        );
+        assert!(
+            measured.contains_key("shy"),
+            "the round trip stands on its own, position or not"
+        );
+        assert!(
+            capabilities.read().unwrap().network_coordinate.is_none(),
+            "a peer that gave no position cannot move us"
+        );
+        assert_eq!(tracker.lock().unwrap().observations(), 0);
+
+        probe_server.abort();
+        dir_server.abort();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A poisoned position can never be read or written again, so measuring
+    /// into it is pointless work that would look like a quiet empty round.
+    /// The loop has to stop, loudly, rather than spin.
+    #[tokio::test]
+    async fn a_poisoned_position_stops_the_measurement() {
+        let root = scratch("prox-poison");
+        let (probe_address, probe_server) = serve_probes("anchor-node", fitted_anchor()).await;
+        let (directory, lookups, dir_server) = serve_directory(vec![PeerSample {
+            node_id: "anchor-node".to_string(),
+            probe_endpoint: format!("http://{probe_address}"),
+            coordinate: None,
+        }])
+        .await;
+        let home = root.join("node");
+        let (client, tracker, capabilities) = measuring_node(&home, directory);
+        poison(&tracker);
+
+        let mut measured = HashMap::new();
+        assert!(
+            !round(&client, &tracker, &capabilities, &home, &mut measured).await,
+            "there is nothing left to measure into, so the loop must end"
+        );
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            0,
+            "it must give up before spending a request on anyone else"
+        );
+
+        probe_server.abort();
+        dir_server.abort();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// If the snapshot the daemon advertises from is poisoned, the measurement
+    /// still happened and is still saved - what is lost is the ability to
+    /// publish it, and that is what ends the loop.
+    #[tokio::test]
+    async fn a_poisoned_capability_snapshot_stops_the_measurement() {
+        let root = scratch("prox-caps");
+        let (probe_address, probe_server) = serve_probes("anchor-node", fitted_anchor()).await;
+        let (directory, _, dir_server) = serve_directory(vec![PeerSample {
+            node_id: "anchor-node".to_string(),
+            probe_endpoint: format!("http://{probe_address}"),
+            coordinate: None,
+        }])
+        .await;
+        let home = root.join("node");
+        let (client, tracker, capabilities) = measuring_node(&home, directory);
+        poison_rw(&capabilities);
+
+        let mut measured = HashMap::new();
+        assert!(
+            !round(&client, &tracker, &capabilities, &home, &mut measured).await,
+            "a position nobody can publish is not worth measuring for"
+        );
+        assert!(
+            Vivaldi::load_or_seeded(&home, b"node").observations() > 0,
+            "the round trip was real, so it must survive on disk for the restart"
+        );
+
+        probe_server.abort();
+        dir_server.abort();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// One pass is not a position. The loop has to keep re-measuring on its
+    /// own schedule, because latency moves and a coordinate fitted once and
+    /// never revisited is only true of the network it was measured on.
+    #[tokio::test]
+    async fn the_measurement_loop_keeps_measuring() {
+        let root = scratch("prox-loop");
+        let (probe_address, probe_server) = serve_probes("anchor-node", fitted_anchor()).await;
+        let (directory, lookups, dir_server) = serve_directory(vec![PeerSample {
+            node_id: "anchor-node".to_string(),
+            probe_endpoint: format!("http://{probe_address}"),
+            coordinate: None,
+        }])
+        .await;
+        let home = root.join("node");
+        let (client, tracker, capabilities) = measuring_node(&home, directory);
+
+        let task = tokio::spawn(proximity_loop(
+            client,
+            tracker,
+            capabilities.clone(),
+            home.clone(),
+            Duration::from_millis(10),
+        ));
+        for _ in 0..300 {
+            if lookups.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+
+        assert!(
+            lookups.load(Ordering::SeqCst) >= 3,
+            "the loop measured {} times; it is meant to keep going, not run once",
+            lookups.load(Ordering::SeqCst)
+        );
+        assert!(
+            capabilities.read().unwrap().network_coordinate.is_some(),
+            "a loop that ran against a reachable anchor must have placed us"
+        );
+
+        probe_server.abort();
+        dir_server.abort();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Serving probes is something the operator opted into for as long as the
+    /// daemon runs. When the daemon stops, that port has to stop with it -
+    /// a listener outliving its node is a promise nothing is left to keep.
+    #[tokio::test]
+    async fn shutting_down_takes_the_probe_server_with_it() {
+        let root = scratch("prox-shutdown");
+        // The coordinator only has to get the node as far as running.
+        let coordinator = axum::Router::new().route(
+            "/v1/nodes/register",
+            axum::routing::post(|_: axum::Json<serde_json::Value>| async {
+                axum::Json(mesh_protocol::RegisterResponse {
+                    node_id: "node-under-test".to_string(),
+                    balance_mcu: 0,
+                    protocol_version: mesh_protocol::PROTOCOL_VERSION,
+                    ledger_mode: "coordinator".to_string(),
+                })
+            }),
+        );
+        let dir_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir_address = dir_listener.local_addr().unwrap();
+        let dir_server =
+            tokio::spawn(async move { axum::serve(dir_listener, coordinator).await.unwrap() });
+
+        // Pick a free port for the probe server the way an operator would.
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe_address = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let home = root.join("node");
+        let identity = NodeIdentity::load_or_create(&home).unwrap();
+        let client = MeshClient::new(format!("http://{dir_address}"), identity);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let node = tokio::spawn(run_until(
+            client,
+            mesh_core::hardware::detect_capabilities(false),
+            1,
+            1_000,
+            None,
+            ProximityConfig {
+                home: home.clone(),
+                probe_listen: Some(probe_address.to_string()),
+            },
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+
+        assert!(
+            reachable(probe_address, true).await,
+            "the daemon opted into serving probes, so the port must be open"
+        );
+
+        stop.send(()).unwrap();
+        node.await
+            .expect("the daemon must not panic on the way out")
+            .expect("a clean shutdown is not an error");
+        assert!(
+            reachable(probe_address, false).await,
+            "the probe server must not outlive the node that promised to answer"
+        );
+
+        dir_server.abort();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Wait, briefly, for a port to start or stop accepting connections.
+    async fn reachable(address: SocketAddr, want: bool) -> bool {
+        for _ in 0..300 {
+            if tokio::net::TcpStream::connect(address).await.is_ok() == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
     }
 }

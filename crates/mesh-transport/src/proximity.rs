@@ -211,4 +211,115 @@ mod tests {
         let result = probe_peer(&reqwest::Client::new(), "http://127.0.0.1:1", None, None).await;
         assert!(result.is_err());
     }
+
+    /// A position is only worth folding in when there is a measurement to fold
+    /// it in *at*. Half an exchange is not evidence, and a peer must not drift
+    /// because someone announced where they think they are.
+    #[tokio::test]
+    async fn half_a_report_never_moves_the_responder() {
+        let tracker = Arc::new(Mutex::new(Vivaldi::seeded(b"peer")));
+        let endpoint = serve(ProbeState::new("mesh_peer", tracker.clone())).await;
+        let http = reqwest::Client::new();
+        let claim = NetworkCoordinate {
+            vector_micros: [25_000, 0, 0],
+            height_micros: 900,
+            error_permille: 120,
+        };
+
+        probe_peer(&http, &endpoint, Some(claim), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.lock().unwrap().observations(),
+            0,
+            "a position with no round trip attached is just a claim"
+        );
+
+        probe_peer(&http, &endpoint, None, Some(40_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.lock().unwrap().observations(),
+            0,
+            "a round trip to nowhere in particular cannot place anyone"
+        );
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A probe endpoint that counts what it was asked, so a test can see the
+    /// sampling the caller does rather than infer it from a timing.
+    async fn counting_endpoint() -> (String, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let router = Router::new().route(
+            "/v1/proximity/probe",
+            post(move |Json(_): Json<ProbeRequest>| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Json(ProbeResponse {
+                        node_id: "mesh_responder".to_string(),
+                        coordinate: None,
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{address}"), calls)
+    }
+
+    /// The first exchange pays for DNS, TCP and TLS, so it is thrown away and
+    /// the reported round trip is the smallest of the ones after it. Fewer
+    /// samples would report scheduler noise as distance.
+    #[tokio::test]
+    async fn the_reported_round_trip_is_the_best_of_several_after_a_warm_up() {
+        let (endpoint, calls) = counting_endpoint().await;
+        let http = reqwest::Client::new();
+        let outcome = probe_peer(&http, &endpoint, None, None).await.unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            PROBE_SAMPLES + 1,
+            "one warm-up plus the timed samples, no more and no fewer"
+        );
+        assert_eq!(
+            outcome.node_id, "mesh_responder",
+            "the outcome names who answered, not who asked"
+        );
+        assert!(
+            outcome.rtt_micros >= 1,
+            "a measured round trip is never free, however fast the loopback is"
+        );
+    }
+
+    /// Endpoints are written by hand and by operators, so a trailing slash is
+    /// inevitable. It must not become a double slash the responder rejects.
+    #[tokio::test]
+    async fn a_trailing_slash_on_the_endpoint_is_harmless() {
+        let tracker = Arc::new(Mutex::new(Vivaldi::seeded(b"peer")));
+        let endpoint = serve(ProbeState::new("mesh_peer", tracker)).await;
+        let http = reqwest::Client::new();
+
+        let outcome = probe_peer(&http, &format!("{endpoint}/"), None, None)
+            .await
+            .expect("a trailing slash must not change where the probe lands");
+        assert_eq!(outcome.node_id, "mesh_peer");
+    }
+
+    /// Anything can be listening on a port. A reply that is not a probe
+    /// response has to fail loudly rather than be read as a position.
+    #[tokio::test]
+    async fn a_reply_that_is_not_a_probe_response_is_an_error() {
+        let router = Router::new().route("/v1/proximity/probe", post(|| async { "hello" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let http = reqwest::Client::new();
+        let result = probe_peer(&http, &format!("http://{address}"), None, None).await;
+        assert!(result.is_err(), "unparseable is not the same as unplaced");
+    }
 }
