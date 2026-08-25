@@ -13,6 +13,7 @@ use mesh_ai::{
     register_model_body_hash, report_inference_body_hash, submit_inference_body_hash,
 };
 use mesh_core::compute::{split_work, verify_work, work_cost_mcu};
+use mesh_core::proximity;
 use mesh_gpu::{BackendKind, DeviceCapability};
 use mesh_ledger::{
     network::LedgerNetwork,
@@ -24,12 +25,12 @@ use mesh_ledger::{
 };
 use mesh_model::ModelManifest;
 use mesh_protocol::{
-    BalanceResponse, DEFAULT_LEASE_SECONDS, HeartbeatRequest, JobStatusResponse,
-    NetworkStatsResponse, NodeCapabilities, NodeStatusResponse, PollRequest, PollResponse,
-    RegisterRequest, RegisterResponse, ResultRequest, ResultResponse, SubmitJobRequest,
-    SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, empty_body_hash, heartbeat_body_hash,
-    job_id_from_auth, now_unix, register_body_hash, result_body_hash, submit_body_hash,
-    verify_auth,
+    BalanceResponse, DEFAULT_LEASE_SECONDS, HeartbeatRequest, JobStatusResponse, NetworkCoordinate,
+    NetworkStatsResponse, NodeCapabilities, NodeStatusResponse, PeerSample, PeerSampleResponse,
+    PollRequest, PollResponse, RegisterRequest, RegisterResponse, ResultRequest, ResultResponse,
+    SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, empty_body_hash,
+    heartbeat_body_hash, job_id_from_auth, now_unix, register_body_hash, result_body_hash,
+    submit_body_hash, verify_auth,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::{Arc, Mutex};
@@ -43,6 +44,9 @@ pub struct AppState {
 
 type AssignmentSettlementRow = (String, String, i64, i64, String, Option<String>, i64);
 
+/// How recently a node must have been heard from to count as online.
+const NODE_ONLINE_SECS: i64 = 30;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -55,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/nodes/{id}/balance", get(balance))
         .route("/v1/nodes/{id}", get(node_status))
         .route("/v1/network/stats", get(network_stats))
+        .route("/v1/network/peers", get(network_peers))
         .route("/v1/ai/models", get(list_models))
         .route("/v1/ai/models/register", post(register_model))
         .route("/v1/ai/models/{model}/{revision}", get(get_model))
@@ -162,15 +167,17 @@ async fn plan_ai(
             .iter()
             .map(|chunk| chunk.sha256.clone())
             .collect();
+        let requester = stored_coordinate(&conn, &req.auth.node_id);
         let mut statement = conn
             .prepare(
                 "SELECT node_id,capabilities_json FROM nodes WHERE last_seen>=?1 AND node_id!=?2",
             )
             .map_err(ApiError::internal)?;
         let rows = statement
-            .query_map(params![now_unix() - 30, req.auth.node_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map(
+                params![now_unix() - NODE_ONLINE_SECS, req.auth.node_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
             .map_err(ApiError::internal)?;
         let mut nodes = Vec::new();
         for row in rows {
@@ -194,8 +201,7 @@ async fn plan_ai(
                 node_id,
                 devices,
                 cached_chunks,
-                network_latency_ms: (capabilities.coordinator_latency_micros as f64 / 1000.0)
-                    .max(0.1),
+                network_latency_ms: scoring_latency_ms(requester.as_ref(), &capabilities),
                 bandwidth_mbps: (capabilities.model_bandwidth_kbps as f64 / 1000.0).max(0.001),
                 load_fraction: (capabilities.accelerator_load_permille.min(1000) as f64) / 1000.0,
                 recent_failures: 0,
@@ -512,13 +518,15 @@ fn ai_context(
         .iter()
         .map(|chunk| chunk.sha256.clone())
         .collect();
+    let requester = stored_coordinate(conn, requester_node_id);
     let mut statement = conn
         .prepare("SELECT node_id,capabilities_json FROM nodes WHERE last_seen>=?1 AND node_id!=?2")
         .map_err(ApiError::internal)?;
     let rows = statement
-        .query_map(params![now_unix() - 30, requester_node_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+        .query_map(
+            params![now_unix() - NODE_ONLINE_SECS, requester_node_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
         .map_err(ApiError::internal)?;
     let mut nodes = Vec::new();
     let mut seed_peers = Vec::new();
@@ -545,7 +553,7 @@ fn ai_context(
             } else {
                 Default::default()
             },
-            network_latency_ms: (capabilities.coordinator_latency_micros as f64 / 1000.0).max(0.1),
+            network_latency_ms: scoring_latency_ms(requester.as_ref(), &capabilities),
             bandwidth_mbps: (capabilities.model_bandwidth_kbps as f64 / 1000.0).max(0.001),
             load_fraction: capabilities.accelerator_load_permille.min(1000) as f64 / 1000.0,
             recent_failures: 0,
@@ -1066,7 +1074,7 @@ async fn network_stats(
     let online_nodes = conn
         .query_row(
             "SELECT COUNT(*) FROM nodes WHERE last_seen>=?1",
-            params![now_unix() - 30],
+            params![now_unix() - NODE_ONLINE_SECS],
             |r| r.get::<_, i64>(0),
         )
         .map_err(ApiError::internal)? as u64;
@@ -1098,6 +1106,63 @@ async fn network_stats(
         total_available_mcu,
         ledger_mode: ledger_mode(&state).into(),
     }))
+}
+
+/// How many probe targets a node is handed at once.
+///
+/// Vivaldi needs a handful of well-spread peers, not the whole network: the
+/// fit converges on a few, and every extra target is a real round trip on
+/// someone else's machine.
+const PEER_SAMPLE_SIZE: usize = 8;
+
+/// Hand out a sample of reachable peers to measure against.
+///
+/// This is a directory lookup, not an authority: the coordinator never times
+/// anything, never sees a round trip, and cannot influence the fit beyond
+/// choosing who gets measured. Gossip can replace this endpoint without
+/// changing how a single coordinate is computed.
+///
+/// The sample is random rather than "closest" or "most recent" on purpose.
+/// Handing every node the same peers would fit them all against the same few
+/// points, and a coordinate space built from one clique describes that clique
+/// rather than the network.
+async fn network_peers(
+    State(state): State<AppState>,
+) -> Result<Json<PeerSampleResponse>, ApiError> {
+    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT node_id, capabilities_json FROM nodes \
+             WHERE last_seen>=?1 ORDER BY RANDOM()",
+        )
+        .map_err(ApiError::internal)?;
+    let rows = stmt
+        .query_map(params![now_unix() - NODE_ONLINE_SECS], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(ApiError::internal)?;
+
+    let mut peers = Vec::new();
+    for row in rows {
+        let (node_id, capabilities_json) = row.map_err(ApiError::internal)?;
+        let Ok(caps) = serde_json::from_str::<NodeCapabilities>(&capabilities_json) else {
+            continue;
+        };
+        // A node that does not serve probes is not a target, even though it
+        // may well be measuring others.
+        let Some(probe_endpoint) = caps.probe_endpoint else {
+            continue;
+        };
+        peers.push(PeerSample {
+            node_id,
+            probe_endpoint,
+            coordinate: caps.network_coordinate,
+        });
+        if peers.len() >= PEER_SAMPLE_SIZE {
+            break;
+        }
+    }
+    Ok(Json(PeerSampleResponse { peers }))
 }
 
 fn finalize_reservation(
@@ -1155,6 +1220,39 @@ fn finalize_reward(
     }
     tx.commit().map_err(ApiError::internal)?;
     Ok(())
+}
+
+/// The coordinate a node last advertised, if it has one.
+fn stored_coordinate(conn: &Connection, node_id: &str) -> Option<NetworkCoordinate> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT capabilities_json FROM nodes WHERE node_id=?1",
+            params![node_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    serde_json::from_str::<NodeCapabilities>(&json?)
+        .ok()?
+        .network_coordinate
+        .filter(proximity::is_plausible)
+}
+
+/// Latency to score a worker at, in milliseconds.
+///
+/// Prefers the requester-to-worker distance. `coordinator_latency_micros` is
+/// the wrong quantity here: it measures the worker's distance to the
+/// coordinator, but the payload travels between requester and worker, and
+/// under a coordinator-free design there is no coordinator to be near.
+fn scoring_latency_ms(requester: Option<&NetworkCoordinate>, worker: &NodeCapabilities) -> f64 {
+    let coords = requester.zip(worker.network_coordinate.as_ref());
+    match coords {
+        Some((from, to)) if proximity::is_plausible(to) => {
+            (proximity::predicted_rtt_micros(from, to) as f64 / 1000.0).max(0.1)
+        }
+        _ => (worker.coordinator_latency_micros as f64 / 1000.0).max(0.1),
+    }
 }
 
 fn scalar_u64(conn: &Connection, sql: &str) -> Result<u64, ApiError> {
@@ -1256,6 +1354,7 @@ mod ai_api_tests {
     use mesh_model::{ChunkRef, ModelFormat, sha256};
     use mesh_protocol::{RegisterRequest, register_body_hash};
     use serde::{Serialize, de::DeserializeOwned};
+    use std::collections::HashSet;
     use std::fs;
 
     #[tokio::test]
@@ -1436,6 +1535,11 @@ mod ai_api_tests {
             model_bandwidth_kbps: 100_000,
             accelerator_load_permille: 0,
             ai_runtime_ready: ai_ready,
+            shared_logical_cpus: 4,
+            shared_memory_bytes: 8 * 1024 * 1024 * 1024,
+            shared_gpu_percent: if ai_ready { 100 } else { 0 },
+            network_coordinate: None,
+            probe_endpoint: None,
         }
     }
 
@@ -1447,6 +1551,138 @@ mod ai_api_tests {
         let response = reqwest::Client::new()
             .post(format!("{base}{path}"))
             .json(body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {text}");
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// The peer sample is a bootstrap directory, so it must only name nodes a
+    /// probe can actually reach: no endpoint, or gone quiet, means no entry.
+    #[tokio::test]
+    async fn the_peer_sample_lists_only_nodes_that_can_answer_a_probe() {
+        let root = std::env::temp_dir().join(format!("mesh-peer-sample-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("coordinator.db");
+        let state = AppState {
+            db: Arc::new(Mutex::new(
+                crate::db::open(db_path.to_str().unwrap()).unwrap(),
+            )),
+            ledger: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let base = format!("http://{address}");
+
+        // Serving probes is opt-in, so a node that never passed --probe-listen
+        // is online and schedulable but useless as a probe target.
+        let silent = NodeIdentity::load_or_create(&root.join("silent")).unwrap();
+        register_test_node(&base, &silent, test_capabilities(false, 0)).await;
+
+        let stale = NodeIdentity::load_or_create(&root.join("stale")).unwrap();
+        register_test_node(
+            &base,
+            &stale,
+            probeable_capabilities("http://127.0.0.1:7001"),
+        )
+        .await;
+
+        let reachable = NodeIdentity::load_or_create(&root.join("reachable")).unwrap();
+        register_test_node(
+            &base,
+            &reachable,
+            probeable_capabilities("http://127.0.0.1:7002"),
+        )
+        .await;
+
+        // Age the stale node past the online window without waiting for it.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE nodes SET last_seen = ?1 WHERE node_id = ?2",
+            params![now_unix() - NODE_ONLINE_SECS - 1, stale.node_id()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let sample: PeerSampleResponse = get(&base, "/v1/network/peers").await;
+        let ids: Vec<&str> = sample.peers.iter().map(|p| p.node_id.as_str()).collect();
+        let expected = reachable.node_id();
+        assert_eq!(
+            ids,
+            vec![expected.as_str()],
+            "only an online node that offered a probe endpoint belongs in the sample"
+        );
+        let peer = &sample.peers[0];
+        assert_eq!(peer.probe_endpoint, "http://127.0.0.1:7002");
+        assert_eq!(
+            peer.coordinate.as_ref().unwrap().error_permille,
+            250,
+            "an already-fitted peer must arrive with its confidence intact"
+        );
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Every extra target is a real round trip on someone else's machine, so
+    /// the sample stays bounded however large the mesh grows.
+    #[tokio::test]
+    async fn the_peer_sample_stays_bounded_as_the_mesh_grows() {
+        let root = std::env::temp_dir().join(format!("mesh-peer-cap-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let state = AppState {
+            db: Arc::new(Mutex::new(
+                crate::db::open(root.join("coordinator.db").to_str().unwrap()).unwrap(),
+            )),
+            ledger: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let base = format!("http://{address}");
+
+        for index in 0..PEER_SAMPLE_SIZE + 4 {
+            let home = root.join(format!("node-{index}"));
+            let identity = NodeIdentity::load_or_create(&home).unwrap();
+            let endpoint = format!("http://127.0.0.1:{}", 7100 + index);
+            register_test_node(&base, &identity, probeable_capabilities(&endpoint)).await;
+        }
+
+        let sample: PeerSampleResponse = get(&base, "/v1/network/peers").await;
+        assert_eq!(sample.peers.len(), PEER_SAMPLE_SIZE);
+        let unique: HashSet<&str> = sample.peers.iter().map(|p| p.node_id.as_str()).collect();
+        assert_eq!(
+            unique.len(),
+            PEER_SAMPLE_SIZE,
+            "a peer must not be sampled twice"
+        );
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn probeable_capabilities(endpoint: &str) -> NodeCapabilities {
+        let mut capabilities = test_capabilities(false, 0);
+        capabilities.probe_endpoint = Some(endpoint.to_string());
+        capabilities.network_coordinate = Some(NetworkCoordinate {
+            vector_micros: [1_000, 2_000, 3_000],
+            height_micros: 400,
+            error_permille: 250,
+        });
+        capabilities
+    }
+
+    async fn get<R: DeserializeOwned>(base: &str, path: &str) -> R {
+        let response = reqwest::Client::new()
+            .get(format!("{base}{path}"))
             .send()
             .await
             .unwrap();

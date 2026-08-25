@@ -10,10 +10,10 @@ use mesh_core::identity::NodeIdentity;
 use mesh_model::ModelManifest;
 use mesh_protocol::{
     BalanceResponse, ErrorResponse, HeartbeatRequest, JobStatusResponse, NetworkStatsResponse,
-    NodeCapabilities, NodeStatusResponse, PollRequest, PollResponse, RegisterRequest,
-    RegisterResponse, ResultRequest, ResultResponse, SubmitJobRequest, SubmitJobResponse,
-    WorkAssignment, WorkResult, WorkSpec, empty_body_hash, heartbeat_body_hash, register_body_hash,
-    result_body_hash, submit_body_hash,
+    NodeCapabilities, NodeStatusResponse, PeerSampleResponse, PollRequest, PollResponse,
+    RegisterRequest, RegisterResponse, ResultRequest, ResultResponse, SubmitJobRequest,
+    SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, empty_body_hash, heartbeat_body_hash,
+    register_body_hash, result_body_hash, submit_body_hash,
 };
 use reqwest::{Client, Response};
 use serde::de::DeserializeOwned;
@@ -179,6 +179,16 @@ impl MeshClient {
         let body_hash = fail_inference_body_hash(&request)?;
         request.auth = self.identity.auth("fail_inference", &body_hash);
         self.post("/v1/ai/work/fail", &request).await
+    }
+
+    /// Ask for probe targets to measure ourselves against.
+    ///
+    /// Unauthenticated on purpose: the reply is a directory of endpoints and
+    /// positions that every node already publishes, and requiring a signature
+    /// would imply the coordinator vouches for the answer. It does not - it
+    /// never times a round trip.
+    pub async fn peers(&self) -> Result<PeerSampleResponse> {
+        self.get("/v1/network/peers").await
     }
 
     pub async fn inference_status(&self, job_id: &str) -> Result<InferenceJobStatus> {

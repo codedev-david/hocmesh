@@ -160,7 +160,7 @@ Each installation creates an Ed25519 keypair locally.
 
 The private key remains on the participant machine. The public key derives the node identity and is registered with the coordinator.
 
-Protocol v3 signed live requests include:
+Protocol v4 signed live requests include:
 
 ```text
 protocol domain

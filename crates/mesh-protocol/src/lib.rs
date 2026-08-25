@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const AUTH_MAX_CLOCK_SKEW_SECS: i64 = 300;
 pub const DEFAULT_LEASE_SECONDS: i64 = 900;
 
@@ -22,6 +22,24 @@ pub struct GpuCapability {
     pub supports_int8: bool,
     pub benchmark_bytes_per_second: Option<u64>,
     pub benchmark_p95_micros: Option<u64>,
+}
+
+/// Number of axes in the synthetic latency space.
+pub const COORDINATE_DIMENSIONS: usize = 3;
+
+/// A node's position in latency space, carried with its capabilities.
+///
+/// Fixed-point microseconds rather than floats: this record is signed and
+/// compared byte-for-byte, and two honest peers must never disagree about
+/// its encoding because their platforms round differently.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkCoordinate {
+    /// Position along each axis, in microseconds.
+    pub vector_micros: [i64; COORDINATE_DIMENSIONS],
+    /// Access-link cost crossed at both ends of any path, in microseconds.
+    pub height_micros: i64,
+    /// Confidence in this position, per mille; 1000 means "no confidence".
+    pub error_permille: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +65,27 @@ pub struct NodeCapabilities {
     pub accelerator_load_permille: u16,
     #[serde(default)]
     pub ai_runtime_ready: bool,
+    /// Workers this node will actually run, after applying operator limits.
+    #[serde(default)]
+    pub shared_logical_cpus: usize,
+    /// RAM this node is willing to let a workload occupy.
+    #[serde(default)]
+    pub shared_memory_bytes: u64,
+    /// Share of GPU the operator lends; 0 means the GPU is not offered.
+    #[serde(default)]
+    pub shared_gpu_percent: u8,
+    /// Where this node sits in latency space, once it has measured enough
+    /// peers to have a position. `None` means "unknown" and must never be
+    /// scored as "nearby".
+    #[serde(default)]
+    pub network_coordinate: Option<NetworkCoordinate>,
+    /// Base URL at which this node answers latency probes, if it is reachable.
+    ///
+    /// Opt-in and independent of measuring: probing is outbound, so a node
+    /// behind NAT still fits its own coordinate. It just cannot be a target,
+    /// and so leaves this `None`.
+    #[serde(default)]
+    pub probe_endpoint: Option<String>,
 }
 
 /// Replay-resistant request authentication. The nonce must be unique per node
@@ -194,6 +233,54 @@ pub struct NetworkStatsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+/// One reachable peer a node may measure itself against.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerSample {
+    pub node_id: String,
+    /// Base URL of the peer's probe endpoint.
+    pub probe_endpoint: String,
+    /// The peer's last advertised position, if it has fitted one.
+    pub coordinate: Option<NetworkCoordinate>,
+}
+
+/// A bootstrap list of probe targets.
+///
+/// The coordinator is a convenient directory, not an authority: it never
+/// measures anything and never sees a round trip. A gossip layer can replace
+/// this endpoint without touching how coordinates are fitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerSampleResponse {
+    pub peers: Vec<PeerSample>,
+}
+
+/// A latency probe. The body is deliberately tiny so that what is timed is
+/// the round trip rather than the transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeRequest {
+    /// The caller's position, so the peer can fit against us as we fit
+    /// against it. `None` from a node that has not yet been placed.
+    #[serde(default)]
+    pub coordinate: Option<NetworkCoordinate>,
+    /// A round trip the caller already measured to this peer.
+    ///
+    /// The responder cannot time the exchange itself, so this is the only way
+    /// it learns the distance. It is an untrusted number, bounded on arrival
+    /// by the same limits as any other observation.
+    #[serde(default)]
+    pub measured_rtt_micros: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeResponse {
+    pub node_id: String,
+    /// The responder's position as it stands, whether or not it is yet
+    /// confident enough to advertise it for scheduling. `error_permille`
+    /// carries how much of it to believe. `None` means the responder declined
+    /// to give one, which the caller must treat as unusable rather than as a
+    /// position at the origin.
+    pub coordinate: Option<NetworkCoordinate>,
 }
 
 pub fn now_unix() -> i64 {

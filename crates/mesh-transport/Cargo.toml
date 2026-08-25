@@ -11,7 +11,9 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
+mesh-core = { path = "../mesh-core" }
 mesh-model = { path = "../mesh-model" }
+mesh-protocol = { path = "../mesh-protocol" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

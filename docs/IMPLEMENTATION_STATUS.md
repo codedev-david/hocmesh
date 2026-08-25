@@ -11,6 +11,8 @@
 | Replicated validator ledger | Implemented | Hash-linked entries and quorum certificates |
 | Crash-safe settlement intents | Implemented | Recovery integration test |
 | Client mirror and offline audit | Implemented | Validator quorum sync/audit commands |
+| Operator resource limits | Implemented | Persisted share of CPU/memory/GPU; advertised capacity is the share, not the machine |
+| Network coordinates | Implemented | Vivaldi fit from measured probes, persisted across restarts, advertised only once fitted |
 | BFT leader/view change | Not implemented | Static validator coordination remains |
 | Validator membership epochs | Not implemented | Validator set is pinned |
 

@@ -1,4 +1,4 @@
-# MESH Protocol v3
+# MESH Protocol v4
 
 ## Authentication
 
@@ -14,7 +14,7 @@ signature_b64
 Canonical signed message:
 
 ```text
-mesh-v3|ACTION|NODE_ID|TIMESTAMP|NONCE|BODY_HASH
+mesh-v4|ACTION|NODE_ID|TIMESTAMP|NONCE|BODY_HASH
 ```
 
 The server verifies:
@@ -88,7 +88,25 @@ GET  /v1/jobs/{id}
 GET  /v1/nodes/{id}/balance
 GET  /v1/nodes/{id}
 GET  /v1/network/stats
+GET  /v1/network/peers
 ```
+
+`GET /v1/network/peers` is deliberately unauthenticated and returns a small
+random sample of nodes that have opted into serving latency probes. It is a
+directory lookup, not an authority: nothing in the response is trusted, it only
+tells a node who is worth measuring. Gossip can replace it without a wire change.
+
+## Node routes
+
+```text
+POST /v1/proximity/probe
+```
+
+Served only by nodes started with `--probe-listen`. The request carries the
+caller's current position and the round trip it last measured to this node, so
+both sides can fit from one exchange; the response carries the responder's
+position as it stands, whether or not it is yet confident enough to advertise
+it for scheduling.
 
 ## Validator routes
 
@@ -102,6 +120,11 @@ GET  /v1/ledger/entries?from=N&limit=M
 
 ## Versioning
 
-`PROTOCOL_VERSION` is currently `2`.
+`PROTOCOL_VERSION` is currently `4`.
 
 Breaking wire changes should bump the protocol version and preserve explicit migration/compatibility behavior rather than silently changing serialized structures.
+
+Version `4` added `network_coordinate` and `probe_endpoint` to
+`NodeCapabilities`, and with them the two routes above. Because the version is
+part of the signed message, a v3 node cannot register against a v4 coordinator:
+registration rejects the mismatch before it checks the signature at all.

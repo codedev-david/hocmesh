@@ -5,7 +5,7 @@
 - Rust workspace split by responsibility.
 - Native participant/coordinator/validator binaries.
 - Ed25519 identities.
-- Signed protocol v3 requests with nonces and AI capability advertisements.
+- Signed protocol v4 requests with nonces and AI capability advertisements.
 - Hardware discovery and CPU benchmarking.
 - Declarative CPU work.
 - Multi-worker task parallelism.
@@ -20,6 +20,8 @@
 - Duplicate settlement protection.
 - Certified reservation-to-reward binding.
 - Full replica sync/audit for validators and participants.
+- Operator resource limits, so a contributor shares a slice rather than the machine.
+- Measured network coordinates, so scheduling uses requester-to-worker distance.
 
 ## Priority 0 — handoff validation
 
@@ -48,7 +50,6 @@
 - Regional coordinators.
 - Coordinator health/failover.
 - Shared/federated job state.
-- Latency/bandwidth probes.
 - Resource graph.
 - Scheduling by hardware, network, reliability, and cache locality.
 

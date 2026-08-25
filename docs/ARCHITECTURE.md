@@ -85,7 +85,8 @@ A participant node owns:
 - worker loops,
 - declarative work execution,
 - signed result proofs,
-- optional full-ledger mirror.
+- optional full-ledger mirror,
+- its own position in the network, measured rather than declared.
 
 ## Separation of control and data planes
 
@@ -105,12 +106,27 @@ Model data    -> P2P content-addressed swarm
 Tensor data   -> direct low-latency worker paths
 ```
 
-## Future peer discovery
+## Peer discovery
 
-The end state should support a DHT/bootstrap/gossip layer for:
+Latency probing runs directly between nodes. A node asks the coordinator for a
+small random sample of probe-serving peers, times a real round trip to each, and
+fits a Vivaldi coordinate from what it measured.
+
+The coordinator is only a directory here. It never asserts where a node sits,
+and nothing in its peer sample is trusted: it just says who is worth measuring.
+A node that has not measured enough advertises no coordinate at all, and the
+scheduler scores it by the worker's coordinator-observed latency instead - a
+worse number, honestly labelled, rather than a confident guess.
+
+Probing outward is unconditional; serving probes is opt-in (`--probe-listen`),
+so a node behind NAT still earns a position without ever accepting a connection.
+Each exchange also carries the round trip the caller measured, which lets the
+responder fit itself from the same packets rather than spending its own probe.
+
+What remains is to replace that bootstrap directory with a DHT/gossip layer,
+which needs no wire change, and to carry the same discovery to:
 
 - model chunk providers,
-- latency probes,
 - compute neighborhood discovery,
 - direct data-path establishment.
 

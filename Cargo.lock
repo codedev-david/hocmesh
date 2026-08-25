@@ -1117,6 +1117,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "uuid",
 ]
 
 [[package]]
@@ -1193,7 +1194,9 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "mesh-core",
  "mesh-model",
+ "mesh-protocol",
  "reqwest",
  "serde",
  "serde_json",

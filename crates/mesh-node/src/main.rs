@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use client::MeshClient;
 use mesh_ai::{InferenceRequirements, PlanRequest, SubmitInferenceRequest};
-use mesh_core::{hardware, identity::NodeIdentity};
+use mesh_core::{hardware, identity::NodeIdentity, limits::ResourceLimits, proximity::Vivaldi};
 use mesh_gpu::{InferenceBackend, InferenceRequest, LlamaCppBackend};
 use mesh_ledger::{
     network::LedgerNetwork, store::LedgerStore, types::ValidatorSet,
@@ -48,6 +48,21 @@ enum Command {
         model_seed_listen: Option<String>,
         #[arg(long)]
         model_seed_url: Option<String>,
+        /// Serve latency probes here so other nodes can measure the path to
+        /// this one. Requires a reachable address; measuring others does not.
+        #[arg(long)]
+        probe_listen: Option<String>,
+    },
+    /// Show where this node sits in the network's latency space.
+    Proximity,
+    /// Show or set the share of this machine lent to the mesh.
+    Limits {
+        #[arg(long)]
+        cpu_percent: Option<u8>,
+        #[arg(long)]
+        gpu_percent: Option<u8>,
+        #[arg(long)]
+        memory_percent: Option<u8>,
     },
     Status,
     Balance,
@@ -192,7 +207,10 @@ async fn main() -> Result<()> {
     let client = MeshClient::new(cli.coordinator, identity.clone());
     match cli.command {
         Command::Init => {
-            let caps = hardware::detect_capabilities(true);
+            let mut caps = hardware::detect_capabilities(true);
+            // Register with the same share the daemon will advertise, so an
+            // operator's limits hold from the very first contact.
+            hardware::apply_limits(&mut caps, &ResourceLimits::load_or_default(&cli.home)?);
             let r = client.register(&caps).await?;
             print_registration(&r, &caps);
         }
@@ -203,6 +221,7 @@ async fn main() -> Result<()> {
             gpu_layers,
             model_seed_listen,
             model_seed_url,
+            probe_listen,
         } => {
             let cached_model_manifests = model_registry(&cli.home)?
                 .list()?
@@ -214,15 +233,80 @@ async fn main() -> Result<()> {
                 model_seed_url,
                 cached_model_manifests,
             );
+            let limits = ResourceLimits::load_or_default(&cli.home)?;
+            hardware::apply_limits(&mut caps, &limits);
             caps.ai_runtime_ready = ai_runtime.is_some() && !caps.gpus.is_empty();
-            let workers = workers.unwrap_or_else(|| caps.logical_cpus.saturating_sub(1).max(1));
+            caps.probe_endpoint = probe_listen.as_ref().map(|listen| probe_url(listen));
+            // --workers may lower the ceiling the operator set, never raise it.
+            let workers = limits.clamp_requested_workers(workers, caps.logical_cpus);
+            println!(
+                "Sharing {} of {} logical CPUs (cpu {}%, gpu {}%, memory {}%)",
+                workers,
+                caps.logical_cpus,
+                limits.cpu_percent,
+                limits.gpu_percent,
+                limits.memory_percent
+            );
             let ai = ai_runtime.map(|runtime| daemon::AiWorkerConfig {
                 home: cli.home.clone(),
                 runtime,
                 gpu_layers,
                 seed_listen: model_seed_listen,
             });
-            daemon::run(client, caps, workers, poll_ms, ai).await?;
+            let proximity = daemon::ProximityConfig {
+                home: cli.home.clone(),
+                probe_listen,
+            };
+            daemon::run(client, caps, workers, poll_ms, ai, proximity).await?;
+        }
+        Command::Proximity => {
+            let tracker = Vivaldi::load_or_seeded(&cli.home, client.node_id().as_bytes());
+            match tracker.coordinate() {
+                Some(coordinate) => println!(
+                    "position: {:?} height {}us\nconfidence: {}%  (from {} measurements)\nstored at: {}",
+                    coordinate.vector_micros,
+                    coordinate.height_micros,
+                    100 - (coordinate.error_permille / 10).min(100),
+                    tracker.observations(),
+                    Vivaldi::path(&cli.home).display()
+                ),
+                None => println!(
+                    "Not placed yet: this node has measured nothing.\nRun `mesh daemon` and give it a minute, or check that the coordinator\nknows peers advertising --probe-listen."
+                ),
+            }
+        }
+        Command::Limits {
+            cpu_percent,
+            gpu_percent,
+            memory_percent,
+        } => {
+            let mut limits = ResourceLimits::load_or_default(&cli.home)?;
+            let changed =
+                cpu_percent.is_some() || gpu_percent.is_some() || memory_percent.is_some();
+            if let Some(v) = cpu_percent {
+                limits.cpu_percent = v;
+            }
+            if let Some(v) = gpu_percent {
+                limits.gpu_percent = v;
+            }
+            if let Some(v) = memory_percent {
+                limits.memory_percent = v;
+            }
+            if changed {
+                limits.save(&cli.home)?;
+            }
+            let cpus = hardware::detect_capabilities(false).logical_cpus;
+            println!(
+                "cpu {}%  gpu {}%  memory {}%
+workers when running: {} of {} logical CPUs
+stored at: {}",
+                limits.cpu_percent,
+                limits.gpu_percent,
+                limits.memory_percent,
+                limits.effective_workers(cpus),
+                cpus,
+                ResourceLimits::path(&cli.home).display()
+            );
         }
         Command::Status => {
             let s = client.node_status().await?;
@@ -661,4 +745,25 @@ fn print_registration(r: &mesh_protocol::RegisterResponse, c: &mesh_protocol::No
             "Contribution-first rule active: run `mesh daemon` and complete community work before submitting jobs."
         );
     }
+}
+
+/// Turn a listen address into the URL peers should probe.
+///
+/// A wildcard bind says where to *listen*, not where to be *found*, so it is
+/// rewritten to loopback rather than advertised as-is: `0.0.0.0` reaches
+/// nothing from another machine, and publishing it would put an endpoint in
+/// the directory that every peer wastes a probe timeout on. An operator with a
+/// real public address should pass it explicitly.
+fn probe_url(listen: &str) -> String {
+    let address = listen.trim();
+    if let Some(port) = address.strip_prefix("0.0.0.0:") {
+        return format!("http://127.0.0.1:{port}");
+    }
+    if let Some(port) = address.strip_prefix("[::]:") {
+        return format!("http://127.0.0.1:{port}");
+    }
+    if address.starts_with("http://") || address.starts_with("https://") {
+        return address.to_string();
+    }
+    format!("http://{address}")
 }

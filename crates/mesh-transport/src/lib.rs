@@ -1,3 +1,6 @@
+mod proximity;
+pub use proximity::{ProbeOutcome, ProbeState, probe_peer, probe_router};
+
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use axum::{

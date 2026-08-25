@@ -23,6 +23,8 @@ Implemented architecture:
 - Ed25519 node identities generated locally.
 - Replay-resistant signed API requests using timestamp + cryptographic nonce.
 - Hardware discovery and CPU benchmarking.
+- Operator-set resource limits: a node advertises the share of CPU/memory/GPU it lends, never the whole machine.
+- Measured network coordinates, so the scheduler ranks workers by distance to the requester rather than to itself.
 - GPU detection for NVIDIA/CUDA and Apple/Metal-capable systems where detectable by the current hardware adapter.
 - Declarative allow-listed work instead of arbitrary remote binaries.
 - Deterministic prime-range workload as the first safe distributed workload.
@@ -485,13 +487,42 @@ mesh --coordinator https://coordinator.example.org --home .mesh init
 mesh --coordinator https://coordinator.example.org --home .mesh daemon --workers 4
 ```
 
-Workers only need outbound access to the coordinator. They do not need an inbound listening port.
+Workers only need outbound access to the coordinator. They do not need an inbound listening port unless they opt into answering other nodes' latency probes.
+
+### Choosing how much of the machine to lend
+
+A contributor lends a share, not the whole box. The share is stored under
+`--home` and is what the node advertises; the coordinator never sees the rest.
+
+```bash
+mesh --home .mesh-a limits
+mesh --home .mesh-a limits --cpu-percent 50 --memory-percent 25 --gpu-percent 0
+```
+
+Limits apply from the first contact: `mesh init` registers the same share the
+daemon will advertise. Setting `--gpu-percent 0` withdraws the GPU entirely, and
+the node stops advertising accelerators at all.
+
+### Seeing where the node sits
+
+```bash
+mesh --home .mesh-a proximity
+```
+
+A node that has not yet measured enough peers reports that it has no place yet
+rather than inventing one. To also answer other nodes' probes, give the daemon a
+port to listen on:
+
+```bash
+mesh --home .mesh-a daemon --workers 4 --probe-listen 0.0.0.0:8646
+```
 
 ---
 
 # How clients find work and one another
 
-In v0.2, participant nodes do **not** open random inbound peer ports or directly discover workers.
+Participant nodes do **not** open random inbound peer ports and do not discover
+workers directly. Work is still handed out by the coordinator.
 
 The scheduler model is:
 
@@ -504,6 +535,15 @@ Worker A ──poll──► Coordinator ◄──poll── Worker B
 ```
 
 This choice is deliberate because it works through normal home NAT/firewalls and minimizes attack surface.
+
+The one thing nodes do measure between themselves is distance. Every daemon
+probes a small sample of peers outbound and fits a network coordinate from the
+round trips it observes, which is what lets the scheduler rank workers by their
+distance to the requester rather than to the coordinator.
+
+Probing outward needs no inbound port. Answering other nodes' probes does, so it
+stays opt-in behind `--probe-listen`; a node that never sets it is still placed
+on the map by its own measurements.
 
 The end-state architecture will add peer discovery/data paths for model blocks and low-latency compute neighborhoods, while the control plane can remain federated rather than requiring direct arbitrary remote access.
 

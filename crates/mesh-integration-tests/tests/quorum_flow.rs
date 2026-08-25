@@ -676,6 +676,11 @@ fn capabilities() -> NodeCapabilities {
         model_bandwidth_kbps: 100_000,
         accelerator_load_permille: 0,
         ai_runtime_ready: false,
+        shared_logical_cpus: 2,
+        shared_memory_bytes: 4 * 1024 * 1024 * 1024,
+        shared_gpu_percent: 0,
+        network_coordinate: None,
+        probe_endpoint: None,
     }
 }
 

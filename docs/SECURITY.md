@@ -34,7 +34,7 @@ Current key persistence is a local JSON file. Public production should move priv
 
 ## Replay resistance
 
-Protocol v3 uses a random nonce in every signed API request.
+Protocol v4 uses a random nonce in every signed API request.
 
 The coordinator persists recent nonces and rejects reuse.
 
