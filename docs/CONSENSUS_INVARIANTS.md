@@ -29,6 +29,30 @@ A user reservation transfers CU from requester to a job escrow. A provider rewar
 
 The only account allowed to supply newly issued bootstrap CU is `hocmesh:community:issuance`, and cumulative issuance may not exceed the validator-set policy limit.
 
+## What a Compute Unit buys
+
+Every workload prices against one constant, `REFERENCE_OPS_PER_MCU`, so a mCU
+means the same machine work whichever workload earned it. The price comes from
+the *spec*, never from elapsed time: a slow machine must not earn more for
+identical work, and nobody can prove how long they spent.
+
+That rule is only true if the op model matches the work. Prime shards were
+first rated at a flat one operation per candidate, which is right at 10^4 and
+wrong by 33x at 10^8, because trial division gets more expensive as the numbers
+grow. A unit that drifts with its input is not a unit, and the drift is an
+arbitrage: pick the range where the mCU is cheapest to earn, spend it where the
+mCU is dearest to buy.
+
+A prime candidate near `n` now costs `2 + isqrt(n) / (3 * ln n)` divisions -
+composites fall out on the first two checks, primes run to the square root in
+steps of six, and about one candidate in `ln n` is prime. Measured against the
+divisions the code actually performs, that model holds within 25% from 10^4 to
+10^8, where the flat rate drifted 33x over the same span.
+
+The model is integer-only on purpose. A price has to be reproduced exactly by
+every validator, and floating point makes no such promise across machines.
+
+
 ## Exactly-once claims
 
 - Both user and community reservations claim `reserve:<job_id>`.

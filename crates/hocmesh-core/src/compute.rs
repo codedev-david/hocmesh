@@ -91,15 +91,15 @@ pub fn is_prime(n: u64) -> bool {
 /// recompute this number, which is why the coordinator is not the authority
 /// on what a shard is worth.
 ///
-/// Both variants are calibrated against one reference unit: 1 mCU is either 50
-/// candidate integers or `REFERENCE_OPS_PER_MCU` field multiply-adds, which
-/// cost about the same on the reference machine. Every workload added later
-/// must declare its price the same way -- closed form, from the spec.
+/// There is one calibration and every workload goes through it: ops on the
+/// reference machine, divided by `REFERENCE_OPS_PER_MCU`. No workload gets its
+/// own rate, because a mCU earned counting primes has to buy the same machine
+/// work as a mCU earned multiplying matrices -- otherwise the cheapest workload
+/// to run becomes the cheapest way to mint, and the unit stops meaning
+/// anything. Every workload added later must price the same way: closed form,
+/// from the spec, against this one constant.
 pub fn work_cost_mcu(work: &WorkSpec) -> i64 {
-    let mcu = match work {
-        WorkSpec::PrimeCount { start, end } => end.saturating_sub(*start).div_ceil(50),
-        other => verify::compute_ops(other).div_ceil(REFERENCE_OPS_PER_MCU),
-    };
+    let mcu = verify::compute_ops(work).div_ceil(REFERENCE_OPS_PER_MCU);
     mcu.max(1).min(i64::MAX as u64) as i64
 }
 
@@ -208,6 +208,50 @@ mod tests {
     #[test]
     fn prime_count_is_correct() {
         assert_eq!(count_primes(2, 20), 8);
+    }
+
+    /// The price of a prime shard has to track what the machine really does.
+    ///
+    /// Counting the divisions a range actually costs and comparing them with
+    /// the number the ledger charges for is the only way to know a mCU still
+    /// means the same work at 10^8 as at 10^4. The flat rate this replaced was
+    /// off by more than a hundredfold across that span, which quietly made the
+    /// unit mean whichever range you happened to pick.
+    #[test]
+    fn a_prime_shard_costs_what_it_is_priced_at() {
+        fn divisions(n: u64) -> u64 {
+            if n < 5 {
+                return 1;
+            }
+            if n.is_multiple_of(2) || n.is_multiple_of(3) {
+                return 2;
+            }
+            let mut ops = 2;
+            let mut i = 5_u64;
+            while i <= n / i {
+                ops += 2;
+                if n.is_multiple_of(i) || n.is_multiple_of(i + 2) {
+                    return ops;
+                }
+                i += 6;
+            }
+            ops
+        }
+
+        for (start, end) in [
+            (2_u64, 20_000_u64),
+            (1_000_000, 1_020_000),
+            (100_000_000, 100_020_000),
+        ] {
+            let measured: u64 = (start..end).map(divisions).sum();
+            let priced = verify::compute_ops(&WorkSpec::PrimeCount { start, end });
+            let ratio = priced as f64 / measured as f64;
+            assert!(
+                (0.6..1.7).contains(&ratio),
+                "primes in {start}..{end} really cost {measured} divisions but are \
+                 priced at {priced} ({ratio:.2}x) - a mCU has stopped meaning one thing"
+            );
+        }
     }
 
     #[test]

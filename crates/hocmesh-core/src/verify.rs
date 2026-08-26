@@ -362,7 +362,9 @@ pub fn compare_replicas(first: &WorkResult, second: &WorkResult) -> Verdict {
 /// Multiplications needed to produce a shard, for cost reporting.
 pub fn compute_ops(work: &WorkSpec) -> u64 {
     match work {
-        WorkSpec::PrimeCount { start, end } => end.saturating_sub(*start),
+        WorkSpec::PrimeCount { start, end } => end
+            .saturating_sub(*start)
+            .saturating_mul(trial_division_ops(*end)),
         WorkSpec::MatrixMultiply {
             dim,
             row_start,
@@ -373,6 +375,25 @@ pub fn compute_ops(work: &WorkSpec) -> u64 {
             span * u64::from(*dim) * u64::from(*dim)
         }
     }
+}
+
+/// Divisions one trial-division candidate costs near `n`.
+///
+/// Composites almost all fall out on the first two checks; a prime runs to the
+/// square root in steps of six, and about one candidate in `ln n` is prime.
+///
+/// Flat-rating a candidate, which is what the first cut did, makes one mCU
+/// mean a hundred times more machine work at 10^12 than at 10^6 - and a unit
+/// that drifts with its input is not a unit.
+///
+/// Integer arithmetic only. This number sets a price every validator has to
+/// reproduce exactly, and floating point makes no such promise across
+/// machines.
+pub fn trial_division_ops(n: u64) -> u64 {
+    let n = n.max(2);
+    // ln n, from the exact integer log2 scaled by 693/1000 ~ ln 2.
+    let ln_n = (u64::from(n.ilog2()) * 693 / 1000).max(1);
+    2 + n.isqrt() / (3 * ln_n)
 }
 
 /// Multiplications needed to check a shard with its witness.

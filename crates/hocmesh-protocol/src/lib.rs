@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+/// Bumped to 6 when prime shards started pricing by the divisions they really
+/// cost instead of a flat rate per candidate. Prices are consensus-visible, so
+/// history certified under the old rate must not validate under the new one.
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const AUTH_MAX_CLOCK_SKEW_SECS: i64 = 300;
 pub const DEFAULT_LEASE_SECONDS: i64 = 900;
 

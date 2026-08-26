@@ -96,7 +96,7 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
             .arg("--start")
             .arg("2")
             .arg("--end")
-            .arg("2000")
+            .arg("200000")
             .arg("--shards")
             .arg("4"),
         "seed community job",
