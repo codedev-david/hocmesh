@@ -30,7 +30,7 @@ The private key stays local.
 
 The node ID is derived from the public key.
 
-Current key persistence is a local JSON file. Public production should move private-key protection into OS secure storage or hardware-backed key facilities.
+Keys persist in a local JSON file, sealed with a passphrase when `HOCMESH_IDENTITY_PASSPHRASE` is set. See *Key custody, and why the ledger is not encrypted* below. Hardware-backed key storage remains the stronger option for a production validator.
 
 ## Replay resistance
 
@@ -176,6 +176,51 @@ Before public release add:
 - validator proposal rate limits,
 - computational verification budgets,
 - abuse reputation/ban controls.
+
+## Key custody, and why the ledger is not encrypted
+
+These two are one decision, so they are written down together.
+
+The ledger is **not** encrypted, at rest or in the entries it serves, and that
+is deliberate. Its entire security argument is that anyone can replay it and
+arrive at the same balances. A chain nobody can independently check is worth
+less than one everybody can read.
+
+Encrypting the validator database would also have bought very little. Entries
+are served over the API and clients are expected to mirror them, so a stolen
+disk yields nothing an attacker could not have fetched. It would have protected
+data that is public by design while making the one property the system depends
+on harder to exercise.
+
+Two related ideas were considered and rejected on the same grounds. Rotating
+per-epoch account keys would buy weak unlinkability - the network layer leaks
+far more than the ledger does - while breaking per-account CU conservation,
+`BalanceProof`, escrow addressing, and the requester-cannot-pay-itself check.
+Confidential amounts would make CU conservation uncheckable without a
+zero-knowledge circuit, which contradicts the invariant outright.
+
+### What does need to stay secret
+
+The signing key. A validator's key is the whole quorum's security, and it lived
+in `identity.json` in the clear, protected by a `chmod 0600` that was a silent
+no-op on any platform without Unix file modes.
+
+Setting `HOCMESH_IDENTITY_PASSPHRASE` now seals the key with XChaCha20-Poly1305
+under an Argon2id-derived key. Setting it on a node that already has a
+plaintext identity re-seals that identity in place, keeping the node id the rest
+of the network knows it by. Where file modes cannot be enforced, an unsealed key
+says so on stderr rather than reporting success.
+
+It is a passphrase from the environment rather than a prompt because a
+validator has to come back after a reboot without a human present. Supply it
+the way the platform supplies secrets - a systemd credential, a service
+environment, a secrets manager - not from a file next to the key it protects.
+
+This does not defend against malware already running as the node's own user;
+nothing that starts unattended can. It defends against the ways keys actually
+escape: a backup, a synced folder, a copied disk, a repository someone committed
+their working directory to. If a validator key does leak, the answer is now
+eviction - see *Validator set membership* above.
 
 ## Data privacy
 
