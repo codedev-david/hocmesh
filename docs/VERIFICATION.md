@@ -143,14 +143,23 @@ The reveal is 12,288 of 262,144 bytes - 4.7% of the shard - and the validator
 re-executes exactly those rows, so it pays 4.7% of the job. Both numbers fall
 out of `AUDIT_BUCKETS / BUCKETS`, unchanged from the integer path.
 
-**Not yet wired.** `hocmesh-core::tensor` proves both halves work: the witness
-for whoever holds the payload, the block audit for whoever does not. Neither is
-reachable from a job yet. There is no `WorkSpec` for inference, so no inference
-shard is priced, escrowed or paid through the ledger, and the protocol has no
-reveal round: the block audit needs the provider to answer a challenge after
-settlement is proposed, which is a message that does not exist today. Both are
-engineering jobs rather than open questions, and that is the whole change in
-their status.
+Sixty-four digests is 4 KB, which is too much for an entry, so the entry
+carries their root and the digest list arrives with the reveal. A validator
+checks that the list reproduces the root - which was signed before anyone could
+know the challenge - then that each revealed block matches its own digest, then
+that a fresh re-execution of those rows agrees with them. `reveal_accepted`
+does all three and trusts nothing that arrived with the reveal. The entry stays
+64 bytes whatever the shard costs.
+
+**Not yet wired.** `hocmesh-core::tensor` has all three checks working: the
+witness for whoever holds the payload, the block audit for whoever does not,
+and `reveal_accepted` for the round a validator would run. None of it is
+reachable from a job. There is no `WorkSpec` for inference, so no inference
+shard is priced, escrowed or paid, and no transaction carries a reveal. What
+is left is plumbing with a known shape: a `TensorProduct` spec and result, an
+entry that carries the root, and a second transaction that carries the digest
+list and the opened blocks. Until that exists, `audit_class` keeps tensor work
+out of the issuance path, which is where an unaudited shard would do damage.
 
 ## The nonce must come after the commitment
 

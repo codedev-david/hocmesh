@@ -291,6 +291,55 @@ pub fn block_reexecuted(
     worst / scale <= TOLERANCE
 }
 
+/// The single digest a ledger entry carries for a whole shard.
+///
+/// The per-block digests are what the audit needs, but 64 of them is 4 KB and
+/// an entry should be small. So the entry carries their root, and the block
+/// list arrives with the reveal, where it can be checked against the root that
+/// was published before anyone knew which blocks would be opened.
+pub fn commit_blocks(commitments: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hocmesh-tensor-blocks-v1");
+    hasher.update((commitments.len() as u64).to_be_bytes());
+    for digest in commitments {
+        hasher.update((digest.len() as u64).to_be_bytes());
+        hasher.update(digest.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The whole audit a validator runs on a revealed shard.
+///
+/// `root` came from the ledger entry, which was signed before `nonce` could be
+/// derived. `digests` and `revealed` arrive with the reveal, so neither is
+/// trusted: the digest list has to reproduce the root, and the revealed rows
+/// have to match both their own digest and a fresh re-execution of those rows.
+pub fn reveal_accepted(
+    a: &[f32],
+    b: &[f32],
+    shape: Shape,
+    root: &str,
+    digests: &[String],
+    nonce: crate::verify::AuditNonce,
+    revealed: &[&[f32]],
+) -> bool {
+    if digests.len() != BLOCKS as usize || commit_blocks(digests) != root {
+        return false;
+    }
+    let opened = opened_blocks(nonce);
+    if revealed.len() != opened.len() {
+        return false;
+    }
+    opened
+        .iter()
+        .zip(revealed)
+        .all(|(index, rows)| block_reexecuted(a, b, shape, *index, rows, &digests[*index as usize]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +624,88 @@ mod tests {
             "reveal {revealed} of {}",
             product.len()
         );
+    }
+
+    /// One helper for the whole reveal round, so the tests below only vary the
+    /// thing they are actually testing.
+    fn reveal_for(
+        product: &[f32],
+        s: Shape,
+        nonce: crate::verify::AuditNonce,
+    ) -> (String, Vec<String>, Vec<&[f32]>) {
+        let digests = block_commitments(product, s);
+        let root = commit_blocks(&digests);
+        let revealed = opened_blocks(nonce)
+            .into_iter()
+            .map(|index| block_payload(product, s, index))
+            .collect();
+        (root, digests, revealed)
+    }
+
+    /// The round a validator actually runs: a 64-byte root from the entry, a
+    /// nonce it derived itself, and a reveal it does not trust.
+    #[test]
+    fn an_honest_shard_survives_the_whole_reveal_round() {
+        let s = shape();
+        let a = matrix(0xa11, s.rows * s.inner);
+        let b = matrix(0xb22, s.inner * s.cols);
+        let product = multiply_blocked(&a, &b, s);
+        for seed in [1u64, 2, 3, 99] {
+            let nonce = crate::verify::AuditNonce::draw(seed);
+            let (root, digests, revealed) = reveal_for(&product, s, nonce);
+            assert!(reveal_accepted(
+                &a, &b, s, &root, &digests, nonce, &revealed
+            ));
+        }
+    }
+
+    /// Swapping the digest list for one that matches a shard the provider did
+    /// compute is the obvious attack on a root that only commits to a list.
+    #[test]
+    fn a_digest_list_that_does_not_reproduce_the_root_is_refused() {
+        let s = shape();
+        let a = matrix(0xa11, s.rows * s.inner);
+        let b = matrix(0xb22, s.inner * s.cols);
+        let product = multiply(&a, &b, s);
+        let nonce = crate::verify::AuditNonce::draw(4);
+        let (root, mut digests, revealed) = reveal_for(&product, s, nonce);
+        digests[0] = commit(&[0.0f32]);
+        assert!(!reveal_accepted(
+            &a, &b, s, &root, &digests, nonce, &revealed
+        ));
+    }
+
+    /// A provider that computed the shard for a different nonce cannot reuse
+    /// the reveal, because the challenge names different blocks.
+    #[test]
+    fn a_reveal_for_the_wrong_nonce_is_refused() {
+        let s = shape();
+        let a = matrix(0xa11, s.rows * s.inner);
+        let b = matrix(0xb22, s.inner * s.cols);
+        let product = multiply(&a, &b, s);
+        let asked = crate::verify::AuditNonce::draw(5);
+        let answered = crate::verify::AuditNonce::draw(6);
+        assert_ne!(opened_blocks(asked), opened_blocks(answered));
+        let (root, digests, stale) = reveal_for(&product, s, answered);
+        assert!(!reveal_accepted(&a, &b, s, &root, &digests, asked, &stale));
+    }
+
+    /// The entry stays small whatever the shard costs, which is the only
+    /// reason committing beats shipping the product.
+    #[test]
+    fn the_entry_carries_one_digest_however_large_the_shard() {
+        let s = shape();
+        let product = matrix(0xc33, s.rows * s.cols);
+        let root = commit_blocks(&block_commitments(&product, s));
+        assert_eq!(root.len(), 64);
+        let bigger = Shape {
+            rows: s.rows,
+            inner: s.inner,
+            cols: s.cols * 2,
+        };
+        let wide = matrix(0xc34, bigger.rows * bigger.cols);
+        let wide_root = commit_blocks(&block_commitments(&wide, bigger));
+        assert_eq!(wide_root.len(), root.len());
+        assert_ne!(wide_root, root);
     }
 }
