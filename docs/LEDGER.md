@@ -284,6 +284,12 @@ answers what the seats were at a height; `current_set()` answers what they are
 now. A node that has been running is bound by what the quorum certified, not by
 whatever is still sitting in its bootstrap file.
 
+Mirroring follows the same rule as auditing. A client fetching a run of
+entries checks each one against the set that governed it, walking that set
+forward across any change the run contains, because an old entry was signed by
+whoever held a seat at the time. Checking history against the seats sitting now
+would reject the whole chain the moment anybody joined or left.
+
 See `docs/SECURITY.md`, *Validator set membership*, for the vouch message, the
 threshold rationale, and the operator commands.
 

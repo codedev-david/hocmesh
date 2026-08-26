@@ -7,7 +7,7 @@ use hocmesh_ledger::{
     network::LedgerNetwork,
     types::{
         COMMUNITY_ISSUANCE_ACCOUNT, LedgerHead, LedgerTransaction, Posting, TransactionEvidence,
-        TransactionKind, ValidatorSet, escrow_account,
+        TransactionKind, ValidatorMember, ValidatorSet, ValidatorSignature, escrow_account,
     },
 };
 use hocmesh_protocol::{
@@ -1083,4 +1083,240 @@ async fn concurrent_settlements_share_ledger_entries() -> Result<()> {
     }
     drop(validators);
     Ok(())
+}
+
+/// A fifth validator is admitted by vouch, catches up, and then holds a seat
+/// the bootstrap file has never heard of.
+///
+/// This is the whole membership path through the real binaries. Three sitting
+/// validators sponsor a joiner by name, the change is certified into the chain,
+/// the joiner replays from the *genesis* file and arrives holding a set that
+/// file does not describe, and a client still addressing the old seats follows
+/// the change forward instead of stalling. The last settlement runs with one of
+/// the original validators killed, so a quorum of four out of five can only
+/// form if the joiner's signature counts for as much as anybody else's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vouched_validator_joins_and_the_chain_carries_the_change() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = Client::new();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let (validators_path, validator_homes, validator_dbs, set) =
+        create_validator_set(&tmp, &validator_bin, &validator_ports)?;
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    // Something in the chain before the set moves, so the joiner has history to
+    // replay that predates its own admission.
+    let net = LedgerNetwork::new(set.clone())?;
+    settle_community(&net, "before").await?;
+    let before = net.head_quorum().await?.sequence;
+
+    // A fifth identity, created but in nobody's set.
+    let joiner_port = free_port()?;
+    let joiner_home = tmp.path.join("validator-4");
+    let joiner_db = tmp.path.join("validator-4.db");
+    let joiner = validator_member(&validator_bin, &joiner_home, joiner_port)?;
+    let member_path = tmp.path.join("joiner.json");
+    fs::write(&member_path, serde_json::to_vec_pretty(&joiner)?)?;
+
+    // Sponsors, one at a time and each on its own machine's key. Three is the
+    // sitting set's own threshold: admission is never cheaper than agreement.
+    let mut vouches = Vec::new();
+    for home in validator_homes.iter().take(3) {
+        vouches.push(vouch(&node_bin, home, &validators_path, &member_path, 4)?);
+    }
+    let vouches_path = tmp.path.join("vouches.json");
+    fs::write(&vouches_path, serde_json::to_vec_pretty(&vouches)?)?;
+
+    let next_path = tmp.path.join("validators.next.json");
+    run_ok(
+        Command::new(&node_bin)
+            .arg("--home")
+            .arg(&validator_homes[0])
+            .arg("membership-commit")
+            .arg("--validators")
+            .arg(&validators_path)
+            .arg("--action")
+            .arg("join")
+            .arg("--member")
+            .arg(&member_path)
+            .arg("--threshold")
+            .arg("4")
+            .arg("--vouches")
+            .arg(&vouches_path)
+            .arg("--out")
+            .arg(&next_path),
+        "membership-commit",
+    )?;
+    let next: ValidatorSet = serde_json::from_slice(&fs::read(&next_path)?)?;
+    assert_eq!(next.members.len(), 5);
+    assert_eq!(next.threshold, 4);
+
+    // The joiner bootstraps from the file that predates it. Entries up to its
+    // own admission are checked against the four seats that certified them, and
+    // everything after against the five the chain then hands over - which is
+    // the only reason a file with no mention of this validator is enough.
+    run_ok(
+        Command::new(&validator_bin)
+            .arg("sync")
+            .arg("--db")
+            .arg(&joiner_db)
+            .arg("--validators")
+            .arg(&validators_path),
+        "joiner sync",
+    )?;
+    validators.push(
+        start_validator(
+            &validator_bin,
+            &validators_path,
+            &joiner_home,
+            &joiner_db,
+            joiner_port,
+            &http,
+        )
+        .await?,
+    );
+
+    // A client still holding the four-member file settles again. Quorum is four
+    // of five now, which that file cannot reach, so this only passes if the
+    // client followed the change forward on its own.
+    settle_community(&net, "after").await?;
+    assert_eq!(net.set().members.len(), 5);
+    assert!(net.head_quorum().await?.sequence > before);
+
+    // Take an original validator away. Four seats are left, the threshold is
+    // four, and one of them is the joiner: nothing settles from here unless the
+    // admission was real.
+    validators[0].kill();
+    settle_community(&net, "without-a-founder").await?;
+
+    let head = net.head_quorum().await?;
+    let joiner_head = validator_head(&http, &joiner.url).await?;
+    assert_eq!(joiner_head.entry_hash, head.entry_hash);
+    assert_eq!(joiner_head.sequence, head.sequence);
+
+    for mut v in validators {
+        v.kill();
+    }
+    Ok(())
+}
+
+/// Read a validator's identity out of its home and describe it as a member.
+fn validator_member(validator_bin: &Path, home: &Path, port: u16) -> Result<ValidatorMember> {
+    let output = Command::new(validator_bin)
+        .arg("id")
+        .arg("--home")
+        .arg(home)
+        .output()
+        .context("creating joiner identity")?;
+    if !output.status.success() {
+        bail!(
+            "validator id failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    Ok(ValidatorMember {
+        validator_id: parse_value(&stdout, "validator_id=")?,
+        url: format!("http://127.0.0.1:{port}"),
+        public_key_b64: parse_value(&stdout, "public_key_b64=")?,
+    })
+}
+
+/// One sitting validator's signed sponsorship, produced the way an operator
+/// produces it: locally, from the machine that holds the key.
+fn vouch(
+    node_bin: &Path,
+    home: &Path,
+    validators_path: &Path,
+    member_path: &Path,
+    threshold: usize,
+) -> Result<ValidatorSignature> {
+    let output = Command::new(node_bin)
+        .arg("--home")
+        .arg(home)
+        .arg("membership-vouch")
+        .arg("--validators")
+        .arg(validators_path)
+        .arg("--action")
+        .arg("join")
+        .arg("--member")
+        .arg(member_path)
+        .arg("--threshold")
+        .arg(threshold.to_string())
+        .output()
+        .context("running membership-vouch")?;
+    if !output.status.success() {
+        bail!(
+            "membership-vouch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let line = stdout
+        .lines()
+        .next_back()
+        .ok_or_else(|| anyhow!("membership-vouch printed nothing"))?;
+    Ok(serde_json::from_str(line)?)
+}
+
+/// Mint a small community job and settle its reservation through the quorum.
+async fn settle_community(net: &LedgerNetwork, label: &str) -> Result<()> {
+    let work = WorkSpec::PrimeCount { start: 2, end: 200 };
+    let shards = 1;
+    let cost: i64 = split_work(&work, shards).iter().map(work_cost_mcu).sum();
+    let job_id = format!("job_membership_{label}");
+    net.transact(LedgerTransaction {
+        transaction_id: format!("community_reserve_{job_id}"),
+        kind: TransactionKind::CommunityReserve,
+        postings: vec![
+            Posting {
+                account_id: COMMUNITY_ISSUANCE_ACCOUNT.into(),
+                delta_mcu: -cost,
+            },
+            Posting {
+                account_id: escrow_account(&job_id),
+                delta_mcu: cost,
+            },
+        ],
+        evidence: TransactionEvidence::CommunityReserve {
+            job_id,
+            work,
+            shards,
+        },
+        created_at: now_unix(),
+    })
+    .await?;
+    Ok(())
+}
+
+/// One validator's own view of the head, unsigned-checked - the caller is
+/// asserting agreement, not trusting the answer.
+async fn validator_head(http: &Client, url: &str) -> Result<LedgerHead> {
+    let proof: serde_json::Value = http
+        .get(format!("{}/v1/ledger/head", url.trim_end_matches('/')))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(serde_json::from_value(proof["head"].clone())?)
 }

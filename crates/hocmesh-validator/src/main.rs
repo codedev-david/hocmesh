@@ -490,22 +490,32 @@ fn validate_inference_membership(store: &LedgerStore, tx: &LedgerTransaction) ->
     Ok(())
 }
 async fn sync(db: &str, validators: &str, batch: u64) -> Result<()> {
-    let set = load_set(validators)?;
-    let net = LedgerNetwork::new(set.clone())?;
+    let net = LedgerNetwork::new(load_set(validators)?)?;
     let mut store = LedgerStore::open(db)?;
     loop {
+        // Whatever the chain has last handed over, not the bootstrap file. A
+        // validator catching up across an admission has to check the entries
+        // after it against the set that admitted, exactly as an audit does.
+        let set = store.current_set()?.unwrap_or_else(|| net.set());
         let h = store.head(&set)?;
+        net.refresh_set().await?;
         let remote = net.head_quorum().await?;
         if h.sequence >= remote.sequence {
             println!("SYNC OK height={} head={}", h.sequence, h.entry_hash);
             break;
         }
-        let certs = net.fetch_certificates(h.sequence + 1, batch.max(1)).await?;
+        let certs = net
+            .fetch_certificates(h.sequence + 1, batch.max(1), &set)
+            .await?;
         if certs.is_empty() {
             bail!("remote head is ahead but no entries returned")
         };
+        let mut set = set;
         for c in certs {
             store.apply(&c, &set)?;
+            if let Some(next) = store.current_set()? {
+                set = next;
+            }
         }
     }
     Ok(())

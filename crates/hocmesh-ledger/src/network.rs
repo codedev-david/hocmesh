@@ -89,7 +89,7 @@ impl LedgerNetwork {
         let start = at;
         let mut cursor = at;
         loop {
-            let certs = self.fetch_certificates(cursor + 1, 256).await?;
+            let certs = self.fetch_certificates(cursor + 1, 256, &active).await?;
             if certs.is_empty() {
                 break;
             }
@@ -107,7 +107,6 @@ impl LedgerNetwork {
                     })
                     .collect();
                 if !changes.is_empty() {
-                    verify_certificate(c, &active)?;
                     for e in changes {
                         active = verify_membership_change(&active, e)?;
                     }
@@ -538,10 +537,19 @@ impl LedgerNetwork {
         };
         Ok(cert)
     }
+    /// Fetch a run of certificates, checked against the set that governed each.
+    ///
+    /// `at` is the set the caller believes was sitting when entry `from` was
+    /// certified - not the set sitting now. History was signed by whoever held
+    /// a seat at the time, so checking an old entry against today's members
+    /// rejects the entire chain the moment anybody has ever joined or left.
+    /// The set is walked forward here for the same reason an audit walks it:
+    /// a membership change governs everything after it and nothing before.
     pub async fn fetch_certificates(
         &self,
         from: u64,
         limit: u64,
+        at: &ValidatorSet,
     ) -> Result<Vec<QuorumCertificate>> {
         for m in &self.set().members {
             let url = format!(
@@ -554,8 +562,14 @@ impl LedgerNetwork {
                 && r.status().is_success()
             {
                 let e = r.json::<EntriesResponse>().await?;
+                let mut active = at.clone();
                 for c in &e.certificates {
-                    verify_certificate(c, &self.set())?;
+                    verify_certificate(c, &active)?;
+                    for t in &c.entry.transactions {
+                        if let TransactionEvidence::MembershipChange(mc) = &t.evidence {
+                            active = verify_membership_change(&active, mc)?;
+                        }
+                    }
                 }
                 return Ok(e.certificates);
             }

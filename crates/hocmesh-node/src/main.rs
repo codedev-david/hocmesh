@@ -809,7 +809,7 @@ stored at: {}",
                     break;
                 }
                 let certs = net
-                    .fetch_certificates(local.sequence + 1, batch.max(1))
+                    .fetch_certificates(local.sequence + 1, batch.max(1), &set)
                     .await?;
                 if certs.is_empty() {
                     anyhow::bail!("validators report a newer head but returned no certificates")
