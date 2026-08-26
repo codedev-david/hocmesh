@@ -762,7 +762,7 @@ async fn report_result(
                 work: work.clone(),
                 result: req.result.clone(),
                 system_funded,
-                audit_nonce: settlement.nonce,
+                provisional_audit_nonce: settlement.nonce,
             }),
             created_at: now_unix(),
         };

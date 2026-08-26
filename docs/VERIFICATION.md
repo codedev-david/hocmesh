@@ -63,13 +63,50 @@ derived challenge happens to select three buckets you really did compute. At
 `C(64,3) / C(48,3)` that is about 74 attempts - minutes of work to steal a
 quarter of the shard, forever.
 
-So the nonce is drawn by the coordinator *after* the signed result arrives, and
-recorded in the reward evidence so every validator replays the same audit.
+So the challenge is never drawn by the party being checked, and never from the
+result. Validators derive it themselves, twice, from things that already exist
+on the ledger.
 
-**Known gap.** A coordinator colluding with a worker can still grind its own
-nonce. Closing that needs a beacon neither side controls - a VRF over the block
-hash, or a threshold signature from the validator set. Until then, collusion
-between a coordinator and a provider is outside the threat model this closes.
+**Layer one - the propose-time challenge.** Before a validator votes for an
+entry it derives a challenge from the chain head that entry builds on and the
+transaction id:
+
+    AuditNonce::for_entry(previous_hash, transaction_id)
+
+The worker cannot predict it: it commits and signs its result before it knows
+which head the entry will land on. The coordinator cannot choose it either
+without moving the entry to a different position in the chain.
+
+**Layer two - the apply-time beacon.** When the signed certificate comes back to
+be applied, every validator derives a second, independent challenge from the
+quorum signatures on it:
+
+    AuditNonce::for_certified_entry(previous_hash, transaction_id, signatures)
+
+This is the part a colluding coordinator cannot walk around. Producing a
+signature needs a validator's key, so no amount of local computation tells the
+coordinator what the beacon will say before the quorum has actually signed. To
+draw again it must re-propose - and `lock_vote` refuses a conflicting entry hash
+at a sequence a validator has already voted on. Every retry is therefore a
+public, attributable ledger round, not a private hash loop.
+
+The two challenges are independent draws over the same entry, so a fabricated
+result has to escape both. `a_lazy_result_must_escape_both_challenges_to_settle`
+measures it: the joint escape rate matches the product of the two single-layer
+rates. `grinding_the_beacon_costs_more_public_rounds_the_more_a_node_skips`
+prices the attack - the more work a node skips, the more rounds it has to run in
+the open before one settles.
+
+The nonce the coordinator drew for its own provisional check is still recorded,
+as `provisional_audit_nonce`, but only as an audit trail of what it claims it
+looked at. `a_coordinator_chosen_nonce_cannot_excuse_a_lazy_result` hand-picks
+the luckiest nonce out of 400,000 - one that audits nothing but honest buckets -
+stamps it on a fabricated entry, and shows the entry is still rejected.
+
+**Remaining assumption.** The beacon is only as unpredictable as the quorum is
+independent. A coordinator holding enough validator keys to sign an entry by
+itself controls the beacon too - but that is the same threshold that already
+lets it forge the ledger outright, so it is not a new weakness.
 
 ## Audit rate and the economics
 
@@ -106,3 +143,16 @@ Measured on a Windows 11 laptop, release build:
 
 Per accepted shard with three validators, total network cost falls from 5.00x
 the work delivered to 1.14x - a 4.4x cut in waste that grows with `V`.
+
+Section 4 prices the collusion attack. Escaping one challenge is not escaping
+settlement, and the joint rate tracks the product of the two:
+
+    skipped   escape 1   escape 2   escape both   predicted   public rounds
+      16/64      44.7%      47.4%         21.9%       21.2%            4.6
+      32/64      13.7%      15.2%          1.9%        2.1%           51.3
+      64/64       0.0%       0.1%          0.0%        0.0%       >= 2000
+
+A node skipping half its work needs about 51 public re-proposals before one
+settles, each needing a fresh quorum signature and each refused at any sequence
+where a validator has already voted. That is the price of grinding when the
+challenge comes from a beacon the grinder cannot compute.

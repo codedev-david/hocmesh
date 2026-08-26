@@ -37,12 +37,14 @@ pub struct ProviderRewardEvidence {
     pub work: WorkSpec,
     pub result: WorkResult,
     pub system_funded: bool,
-    /// The challenge the coordinator drew after this result was signed.
+    /// The challenge the coordinator drew for its own provisional check.
     ///
-    /// Recorded so a validator replays the identical audit instead of taking
-    /// the coordinator's word that one happened.
+    /// Advisory only. Validators derive the authoritative challenge from the
+    /// entry's chain position instead, because a coordinator colluding with a
+    /// provider would otherwise be free to choose an audit that finds nothing.
+    /// Kept as an audit trail of what the coordinator claims it checked.
     #[serde(default)]
-    pub audit_nonce: u64,
+    pub provisional_audit_nonce: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

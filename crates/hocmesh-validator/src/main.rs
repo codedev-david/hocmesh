@@ -224,12 +224,13 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
             bail!("claim already settled: {ck}")
         };
         validate_reward_membership(&s, &r.transaction)?;
+        let h = s.head(&a.set)?;
         validate_transaction(
             &r.transaction,
+            &h.entry_hash,
             |x| s.balance(x),
             a.set.community_issuance_limit_mcu,
         )?;
-        let h = s.head(&a.set)?;
         let e = build_entry(h.sequence + 1, h.entry_hash.clone(), r.transaction)?;
         s.lock_vote(e.sequence, &e.entry_hash)?;
         let mh = membership_hash(&a.set)?;
@@ -274,6 +275,7 @@ async fn commit(
     validate_reward_membership(&s, &c.entry.transaction).map_err(|e| e.to_string())?;
     validate_transaction(
         &c.entry.transaction,
+        &c.entry.previous_hash,
         |x| s.balance(x),
         a.set.community_issuance_limit_mcu,
     )

@@ -26,14 +26,20 @@
 //! `BUCKETS = 64`, `AUDIT_BUCKETS = 3` and `m = 16`, that is
 //! `C(64,3) / C(16,3) ~ 74` attempts. Cheap enough to be free.
 //!
-//! So the nonce is drawn by the verifier *after* the worker has signed and
-//! submitted its result, and is recorded alongside the result so that ledger
-//! validators replay exactly the audit the coordinator performed. The worker
-//! commits first; the challenge comes second. See [`AuditNonce`].
+//! So the challenge is drawn *after* the worker has signed and submitted its
+//! result, and it is never drawn by a party with a stake in the answer. Each
+//! validator derives it independently, twice over: once from the chain position
+//! the entry claims ([`AuditNonce::for_entry`]), and again from the quorum
+//! signatures that certified it ([`AuditNonce::for_certified_entry`]). The
+//! worker cannot predict either, and a coordinator cannot compute the second
+//! one at all without the validator keys - so grinding it costs a fresh, public
+//! ledger round per attempt. The worker commits first; the challenge comes
+//! second, and comes from somewhere neither side owns. See [`AuditNonce`].
 
 use crate::matrix;
 use crate::reputation::Reputation;
 use hocmesh_protocol::{WorkResult, WorkSpec};
+use sha2::{Digest, Sha256};
 
 /// Buckets a `PrimeCount` shard is divided into for auditing.
 pub const BUCKETS: u32 = 64;
@@ -111,6 +117,58 @@ impl AuditNonce {
     pub fn unit_interval(self) -> f64 {
         let mixed = mix(self.0 ^ 0x5DEE_CE66_D39B_1A17);
         (mixed >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Derive the authoritative challenge from the chain position an entry
+    /// occupies, so neither the provider nor the coordinator supplies it.
+    ///
+    /// `previous_hash` is the ledger head this entry chains onto. The provider
+    /// cannot know it while computing - the head moves with traffic it does not
+    /// control - and the coordinator cannot choose it, because chain continuity
+    /// forces it to be the current head. See the module docs for what a
+    /// coordinator can still do and what that costs it.
+    pub fn for_entry(previous_hash: &str, transaction_id: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"hocmesh-audit-v1");
+        hasher.update(previous_hash.as_bytes());
+        hasher.update(b"|");
+        hasher.update(transaction_id.as_bytes());
+        let digest = hasher.finalize();
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&digest[..8]);
+        Self(u64::from_be_bytes(word))
+    }
+
+    /// Derive the authoritative challenge from the quorum's own signatures.
+    ///
+    /// This is the only value in the settlement path that neither the provider
+    /// nor the coordinator can produce: signing requires validator keys. The
+    /// provider commits to a result, the quorum signs the entry containing it,
+    /// and only then does the audit target exist.
+    ///
+    /// Regrinding it means re-proposing at the same sequence, which validators
+    /// refuse once they have locked a vote there - so an attempt costs a real,
+    /// attributable ledger round rather than a local hash.
+    pub fn for_certified_entry(
+        previous_hash: &str,
+        transaction_id: &str,
+        signatures: &[&str],
+    ) -> Self {
+        let mut ordered: Vec<&str> = signatures.to_vec();
+        ordered.sort_unstable();
+        let mut hasher = Sha256::new();
+        hasher.update(b"hocmesh-audit-beacon-v1");
+        hasher.update(previous_hash.as_bytes());
+        hasher.update(b"|");
+        hasher.update(transaction_id.as_bytes());
+        for signature in ordered {
+            hasher.update(b"|");
+            hasher.update(signature.as_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&digest[..8]);
+        Self(u64::from_be_bytes(word))
     }
 }
 
@@ -629,5 +687,120 @@ mod tests {
             assert_eq!(cursor, end, "buckets stopped short of [{start},{end})");
             assert_eq!(covered, end - start);
         }
+    }
+
+    /// A quorum signature set is a set, not a list: every validator must derive
+    /// the same challenge from the same certified entry however the signatures
+    /// happen to be ordered on the wire, or the quorum would disagree about
+    /// what "verified" even means.
+    #[test]
+    fn every_validator_draws_the_same_challenge_from_one_entry() {
+        let collected = ["sig-a", "sig-b", "sig-c"];
+        let shuffled = ["sig-c", "sig-a", "sig-b"];
+        let first = AuditNonce::for_certified_entry("head", "tx-1", &collected);
+        let second = AuditNonce::for_certified_entry("head", "tx-1", &shuffled);
+        assert_eq!(first.value(), second.value());
+    }
+
+    /// The challenge is bound to the chain position the entry occupies, so the
+    /// same work settled onto a different head is audited somewhere else. That
+    /// is what stops a coordinator from replaying one lucky audit forever.
+    #[test]
+    fn a_different_chain_position_draws_a_different_challenge() {
+        let quorum = ["sig-a", "sig-b", "sig-c"];
+        let here = AuditNonce::for_certified_entry("head-1", "tx-1", &quorum);
+        let later = AuditNonce::for_certified_entry("head-2", "tx-1", &quorum);
+        assert_ne!(here.value(), later.value());
+    }
+
+    /// Swapping a single validator changes the beacon completely, and no party
+    /// outside the quorum can forge the draw, because signing needs the keys.
+    #[test]
+    fn a_different_quorum_draws_a_different_challenge() {
+        let signed = ["sig-a", "sig-b", "sig-c"];
+        let reshuffled = ["sig-a", "sig-b", "sig-d"];
+        let first = AuditNonce::for_certified_entry("head", "tx", &signed);
+        let second = AuditNonce::for_certified_entry("head", "tx", &reshuffled);
+        assert_ne!(first.value(), second.value());
+    }
+
+    /// The strongest cheap cheat: skip whole buckets, fill them from a
+    /// neighbour so the numbers stay plausible, and report a total that matches
+    /// the buckets exactly so the free arithmetic check finds nothing.
+    fn skip_buckets(honest: &WorkResult, skipped: u32) -> WorkResult {
+        let WorkResult::PrimeCount { bucket_counts, .. } = honest else {
+            unreachable!("this helper fabricates prime work")
+        };
+        let mut counts = bucket_counts.clone();
+        for index in audit_indices(AuditNonce::replay(0xC0FF_EE00), BUCKETS, skipped) {
+            counts[index as usize] = bucket_counts[((index + 1) % BUCKETS) as usize];
+        }
+        WorkResult::PrimeCount {
+            count: counts.iter().sum(),
+            bucket_counts: counts,
+            duration_ms: 0,
+        }
+    }
+
+    /// How often a fabricated result survives the propose-time challenge, the
+    /// apply-time beacon, and both together, sampled over distinct positions.
+    fn escape_rates(work: &WorkSpec, lazy: &WorkResult, entries: u32) -> (f64, f64, f64) {
+        let (mut first, mut second, mut both) = (0u32, 0u32, 0u32);
+        for n in 0..entries {
+            let head = format!("head-{n}");
+            let tx = format!("tx-{n}");
+            let quorum = [format!("a-{n}"), format!("b-{n}"), format!("c-{n}")];
+            let signed: Vec<&str> = quorum.iter().map(String::as_str).collect();
+            let chain = AuditNonce::for_entry(&head, &tx);
+            let beacon = AuditNonce::for_certified_entry(&head, &tx, &signed);
+            let a = witness_check(work, lazy, chain).is_accepted();
+            let b = witness_check(work, lazy, beacon).is_accepted();
+            first += u32::from(a);
+            second += u32::from(b);
+            both += u32::from(a && b);
+        }
+        let rate = |hits: u32| f64::from(hits) / f64::from(entries);
+        (rate(first), rate(second), rate(both))
+    }
+
+    /// Propose-time and apply-time challenges are independent draws over the
+    /// same entry, so escaping settlement means escaping both. Two layers
+    /// multiply: surviving one is not surviving the ledger.
+    #[test]
+    fn a_lazy_result_must_escape_both_challenges_to_settle() {
+        let (work, honest) = primes(1, 20_000);
+        let lazy = skip_buckets(&honest, 16);
+        let (chain, beacon, both) = escape_rates(&work, &lazy, 1_000);
+        let independent = chain * beacon;
+        assert!(
+            (both - independent).abs() < 0.06,
+            "the layers are not independent: {both} measured, {independent} predicted"
+        );
+        assert!(
+            both < chain - 0.15,
+            "the beacon must cost the cheat something: {chain} -> {both}"
+        );
+    }
+
+    /// Grinding the beacon is not a local hash loop. Each attempt needs a fresh
+    /// quorum to sign a fresh entry, and a validator that has locked a vote at
+    /// a sequence refuses a conflicting entry hash there - so every retry is a
+    /// public, attributable round rather than a private guess.
+    #[test]
+    fn grinding_the_beacon_costs_more_public_rounds_the_more_a_node_skips() {
+        let (work, honest) = primes(1, 20_000);
+        let rounds = |skipped: u32| {
+            let (_, _, both) = escape_rates(&work, &skip_buckets(&honest, skipped), 1_000);
+            1.0 / both.max(0.001)
+        };
+        let (light, heavy, brazen) = (rounds(4), rounds(16), rounds(32));
+        assert!(
+            light < heavy && heavy < brazen,
+            "grinding must get harder, not easier: {light} {heavy} {brazen}"
+        );
+        assert!(
+            brazen > 8.0,
+            "skipping half the work should cost many public rounds, not {brazen}"
+        );
     }
 }

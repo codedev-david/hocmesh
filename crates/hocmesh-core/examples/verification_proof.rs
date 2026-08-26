@@ -31,6 +31,7 @@ fn main() {
     network_cost(&prime, &matmul);
     detection_sweep();
     collateral_vs_discount();
+    grinding_cost();
 }
 
 struct Measured {
@@ -268,4 +269,49 @@ fn wrong_buckets(honest: &WorkResult, lazy: &WorkResult) -> u32 {
         unreachable!("the sweep runs on prime work")
     };
     truth.iter().zip(claimed).filter(|(t, c)| t != c).count() as u32
+}
+
+/// Two independent challenges, and what it costs to grind past both.
+///
+/// A cheat must escape the propose-time draw (from the chain head) and the
+/// apply-time beacon (from the quorum signatures). Neither is computable by a
+/// coordinator in advance, so each retry is a public re-proposal.
+fn grinding_cost() {
+    rule("4. Grinding the audit costs public rounds, not CPU cycles");
+    let honest = execute_work(&SWEEP);
+    println!("  skipped   escape 1   escape 2   escape both   predicted   public rounds");
+    for skipped in [4u32, 8, 16, 32, 64] {
+        let lazy = lazy_prime(&honest, skipped);
+        let (mut one, mut two, mut both) = (0u64, 0u64, 0u64);
+        for n in 0..TRIALS {
+            let head = format!("head-{n}");
+            let tx = format!("tx-{n}");
+            let quorum = [format!("a-{n}"), format!("b-{n}"), format!("c-{n}")];
+            let signed: Vec<&str> = quorum.iter().map(String::as_str).collect();
+            let chain = AuditNonce::for_entry(&head, &tx);
+            let beacon = AuditNonce::for_certified_entry(&head, &tx, &signed);
+            let a = verify::witness_check(&SWEEP, &lazy, chain).is_accepted();
+            let b = verify::witness_check(&SWEEP, &lazy, beacon).is_accepted();
+            one += u64::from(a);
+            two += u64::from(b);
+            both += u64::from(a && b);
+        }
+        let rate = |hits: u64| hits as f64 / TRIALS as f64;
+        let (e1, e2, ej) = (rate(one), rate(two), rate(both));
+        let rounds = 1.0 / ej.max(1.0 / TRIALS as f64);
+        println!(
+            "  {skipped:>4}/64   {:>7.1}%   {:>7.1}%   {:>10.1}%   {:>8.1}%   {rounds:>12.1}",
+            e1 * 100.0,
+            e2 * 100.0,
+            ej * 100.0,
+            e1 * e2 * 100.0
+        );
+        assert!(
+            (ej - e1 * e2).abs() < 0.05,
+            "the two challenges must be independent draws"
+        );
+    }
+    println!("\n  A coordinator cannot compute the beacon without validator keys, so every");
+    println!("  extra attempt is a fresh quorum round - and a validator that has voted at a");
+    println!("  sequence refuses a conflicting entry hash there. Grinding happens in public.");
 }

@@ -74,6 +74,7 @@ pub fn claim_key(tx: &LedgerTransaction) -> String {
 
 pub fn validate_transaction(
     tx: &LedgerTransaction,
+    previous_hash: &str,
     balance: impl Fn(&str) -> Result<i64>,
     community_issuance_limit_mcu: i64,
 ) -> Result<()> {
@@ -121,7 +122,7 @@ pub fn validate_transaction(
             },
         ) => validate_community_reserve(tx, job_id, work, *shards)?,
         (TransactionKind::ProviderReward, TransactionEvidence::ProviderReward(e)) => {
-            validate_reward(tx, e)?
+            validate_reward(tx, e, previous_hash)?
         }
         _ => bail!("transaction kind/evidence mismatch"),
     }
@@ -189,7 +190,11 @@ fn validate_community_reserve(
     };
     Ok(())
 }
-fn validate_reward(tx: &LedgerTransaction, e: &ProviderRewardEvidence) -> Result<()> {
+fn validate_reward(
+    tx: &LedgerTransaction,
+    e: &ProviderRewardEvidence,
+    previous_hash: &str,
+) -> Result<()> {
     let bh = result_body_hash(
         &e.assignment_id,
         &e.job_id,
@@ -201,7 +206,7 @@ fn validate_reward(tx: &LedgerTransaction, e: &ProviderRewardEvidence) -> Result
     )?;
     verify_auth_signature(&e.provider_public_key_b64, &e.provider_auth, "result", &bh)
         .map_err(anyhow::Error::msg)?;
-    if !witnessed(&e.work, &e.result, e.audit_nonce) {
+    if !witnessed(&e.work, &e.result, previous_hash, &tx.transaction_id) {
         bail!("provider result does not verify")
     };
     let reward = work_cost_mcu(&e.work);
@@ -229,10 +234,12 @@ fn validate_reward(tx: &LedgerTransaction, e: &ProviderRewardEvidence) -> Result
 
 pub fn validate_historical_transaction(
     tx: &LedgerTransaction,
+    previous_hash: &str,
+    signatures: &[ValidatorSignature],
     balance: impl Fn(&str) -> Result<i64>,
     community_issuance_limit_mcu: i64,
 ) -> Result<()> {
-    verify_historical_evidence(tx)?;
+    verify_historical_evidence(tx, previous_hash, signatures)?;
     if tx.postings.len() < 2 {
         bail!("transaction needs at least two postings")
     }
@@ -380,7 +387,11 @@ pub fn verify_certificate(cert: &QuorumCertificate, set: &ValidatorSet) -> Resul
 }
 
 /// Audit-time evidence signature validation without rejecting old timestamps.
-pub fn verify_historical_evidence(tx: &LedgerTransaction) -> Result<()> {
+pub fn verify_historical_evidence(
+    tx: &LedgerTransaction,
+    previous_hash: &str,
+    signatures: &[ValidatorSignature],
+) -> Result<()> {
     match &tx.evidence {
         TransactionEvidence::JobReserve(e) => {
             let bh = submit_body_hash(&e.work, e.shards)?;
@@ -410,7 +421,13 @@ pub fn verify_historical_evidence(tx: &LedgerTransaction) -> Result<()> {
             )?;
             verify_auth_signature(&e.provider_public_key_b64, &e.provider_auth, "result", &bh)
                 .map_err(anyhow::Error::msg)?;
-            if !witnessed(&e.work, &e.result, e.audit_nonce) {
+            if !certified_witness(
+                &e.work,
+                &e.result,
+                previous_hash,
+                &tx.transaction_id,
+                signatures,
+            ) {
                 bail!("historical work result invalid")
             }
         }
@@ -430,12 +447,39 @@ pub fn verify_historical_evidence(tx: &LedgerTransaction) -> Result<()> {
 /// that actually happened rather than inventing a fresh one. A workload with
 /// no witness falls back to recomputation: sound, but expensive enough to be a
 /// standing argument for designing workloads that can be checked cheaply.
+/// Check a reward entry's work against the challenge its chain position fixes.
+///
+/// The nonce is derived here, not read from the evidence, so a coordinator that
+/// colludes with a provider cannot hand the pair a challenge of its choosing.
 fn witnessed(
     work: &hocmesh_protocol::WorkSpec,
     result: &hocmesh_protocol::WorkResult,
-    nonce: u64,
+    previous_hash: &str,
+    transaction_id: &str,
 ) -> bool {
-    let verdict = verify::witness_check(work, result, AuditNonce::replay(nonce));
+    let nonce = AuditNonce::for_entry(previous_hash, transaction_id);
+    let verdict = verify::witness_check(work, result, nonce);
+    if verdict == verify::Verdict::Inconclusive {
+        return verify::adjudicate(work, result).is_accepted();
+    }
+    verdict.is_accepted()
+}
+
+/// The authoritative audit: the challenge comes from the quorum's signatures,
+/// so neither the provider nor the coordinator had any say in choosing it.
+fn certified_witness(
+    work: &hocmesh_protocol::WorkSpec,
+    result: &hocmesh_protocol::WorkResult,
+    previous_hash: &str,
+    transaction_id: &str,
+    signatures: &[ValidatorSignature],
+) -> bool {
+    let beacon: Vec<&str> = signatures
+        .iter()
+        .map(|s| s.signature_b64.as_str())
+        .collect();
+    let nonce = AuditNonce::for_certified_entry(previous_hash, transaction_id, &beacon);
+    let verdict = verify::witness_check(work, result, nonce);
     if verdict == verify::Verdict::Inconclusive {
         return verify::adjudicate(work, result).is_accepted();
     }
@@ -444,8 +488,13 @@ fn witnessed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stands in for the ledger head an entry chains onto. Honest work has to
+    /// pass whatever challenge this produces, so its value is arbitrary.
+    const TEST_PREVIOUS_HASH: &str =
+        "0f8b1c7d2e3a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
     use hocmesh_core::identity::NodeIdentity;
-    use hocmesh_protocol::{AuthProof, WorkSpec, canonical_auth_message};
+    use hocmesh_protocol::{AuthProof, WorkResult, WorkSpec, canonical_auth_message};
     use std::{
         fs,
         path::PathBuf,
@@ -477,7 +526,7 @@ mod tests {
             },
             created_at: 1,
         };
-        validate_transaction(&tx, |_| Ok(0), 1_000_000).unwrap();
+        validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(0), 1_000_000).unwrap();
     }
 
     #[test]
@@ -503,7 +552,7 @@ mod tests {
             },
             created_at: 1,
         };
-        assert!(validate_transaction(&tx, |_| Ok(0), 1_000_000).is_err());
+        assert!(validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(0), 1_000_000).is_err());
     }
 
     #[test]
@@ -534,7 +583,7 @@ mod tests {
             },
             created_at: 1,
         };
-        assert!(validate_transaction(&tx, |_| Ok(0), 1).is_err());
+        assert!(validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(0), 1).is_err());
     }
 
     #[test]
@@ -551,7 +600,7 @@ mod tests {
             1,
         );
 
-        assert!(validate_transaction(&tx, |_| Ok(10_000), 1_000_000).is_err());
+        assert!(validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(10_000), 1_000_000).is_err());
     }
 
     #[test]
@@ -562,7 +611,8 @@ mod tests {
         let old_auth = auth_at(&requester, "submit", &body_hash, 1);
         let tx = reserve_from_auth("old-job", &requester.public_key_b64(), old_auth, &work, 1);
 
-        validate_historical_transaction(&tx, |_| Ok(10_000), 1_000_000).unwrap();
+        validate_historical_transaction(&tx, TEST_PREVIOUS_HASH, &[], |_| Ok(10_000), 1_000_000)
+            .unwrap();
     }
 
     #[test]
@@ -575,7 +625,7 @@ mod tests {
             e.work = changed;
         }
 
-        assert!(validate_transaction(&tx, |_| Ok(10_000), 1_000_000).is_err());
+        assert!(validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(10_000), 1_000_000).is_err());
     }
 
     #[test]
@@ -586,13 +636,29 @@ mod tests {
         if let TransactionEvidence::ProviderReward(e) = &mut changed_reward.evidence {
             e.reward_mcu += 1;
         }
-        assert!(validate_transaction(&changed_reward, |_| Ok(10_000), 1_000_000).is_err());
+        assert!(
+            validate_transaction(
+                &changed_reward,
+                TEST_PREVIOUS_HASH,
+                |_| Ok(10_000),
+                1_000_000
+            )
+            .is_err()
+        );
 
         let mut changed_assignment = signed_reward("job-assignment", 0, &provider, &work, true);
         if let TransactionEvidence::ProviderReward(e) = &mut changed_assignment.evidence {
             e.assignment_id = "asg_not_the_deterministic_id".into();
         }
-        assert!(validate_transaction(&changed_assignment, |_| Ok(10_000), 1_000_000).is_err());
+        assert!(
+            validate_transaction(
+                &changed_assignment,
+                TEST_PREVIOUS_HASH,
+                |_| Ok(10_000),
+                1_000_000
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -699,7 +765,7 @@ mod tests {
                 work: work.clone(),
                 result,
                 system_funded,
-                audit_nonce: 0,
+                provisional_audit_nonce: 0,
             }),
             created_at: 1,
         }
@@ -807,5 +873,126 @@ mod tests {
         let path = std::env::temp_dir().join(format!("hocmesh-ledger-test-{name}-{suffix}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// A result that skips every bucket and fills it from its neighbour. The
+    /// total still adds up exactly, so the free arithmetic check finds nothing
+    /// and only a recount can tell it apart from real work.
+    fn rotated(work: &WorkSpec) -> WorkResult {
+        let WorkResult::PrimeCount { bucket_counts, .. } =
+            hocmesh_core::compute::execute_work(work)
+        else {
+            unreachable!("prime work returns prime results")
+        };
+        let width = bucket_counts.len();
+        let counts: Vec<u64> = (0..width).map(|i| bucket_counts[(i + 1) % width]).collect();
+        WorkResult::PrimeCount {
+            count: counts.iter().sum(),
+            bucket_counts: counts,
+            duration_ms: 0,
+        }
+    }
+
+    /// Rebuilds a reward around a fabricated result, re-signed by the same
+    /// provider, so the only thing wrong with the entry is the work itself.
+    fn resigned(
+        tx: &LedgerTransaction,
+        provider: &NodeIdentity,
+        result: WorkResult,
+    ) -> LedgerTransaction {
+        let mut out = tx.clone();
+        let TransactionEvidence::ProviderReward(e) = &mut out.evidence else {
+            unreachable!("this helper rewrites provider rewards")
+        };
+        e.result = result;
+        let body_hash = result_body_hash(
+            &e.assignment_id,
+            &e.job_id,
+            e.shard_index,
+            &e.work,
+            e.reward_mcu,
+            e.system_funded,
+            &e.result,
+        )
+        .unwrap();
+        e.provider_auth = provider.auth("result", &body_hash);
+        out
+    }
+
+    /// Stamps the nonce a coordinator claims it audited with.
+    fn stamp_nonce(tx: &mut LedgerTransaction, nonce: u64) {
+        let TransactionEvidence::ProviderReward(e) = &mut tx.evidence else {
+            unreachable!("this helper rewrites provider rewards")
+        };
+        e.provisional_audit_nonce = nonce;
+    }
+
+    fn test_quorum() -> Vec<ValidatorSignature> {
+        ["alpha", "bravo", "charlie"]
+            .iter()
+            .map(|v| ValidatorSignature {
+                validator_id: (*v).to_string(),
+                signature_b64: format!("sig-{v}"),
+            })
+            .collect()
+    }
+
+    /// A coordinator colluding with a provider gets no say in the audit. It can
+    /// stamp any nonce it likes on the entry - including one hand-picked out of
+    /// hundreds of thousands because it audits nothing but honest buckets. Even
+    /// so, validators still draw their own challenge from the quorum that signed
+    /// the entry. The stamp is an audit trail, never an authority.
+    #[test]
+    fn a_coordinator_chosen_nonce_cannot_excuse_a_lazy_result() {
+        let provider = test_identity("provider-collusion");
+        let work = WorkSpec::PrimeCount {
+            start: 1,
+            end: 20_000,
+        };
+        let honest = signed_reward("job-collusion", 0, &provider, &work, true);
+        let lazy = resigned(&honest, &provider, rotated(&work));
+        let quorum = test_quorum();
+        let TransactionEvidence::ProviderReward(e) = &lazy.evidence else {
+            unreachable!("the helper built a provider reward")
+        };
+        let flattering = (0..400_000u64)
+            .find(|n| {
+                verify::witness_check(&e.work, &e.result, AuditNonce::replay(*n)).is_accepted()
+            })
+            .expect("a colluding coordinator can always find a nonce that flatters");
+        let mut colluded = lazy.clone();
+        stamp_nonce(&mut colluded, flattering);
+        let verdict = verify_historical_evidence(&colluded, TEST_PREVIOUS_HASH, &quorum);
+        assert!(
+            verdict.is_err(),
+            "the coordinator's own nonce must carry no weight at settlement"
+        );
+
+        // The same stamp on honest work is harmless: the field is an audit
+        // trail of what the coordinator claims it checked, nothing more.
+        let mut stamped = honest.clone();
+        stamp_nonce(&mut stamped, flattering.wrapping_add(1));
+        verify_historical_evidence(&stamped, TEST_PREVIOUS_HASH, &quorum).unwrap();
+    }
+
+    /// Both layers must reject fabricated work on their own: the propose-time
+    /// check a validator runs before it votes, and the apply-time beacon it
+    /// runs when the signed certificate comes back to be applied.
+    #[test]
+    fn both_the_propose_and_apply_checks_reject_fabricated_work() {
+        let provider = test_identity("provider-layers");
+        let work = WorkSpec::PrimeCount {
+            start: 1,
+            end: 20_000,
+        };
+        let honest = signed_reward("job-layers", 0, &provider, &work, true);
+        let lazy = resigned(&honest, &provider, rotated(&work));
+        let propose = validate_transaction(&lazy, TEST_PREVIOUS_HASH, |_| Ok(10_000), 1_000_000);
+        assert!(
+            propose.is_err(),
+            "a validator must not vote for fabricated work"
+        );
+        let apply = verify_historical_evidence(&lazy, TEST_PREVIOUS_HASH, &test_quorum());
+        assert!(apply.is_err(), "the beacon must catch what the vote missed");
     }
 }

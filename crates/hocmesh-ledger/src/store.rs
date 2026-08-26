@@ -201,7 +201,11 @@ impl LedgerStore {
     }
     pub fn apply(&mut self, cert: &QuorumCertificate, set: &ValidatorSet) -> Result<()> {
         verify_certificate(cert, set)?;
-        verify_historical_evidence(&cert.entry.transaction)?;
+        verify_historical_evidence(
+            &cert.entry.transaction,
+            &cert.entry.previous_hash,
+            &cert.signatures,
+        )?;
         let h = self.head(set)?;
         if cert.entry.sequence != h.sequence + 1 || cert.entry.previous_hash != h.entry_hash {
             bail!("certificate does not extend local head")
@@ -301,6 +305,8 @@ impl LedgerStore {
             };
             validate_historical_transaction(
                 &c.entry.transaction,
+                &c.entry.previous_hash,
+                &c.signatures,
                 |a| Ok(*balances.get(a).unwrap_or(&0)),
                 set.community_issuance_limit_mcu,
             )?;
