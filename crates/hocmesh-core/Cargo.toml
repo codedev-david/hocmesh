@@ -1,0 +1,21 @@
+[package]
+name = "hocmesh-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+hocmesh-protocol = { path = "../hocmesh-protocol" }
+hocmesh-gpu = { path = "../hocmesh-gpu" }
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

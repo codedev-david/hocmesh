@@ -1,6 +1,6 @@
 # Implementation Status
 
-## MESH Compute Core
+## hocMESH Compute Core
 
 | Area | Status | Evidence |
 |---|---|---|
@@ -16,7 +16,7 @@
 | BFT leader/view change | Not implemented | Static validator coordination remains |
 | Validator membership epochs | Not implemented | Validator set is pinned |
 
-## MESH AI
+## hocMESH AI
 
 | Component | Status | Evidence / boundary |
 |---|---|---|
@@ -50,4 +50,4 @@
 
 The workspace is pinned to Rust 1.97.1. CI runs format, check, tests, and Clippy on Windows, Linux, and macOS; separately compiles/tests CUDA, ROCm, and Metal adapter features; enforces measured coverage; audits dependencies; checks policy; emits per-crate CycloneDX SBOMs; and extracts/runs every native installer.
 
-Hardware claims are deliberately scoped. Unit and process tests prove MESH-owned logic. Actual GPU execution also requires the matching device, driver, and backend-enabled llama.cpp binaries. A platform that was not physically exercised is never reported as hardware-validated.
+Hardware claims are deliberately scoped. Unit and process tests prove hocMESH-owned logic. Actual GPU execution also requires the matching device, driver, and backend-enabled llama.cpp binaries. A platform that was not physically exercised is never reported as hardware-validated.

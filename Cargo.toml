@@ -1,16 +1,16 @@
 [workspace]
 members = [
-    "crates/mesh-protocol",
-    "crates/mesh-core",
-    "crates/mesh-ledger",
-    "crates/mesh-node",
-    "crates/mesh-coordinator",
-    "crates/mesh-validator",
-    "crates/mesh-integration-tests",
-    "crates/mesh-model",
-    "crates/mesh-gpu",
-    "crates/mesh-ai",
-    "crates/mesh-transport",
+    "crates/hocmesh-protocol",
+    "crates/hocmesh-core",
+    "crates/hocmesh-ledger",
+    "crates/hocmesh-node",
+    "crates/hocmesh-coordinator",
+    "crates/hocmesh-validator",
+    "crates/hocmesh-integration-tests",
+    "crates/hocmesh-model",
+    "crates/hocmesh-gpu",
+    "crates/hocmesh-ai",
+    "crates/hocmesh-transport",
 ]
 resolver = "2"
 
@@ -18,7 +18,7 @@ resolver = "2"
 version = "0.3.0"
 edition = "2024"
 license = "MIT"
-authors = ["MESH Contributors"]
+authors = ["hocMESH Contributors"]
 rust-version = "1.97"
 
 [workspace.dependencies]

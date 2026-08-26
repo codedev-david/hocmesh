@@ -1,22 +1,22 @@
-# MESH Compute / MESH AI — Full System Specification
+# hocMESH Compute / hocMESH AI — Full System Specification
 
-**MESH = Mutual Exchange of Shared Hardware**
+**hocMESH = Mutual Exchange of Shared Hardware**
 
 Version: **0.2.0 source architecture**
 
-MESH is a contribution-first cooperative compute network. Participants make idle compute available to the community, earn non-monetary Compute Units (CU) for verified useful work, bank those units, and later spend them on work performed by other participants.
+hocMESH is a contribution-first cooperative compute network. Participants make idle compute available to the community, earn non-monetary Compute Units (CU) for verified useful work, bank those units, and later spend them on work performed by other participants.
 
 There is no cash-out, token, cryptocurrency, bidding market, purchasable balance, or paid priority tier in the protocol described here.
 
 > **Contribute first. Compute later.**
 
-The long-term objective is a geographically distributed community data center capable of combining heterogeneous CPUs, GPUs, memory, storage, and network paths for AI and general compute. The current source implements the control-plane and accounting foundation with deterministic CPU work; MESH AI GPU/model execution remains the next major layer.
+The long-term objective is a geographically distributed community data center capable of combining heterogeneous CPUs, GPUs, memory, storage, and network paths for AI and general compute. The current source implements the control-plane and accounting foundation with deterministic CPU work; hocMESH AI GPU/model execution remains the next major layer.
 
 ---
 
 ## 1. System goals
 
-MESH is designed around these goals:
+hocMESH is designed around these goals:
 
 1. **Contribution first.** A new identity begins with zero CU.
 2. **No purchased compute.** CU represents verified community contribution, not money.
@@ -35,7 +35,7 @@ MESH is designed around these goals:
 
 The repository builds three Rust programs.
 
-### `mesh`
+### `hocmesh`
 
 Participant client and worker.
 
@@ -55,7 +55,7 @@ Responsibilities:
 - mirror the full certified ledger;
 - audit a mirrored ledger from genesis.
 
-### `mesh-coordinator`
+### `hocmesh-coordinator`
 
 Scheduler and control plane.
 
@@ -74,7 +74,7 @@ Responsibilities:
 
 The coordinator is **not** the authoritative CU database when quorum mode is enabled.
 
-### `mesh-validator`
+### `hocmesh-validator`
 
 Independent replicated CU ledger authority.
 
@@ -101,13 +101,13 @@ Responsibilities:
 
 ```text
                            ┌──────────────────────┐
-                           │   mesh-coordinator   │
+                           │   hocmesh-coordinator   │
                            │ scheduler / leases   │
                            └──────────┬───────────┘
                                       │ outbound worker HTTP(S)
                     ┌─────────────────┼─────────────────┐
                     ▼                 ▼                 ▼
-                 mesh A            mesh B            mesh C
+                 hocmesh A            hocmesh B            hocmesh C
                  CPU/GPU           CPU/GPU           CPU/GPU
 
                                       │ ledger proposals / proofs
@@ -186,7 +186,7 @@ Historical ledger audit deliberately verifies the cryptographic signature **with
 
 ## 6. Safe workload model
 
-MESH v0.2 does not accept arbitrary executables from requesters.
+hocMESH v0.2 does not accept arbitrary executables from requesters.
 
 Jobs are declarative allow-listed `WorkSpec` values. The implemented workload is deterministic prime counting over a numeric range.
 
@@ -199,7 +199,7 @@ This workload exists because it provides a real end-to-end primitive for testing
 - retry after worker loss;
 - accounting and settlement.
 
-The runtime boundary is intentionally replaceable. Future MESH AI work types should be explicit protocol objects backed by trusted local runtimes, not unrestricted shell commands.
+The runtime boundary is intentionally replaceable. Future hocMESH AI work types should be explicit protocol objects backed by trusted local runtimes, not unrestricted shell commands.
 
 ---
 
@@ -236,7 +236,7 @@ Member-funded shards are not offered to their requester. Validators independentl
 
 ## 8. Compute Units
 
-MESH stores CU internally as milli-compute-units (mCU):
+hocMESH stores CU internally as milli-compute-units (mCU):
 
 ```text
 1000 mCU = 1 CU
@@ -334,7 +334,7 @@ Therefore ordinary compute transfers contribution entitlement; it does not manuf
 The only issuance source is:
 
 ```text
-mesh:community:issuance
+hocmesh:community:issuance
 ```
 
 Its maximum negative balance is bounded by `community_issuance_limit_mcu` in the pinned validator-set policy.
@@ -450,13 +450,13 @@ A claim response may include the complete quorum certificate. One valid certific
 Any participant can maintain the same full certified history as validators:
 
 ```bash
-mesh ledger-sync --validators validators.json --db .mesh/ledger-mirror.db
+hocmesh ledger-sync --validators validators.json --db .hocmesh/ledger-mirror.db
 ```
 
 Then audit it offline:
 
 ```bash
-mesh ledger-audit --validators validators.json --db .mesh/ledger-mirror.db
+hocmesh ledger-audit --validators validators.json --db .hocmesh/ledger-mirror.db
 ```
 
 The audit replays history from genesis and checks:
@@ -474,13 +474,13 @@ The audit replays history from genesis and checks:
 - requester self-reward prohibition;
 - deterministic work results.
 
-This is the Git-like property of MESH: history is content-linked, replicated, and independently checkable. Unlike Git, MESH additionally has a quorum rule to decide which next entry is certified.
+This is the Git-like property of hocMESH: history is content-linked, replicated, and independently checkable. Unlike Git, hocMESH additionally has a quorum rule to decide which next entry is certified.
 
 ---
 
 ## 17. Crash-safe coordinator settlement
 
-The coordinator and validator quorum cannot share one ACID database transaction. MESH therefore uses durable settlement intents.
+The coordinator and validator quorum cannot share one ACID database transaction. hocMESH therefore uses durable settlement intents.
 
 ### Job funding
 
@@ -516,7 +516,7 @@ Recovery runs:
 
 - once when a quorum-mode coordinator starts;
 - periodically while it runs;
-- manually with `mesh-coordinator recover`.
+- manually with `hocmesh-coordinator recover`.
 
 Recovery first asks validators whether the semantic claim already has a certificate. If a full valid quorum certificate is returned, local state can safely finalize. If a quorum agrees that the claim is absent, the coordinator retries the **same persisted transaction**.
 
@@ -536,7 +536,7 @@ leased → lease expires → pending → another worker
 
 A result that has entered quorum settlement changes to `settling`, which is not eligible for re-lease while accounting is reconciled.
 
-This is important: once there is ambiguity about whether a reward was certified, MESH resolves the ledger outcome before allowing another provider to perform the same settlement claim.
+This is important: once there is ambiguity about whether a reward was certified, hocMESH resolves the ledger outcome before allowing another provider to perform the same settlement claim.
 
 ---
 
@@ -575,7 +575,7 @@ The certificate log is the authoritative local history. Balances can be independ
 
 ## 21. Security boundary
 
-MESH intentionally does not provide:
+hocMESH intentionally does not provide:
 
 - SSH access to provider machines;
 - remote desktop access;
@@ -610,16 +610,16 @@ A production public deployment should complete or adopt a mature BFT consensus l
 
 ---
 
-## 23. MESH AI end-state architecture
+## 23. hocMESH AI end-state architecture
 
-MESH AI sits above MESH Compute Core.
+hocMESH AI sits above hocMESH Compute Core.
 
 ```text
-                    MESH AI
+                    hocMESH AI
       model registry / partitioner / runtime
                        │
                        ▼
-                 MESH Compute
+                 hocMESH Compute
  identity / scheduling / accounting / trust / network
                        │
         ┌──────────────┼──────────────┐
@@ -656,7 +656,7 @@ model manifest
    └── ...
 ```
 
-Nodes cache chunks and can seed them to peers, creating the torrent-like data plane originally envisioned for MESH.
+Nodes cache chunks and can seed them to peers, creating the torrent-like data plane originally envisioned for hocMESH.
 
 The scheduler should place work using both compute suitability and data locality so it does not repeatedly move hundreds of gigabytes when useful model blocks are already cached near a job.
 
@@ -679,33 +679,33 @@ Independent work may span continents; pipeline/tensor stages should strongly pre
 ## 26. Repository ownership boundaries
 
 ```text
-mesh-protocol
+hocmesh-protocol
     wire format and signatures
 
-mesh-core
+hocmesh-core
     identity, hardware, deterministic compute
 
-mesh-ledger
+hocmesh-ledger
     accounting types, validation, storage, quorum client
 
-mesh-node
+hocmesh-node
     participant CLI and worker daemon
 
-mesh-coordinator
+hocmesh-coordinator
     scheduling, leases, jobs, settlement intents
 
-mesh-validator
+hocmesh-validator
     independent replicated ledger authority
 ```
 
 Future suggested crates:
 
 ```text
-mesh-runtime
-mesh-gpu
-mesh-model
-mesh-p2p
-mesh-ai
+hocmesh-runtime
+hocmesh-gpu
+hocmesh-model
+hocmesh-p2p
+hocmesh-ai
 ```
 
 Avoid putting GPU/model implementation into the ledger or coordinator crates. The accounting/control plane should remain usable for other safe distributed workloads.
@@ -723,9 +723,9 @@ cargo build --release --workspace
 Expected release programs:
 
 ```text
-mesh
-mesh-coordinator
-mesh-validator
+hocmesh
+hocmesh-coordinator
+hocmesh-validator
 ```
 
 On Windows the binaries have `.exe` extensions.
@@ -764,7 +764,7 @@ Then run a four-validator 3-of-4 integration environment and verify:
 
 ## 29. Production blockers
 
-Before MESH should be exposed as a hostile public Internet network, complete at least:
+Before hocMESH should be exposed as a hostile public Internet network, complete at least:
 
 - compiler/test/clippy clean baseline;
 - extensive integration/failure-injection tests;
@@ -784,7 +784,7 @@ Before MESH should be exposed as a hostile public Internet network, complete at 
 
 ## 30. Core project statement
 
-MESH is intended to make a community of independent machines behave, where technically practical, like a shared distributed data center:
+hocMESH is intended to make a community of independent machines behave, where technically practical, like a shared distributed data center:
 
 ```text
 CONTRIBUTE VERIFIED COMPUTE
@@ -802,4 +802,4 @@ CONTRIBUTE VERIFIED COMPUTE
 
 The authoritative resource being exchanged is **computation itself**, not money.
 
-The long-term MESH AI objective is to add a secure, latency-aware heterogeneous GPU/model data plane on top of this contribution, identity, scheduling, verification, and replicated-accounting foundation.
+The long-term hocMESH AI objective is to add a secure, latency-aware heterogeneous GPU/model data plane on top of this contribution, identity, scheduling, verification, and replicated-accounting foundation.

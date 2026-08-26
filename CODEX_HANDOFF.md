@@ -2,7 +2,7 @@
 
 ## Mission
 
-Take this repository from MESH Compute v0.2 to a compile-clean, integration-tested foundation suitable for progressively adding MESH AI.
+Take this repository from hocMESH Compute v0.2 to a compile-clean, integration-tested foundation suitable for progressively adding hocMESH AI.
 
 Do not redesign away the contribution-first cooperative model.
 
@@ -147,13 +147,13 @@ Add tests for:
 - insufficient validator signatures,
 - tampered old ledger entry.
 
-## Then begin MESH AI
+## Then begin hocMESH AI
 
 Do not start with WAN tensor parallelism.
 
 Recommended implementation order:
 
-1. `mesh-gpu` crate with CUDA capability discovery/benchmark.
+1. `hocmesh-gpu` crate with CUDA capability discovery/benchmark.
 2. Signed model manifest crate.
 3. Content-addressed local model cache.
 4. Independent GPU batch inference worker.
@@ -168,17 +168,17 @@ Recommended implementation order:
 
 ```text
 crates/
-  mesh-protocol
-  mesh-core
-  mesh-ledger
-  mesh-node
-  mesh-coordinator
-  mesh-validator
-  mesh-runtime
-  mesh-gpu
-  mesh-model
-  mesh-p2p
-  mesh-ai
+  hocmesh-protocol
+  hocmesh-core
+  hocmesh-ledger
+  hocmesh-node
+  hocmesh-coordinator
+  hocmesh-validator
+  hocmesh-runtime
+  hocmesh-gpu
+  hocmesh-model
+  hocmesh-p2p
+  hocmesh-ai
 ```
 
 ## Release engineering
@@ -218,12 +218,12 @@ no duplicate payout succeeds
 validator outage/rejoin recovers
 ```
 
-Only after that baseline is stable should MESH AI GPU execution become the main workstream.
+Only after that baseline is stable should hocMESH AI GPU execution become the main workstream.
 
 
 ## Newly implemented crash recovery
 
-The coordinator now persists exact ledger intents before quorum submission. Jobs are held in `funding`/`blocked`, and provider results in `settling`, until certification is reconciled. `mesh-coordinator recover` (also invoked best-effort on startup) uses signed quorum claim proofs and retries the same transaction if necessary.
+The coordinator now persists exact ledger intents before quorum submission. Jobs are held in `funding`/`blocked`, and provider results in `settling`, until certification is reconciled. `hocmesh-coordinator recover` (also invoked best-effort on startup) uses signed quorum claim proofs and retries the same transaction if necessary.
 
 Codex should specifically test crashes at these points:
 

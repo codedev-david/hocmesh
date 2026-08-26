@@ -1,13 +1,13 @@
-# MESH Architecture
+# hocMESH Architecture
 
 ## Product split
 
 ```text
-MESH AI
+hocMESH AI
   model/runtime/inference layer
             │
             ▼
-MESH Compute Core
+hocMESH Compute Core
   identity, scheduling, ledger, resources, verification
             │
             ▼
@@ -18,7 +18,7 @@ Community hardware
 
 ```text
                     ┌───────────────────┐
-                    │ MESH Coordinator  │
+                    │ hocMESH Coordinator  │
                     │ scheduler/control │
                     └─────────┬─────────┘
                               │
@@ -26,7 +26,7 @@ Community hardware
        ┌──────────────────────┼──────────────────────┐
        ▼                      ▼                      ▼
 ┌─────────────┐        ┌─────────────┐        ┌─────────────┐
-│ mesh Node A │        │ mesh Node B │        │ mesh Node C │
+│ hocmesh Node A │        │ hocmesh Node B │        │ hocmesh Node C │
 │ CPU/GPU cap │        │ CPU/GPU cap │        │ CPU/GPU cap │
 └─────────────┘        └─────────────┘        └─────────────┘
 
@@ -45,7 +45,7 @@ Home and consumer networks are often behind NAT, CGNAT, or restrictive firewalls
 A pull model requires only outbound connectivity:
 
 ```text
-mesh -> HTTPS -> coordinator
+hocmesh -> HTTPS -> coordinator
 ```
 
 No participant has to expose SSH, RDP, a shell, or an inbound job listener.
@@ -97,7 +97,7 @@ Control + small work data -> coordinator HTTP API
 Ledger -> validators
 ```
 
-MESH AI:
+hocMESH AI:
 
 ```text
 Control plane -> scheduler/federation

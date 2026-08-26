@@ -1,0 +1,223 @@
+use hocmesh_gpu::benchmark_memory;
+use hocmesh_protocol::{GpuCapability, NodeCapabilities, PROTOCOL_VERSION};
+use std::time::Instant;
+use sysinfo::System;
+
+use crate::compute::count_primes;
+use crate::limits::ResourceLimits;
+
+pub fn detect_capabilities(run_benchmark: bool) -> NodeCapabilities {
+    detect_capabilities_with_models(run_benchmark, None, Vec::new())
+}
+
+pub fn detect_capabilities_with_models(
+    run_benchmark: bool,
+    model_seed_url: Option<String>,
+    cached_model_manifests: Vec<String>,
+) -> NodeCapabilities {
+    let system = System::new_all();
+    let cpu_brand = system
+        .cpus()
+        .first()
+        .map(|cpu| cpu.brand().trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let gpus = hocmesh_gpu::discover_devices()
+        .into_iter()
+        .map(|device| {
+            let benchmark = run_benchmark.then(|| benchmark_memory(&device, 8 * 1024 * 1024, 8));
+            GpuCapability {
+                stable_id: device.stable_id,
+                vendor: device.vendor,
+                name: device.name,
+                backend: format!("{:?}", device.backend).to_lowercase(),
+                memory_mb: device.memory_bytes.map(|bytes| bytes / 1024 / 1024),
+                driver_version: device.driver_version,
+                compute_version: device.compute_version,
+                supports_fp16: device.supports_fp16,
+                supports_bf16: device.supports_bf16,
+                supports_int8: device.supports_int8,
+                benchmark_bytes_per_second: benchmark
+                    .as_ref()
+                    .map(|report| report.throughput_units_per_second as u64),
+                benchmark_p95_micros: benchmark
+                    .as_ref()
+                    .map(|report| (report.latency_p95_ms * 1000.0) as u64),
+            }
+        })
+        .collect();
+
+    let mut caps = NodeCapabilities {
+        protocol_version: PROTOCOL_VERSION,
+        hostname: System::host_name().unwrap_or_else(|| "unknown".to_string()),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        cpu_brand,
+        logical_cpus: system.cpus().len().max(1),
+        total_memory_bytes: system.total_memory(),
+        cpu_benchmark_score: if run_benchmark { benchmark_cpu() } else { 0 },
+        gpus,
+        model_seed_url,
+        cached_model_manifests,
+        coordinator_latency_micros: 0,
+        model_bandwidth_kbps: 100_000,
+        accelerator_load_permille: 0,
+        ai_runtime_ready: false,
+        // Fail safe: until an operator's limits are applied, advertise only the
+        // conservative default share rather than the whole machine.
+        shared_logical_cpus: 0,
+        shared_memory_bytes: 0,
+        shared_gpu_percent: 0,
+        network_coordinate: None,
+        probe_endpoint: None,
+    };
+    apply_limits(&mut caps, &ResourceLimits::default());
+    caps
+}
+
+/// Returns a deterministic CPU throughput score (candidate integers/second).
+pub fn benchmark_cpu() -> u64 {
+    const END: u64 = 150_000;
+    let started = Instant::now();
+    let _ = count_primes(2, END);
+    let elapsed = started.elapsed().as_secs_f64().max(0.000_001);
+    ((END - 2) as f64 / elapsed) as u64
+}
+
+/// Overwrite the advertised shared-capacity fields from the operator's limits.
+///
+/// Advertising the *shared* slice rather than the whole machine keeps the
+/// scheduler honest and avoids disclosing the full hardware profile of a
+/// contributor's machine to the rest of the hocmesh.
+pub fn apply_limits(caps: &mut NodeCapabilities, limits: &ResourceLimits) {
+    caps.shared_logical_cpus = limits.effective_workers(caps.logical_cpus);
+    caps.shared_memory_bytes = limits.shared_memory_bytes(caps.total_memory_bytes);
+    caps.shared_gpu_percent = limits.gpu_percent;
+    if !limits.offers_gpu() {
+        caps.gpus.clear();
+        caps.ai_runtime_ready = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_gpu() -> GpuCapability {
+        GpuCapability {
+            stable_id: "gpu-0".into(),
+            vendor: "test".into(),
+            name: "Test GPU".into(),
+            backend: "cpu".into(),
+            memory_mb: Some(8_192),
+            driver_version: None,
+            compute_version: None,
+            supports_fp16: true,
+            supports_bf16: false,
+            supports_int8: true,
+            benchmark_bytes_per_second: None,
+            benchmark_p95_micros: None,
+        }
+    }
+
+    /// A machine with known hardware, before any operator limit is applied.
+    fn a_machine() -> NodeCapabilities {
+        let mut caps = detect_capabilities(false);
+        caps.logical_cpus = 16;
+        caps.total_memory_bytes = 32_000_000_000;
+        caps.gpus = vec![a_gpu()];
+        caps.ai_runtime_ready = true;
+        caps
+    }
+
+    /// What the hocmesh is told is the operator's share, not the machine. The
+    /// detected totals stay put so the share can be recomputed if the limits
+    /// change; only the advertised slice moves.
+    #[test]
+    fn limits_shrink_what_is_advertised_not_what_was_detected() {
+        let mut caps = a_machine();
+        apply_limits(
+            &mut caps,
+            &ResourceLimits {
+                cpu_percent: 25,
+                gpu_percent: 60,
+                memory_percent: 50,
+            },
+        );
+
+        assert_eq!(caps.shared_logical_cpus, 4);
+        assert_eq!(caps.shared_memory_bytes, 16_000_000_000);
+        assert_eq!(caps.shared_gpu_percent, 60);
+        assert_eq!(caps.logical_cpus, 16, "the machine did not change size");
+        assert_eq!(caps.total_memory_bytes, 32_000_000_000);
+        assert_eq!(caps.gpus.len(), 1, "a lent GPU is still advertised");
+        assert!(caps.ai_runtime_ready);
+    }
+
+    /// Lending no GPU has to mean the hocmesh never learns there is one. Leaving
+    /// the GPU in the advertisement would keep the node eligible for AI work
+    /// it has been told not to do, and would disclose hardware the operator
+    /// deliberately kept back.
+    #[test]
+    fn a_withheld_gpu_is_not_advertised_at_all() {
+        let mut caps = a_machine();
+        apply_limits(
+            &mut caps,
+            &ResourceLimits {
+                cpu_percent: 50,
+                gpu_percent: 0,
+                memory_percent: 50,
+            },
+        );
+
+        assert!(
+            caps.gpus.is_empty(),
+            "a GPU nobody may use is nobody's business"
+        );
+        assert!(
+            !caps.ai_runtime_ready,
+            "a node with no GPU to lend must not be offered AI work"
+        );
+        assert_eq!(caps.shared_gpu_percent, 0);
+        assert_eq!(caps.shared_logical_cpus, 8, "the CPU share is unaffected");
+    }
+
+    /// `hocmesh init` and the daemon both apply limits to a freshly detected
+    /// machine, and an operator may change them and restart. Applying twice
+    /// must land in the same place, or the share would ratchet downwards.
+    #[test]
+    fn applying_the_same_limits_twice_changes_nothing() {
+        let limits = ResourceLimits {
+            cpu_percent: 30,
+            gpu_percent: 40,
+            memory_percent: 30,
+        };
+        let mut once = a_machine();
+        apply_limits(&mut once, &limits);
+        let mut twice = once.clone();
+        apply_limits(&mut twice, &limits);
+        assert_eq!(once, twice);
+    }
+
+    /// A tiny share of a big machine still has to be able to do one thing at
+    /// a time, and a generous share must never promise more than exists.
+    #[test]
+    fn the_worker_count_stays_between_one_and_the_whole_machine() {
+        for (cpu_percent, cpus, expected) in [(1u8, 16usize, 1usize), (100, 16, 16), (50, 1, 1)] {
+            let mut caps = a_machine();
+            caps.logical_cpus = cpus;
+            apply_limits(
+                &mut caps,
+                &ResourceLimits {
+                    cpu_percent,
+                    gpu_percent: 50,
+                    memory_percent: 50,
+                },
+            );
+            assert_eq!(
+                caps.shared_logical_cpus, expected,
+                "{cpu_percent}% of {cpus} CPUs"
+            );
+        }
+    }
+}

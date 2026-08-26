@@ -1,6 +1,6 @@
 # Release Engineering
 
-MESH release artifacts should be built from a clean checkout using the pinned
+hocMESH release artifacts should be built from a clean checkout using the pinned
 Rust toolchain in `rust-toolchain.toml`.
 
 Required pre-release checks:
@@ -12,7 +12,7 @@ cargo test --workspace --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo audit
 cargo deny check
-cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/mesh-coverage.lcov --fail-under-lines 45
+cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/hocmesh-coverage.lcov --fail-under-lines 45
 ```
 
 Release folders are produced with:
@@ -29,9 +29,9 @@ or on Windows PowerShell:
 
 The release folder must include:
 
-- `mesh`
-- `mesh-coordinator`
-- `mesh-validator`
+- `hocmesh`
+- `hocmesh-coordinator`
+- `hocmesh-validator`
 - `README.md`
 - `CODEX_HANDOFF.md`
 - `LICENSE`

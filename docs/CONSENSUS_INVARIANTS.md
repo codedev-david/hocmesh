@@ -1,4 +1,4 @@
-# MESH Consensus and Accounting Invariants
+# hocMESH Consensus and Accounting Invariants
 
 These rules are security boundaries, not implementation suggestions. Changes that weaken them require an explicit protocol-version change and threat-model review.
 
@@ -27,7 +27,7 @@ sum(posting.delta_mcu) == 0
 
 A user reservation transfers CU from requester to a job escrow. A provider reward transfers CU from that same escrow to the provider. No ordinary job creates CU.
 
-The only account allowed to supply newly issued bootstrap CU is `mesh:community:issuance`, and cumulative issuance may not exceed the validator-set policy limit.
+The only account allowed to supply newly issued bootstrap CU is `hocmesh:community:issuance`, and cumulative issuance may not exceed the validator-set policy limit.
 
 ## Exactly-once claims
 

@@ -1,6 +1,6 @@
 # Coordinator / Ledger Crash Recovery
 
-MESH separates scheduler state from authoritative CU state. That creates an unavoidable distributed transaction boundary: a validator quorum can certify a CU transfer while the coordinator crashes before updating its local SQLite rows.
+hocMESH separates scheduler state from authoritative CU state. That creates an unavoidable distributed transaction boundary: a validator quorum can certify a CU transfer while the coordinator crashes before updating its local SQLite rows.
 
 The v0.2 recovery design uses durable intents and idempotent ledger claims rather than pretending SQLite and the validator quorum share one transaction.
 
@@ -47,12 +47,12 @@ possibly job = completed
 
 ## Recovery algorithm
 
-`mesh-coordinator recover --db mesh.db --validators validators.json` scans pending intents.
+`hocmesh-coordinator recover --db hocmesh.db --validators validators.json` scans pending intents.
 
 For each intent it asks validators for the claim (`reserve:<job>` or `reward:<assignment>`).
 
 - If any validator returns the full quorum certificate, the coordinator verifies the certificate and can safely finalize local state even if only that replica received the prior commit.
-- Otherwise MESH requires a threshold of signed validator proofs agreeing the claim is absent at the same ledger head before retrying the exact persisted transaction.
+- Otherwise hocMESH requires a threshold of signed validator proofs agreeing the claim is absent at the same ledger head before retrying the exact persisted transaction.
 
 The same recovery runs best-effort on coordinator startup and periodically while the coordinator is running.
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 3 || $# -gt 4 ]]; then
-  echo "usage: $0 <mesh-binary> <version> <output-dir> [architecture]" >&2
+  echo "usage: $0 <hocmesh-binary> <version> <output-dir> [architecture]" >&2
   exit 2
 fi
 
@@ -14,7 +14,7 @@ output_dir=$(cd "$3" && pwd -P)
 architecture=${4:-amd64}
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
-[[ -f "$binary" ]] || { echo "mesh binary not found: $binary" >&2; exit 1; }
+[[ -f "$binary" ]] || { echo "hocmesh binary not found: $binary" >&2; exit 1; }
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+~-][0-9A-Za-z.+~-]+)*$ ]] || {
   echo "invalid Debian version: $version" >&2
   exit 1
@@ -25,19 +25,19 @@ cd "$repository_root"
 
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
-root="$stage/mesh_${version}_${architecture}"
-install -d "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/mesh"
-install -m 0755 "$binary" "$root/usr/bin/mesh"
-install -m 0644 README.md LICENSE "$root/usr/share/doc/mesh/"
+root="$stage/hocmesh_${version}_${architecture}"
+install -d "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/hocmesh"
+install -m 0755 "$binary" "$root/usr/bin/hocmesh"
+install -m 0644 README.md LICENSE "$root/usr/share/doc/hocmesh/"
 
 sed \
   -e "s/@VERSION@/$version/g" \
   -e "s/@ARCHITECTURE@/$architecture/g" \
   packaging/linux/control.in > "$root/DEBIAN/control"
 
-artifact="$output_dir/mesh_${version}_${architecture}.deb"
+artifact="$output_dir/hocmesh_${version}_${architecture}.deb"
 dpkg-deb --root-owner-group --build "$root" "$artifact"
 dpkg-deb --info "$artifact" >/dev/null
 dpkg-deb --contents "$artifact" > "$stage/contents.txt"
-grep -q 'usr/bin/mesh$' "$stage/contents.txt"
+grep -q 'usr/bin/hocmesh$' "$stage/contents.txt"
 echo "$artifact"

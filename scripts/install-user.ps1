@@ -1,8 +1,8 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
-cargo build --release -p mesh
-$Dest = Join-Path $env:LOCALAPPDATA "MESH\bin"
+cargo build --release -p hocmesh
+$Dest = Join-Path $env:LOCALAPPDATA "hocMESH\bin"
 New-Item -ItemType Directory -Force $Dest | Out-Null
-Copy-Item target\release\mesh.exe (Join-Path $Dest "mesh.exe") -Force
-Write-Host "Installed MESH participant client to $Dest\mesh.exe"
+Copy-Item target\release\hocmesh.exe (Join-Path $Dest "hocmesh.exe") -Force
+Write-Host "Installed hocMESH participant client to $Dest\hocmesh.exe"
 Write-Host "Add $Dest to PATH or run the executable directly."

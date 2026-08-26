@@ -1,22 +1,22 @@
-# MESH Compute
+# hocMESH Compute
 
-**MESH = Mutual Exchange of Shared Hardware**
+**hocMESH = Mutual Exchange of Shared Hardware**
 
-MESH is an open, contribution-first distributed compute network. Participants contribute idle compute, earn non-monetary Compute Units (CU), bank those units, and later spend them on work executed by other participants.
+hocMESH is an open, contribution-first distributed compute network. Participants contribute idle compute, earn non-monetary Compute Units (CU), bank those units, and later spend them on work executed by other participants.
 
 There is **no payment system, token, cryptocurrency, market, or purchasable credit** in this design.
 
 > Contribute first. Compute later.
 
-This repository is a Rust implementation of MESH Compute Core and the MESH AI control/data-plane architecture.
+This repository is a Rust implementation of hocMESH Compute Core and the hocMESH AI control/data-plane architecture.
 
 ## What is implemented in v0.3
 
 This repository contains working source for three native Rust programs:
 
-- `mesh` — participant/client/worker CLI
-- `mesh-coordinator` — workload scheduler and node control plane
-- `mesh-validator` — replicated CU ledger validator
+- `hocmesh` — participant/client/worker CLI
+- `hocmesh-coordinator` — workload scheduler and node control plane
+- `hocmesh-validator` — replicated CU ledger validator
 
 Implemented architecture:
 
@@ -62,7 +62,7 @@ Implemented architecture:
 
 ## Runtime boundary
 
-MESH v0.3 executes independent distributed inference batches through a user-supplied, backend-enabled llama.cpp runtime. Pipeline and tensor/model plans and transport are implemented; actual partial-layer kernels require a compatible runtime plugin because stock llama.cpp does not expose them.
+hocMESH v0.3 executes independent distributed inference batches through a user-supplied, backend-enabled llama.cpp runtime. Pipeline and tensor/model plans and transport are implemented; actual partial-layer kernels require a compatible runtime plugin because stock llama.cpp does not expose them.
 
 The current executable workload is deterministic CPU prime-range computation. The architecture deliberately proves the harder control-plane primitives first:
 
@@ -75,7 +75,7 @@ The current executable workload is deterministic CPU prime-range computation. Th
 7. verification,
 8. fault recovery.
 
-See `docs/MESH_AI.md` for commands, interfaces, validation, and hardware/runtime boundaries.
+See `docs/HOCMESH_AI.md` for commands, interfaces, validation, and hardware/runtime boundaries.
 
 See `docs/FULL_ORIGINAL_SPEC.md` and `docs/ROADMAP.md`.
 
@@ -84,7 +84,7 @@ See `docs/FULL_ORIGINAL_SPEC.md` and `docs/ROADMAP.md`.
 # Repository layout
 
 ```text
-MESH/
+hocMESH/
 ├── Cargo.toml
 ├── rust-toolchain.toml
 ├── README.md
@@ -95,32 +95,32 @@ MESH/
 │   └── validators.example.json
 │
 ├── crates/
-│   ├── mesh-protocol/
+│   ├── hocmesh-protocol/
 │   │   └── shared wire types, signed request format, hashes, IDs
 │   │
-│   ├── mesh-core/
+│   ├── hocmesh-core/
 │   │   ├── identity.rs
 │   │   ├── hardware.rs
 │   │   └── compute.rs
 │   │
-│   ├── mesh-ledger/
+│   ├── hocmesh-ledger/
 │   │   ├── types.rs
 │   │   ├── validate.rs
 │   │   ├── store.rs
 │   │   └── network.rs
 │   │
-│   ├── mesh-node/
+│   ├── hocmesh-node/
 │   │   ├── main.rs
 │   │   ├── client.rs
 │   │   └── daemon.rs
 │   │
-│   ├── mesh-coordinator/
+│   ├── hocmesh-coordinator/
 │   │   ├── main.rs
 │   │   ├── api.rs
 │   │   ├── db.rs
 │   │   └── error.rs
 │   │
-│   └── mesh-validator/
+│   └── hocmesh-validator/
 │       └── main.rs
 │
 ├── docs/
@@ -212,17 +212,17 @@ Expected binaries:
 ## Windows
 
 ```text
-target\release\mesh.exe
-target\release\mesh-coordinator.exe
-target\release\mesh-validator.exe
+target\release\hocmesh.exe
+target\release\hocmesh-coordinator.exe
+target\release\hocmesh-validator.exe
 ```
 
 ## Linux/macOS
 
 ```text
-target/release/mesh
-target/release/mesh-coordinator
-target/release/mesh-validator
+target/release/hocmesh
+target/release/hocmesh-coordinator
+target/release/hocmesh-validator
 ```
 
 Run the full verification suite:
@@ -257,27 +257,27 @@ Windows PowerShell:
 ./scripts/install-user.ps1
 ```
 
-These scripts compile only the `mesh` participant client and copy it to a per-user binary directory. Tagged GitHub releases additionally provide native Windows MSI, macOS PKG, and Linux DEB installers. To build installers locally from an existing release binary:
+These scripts compile only the `hocmesh` participant client and copy it to a per-user binary directory. Tagged GitHub releases additionally provide native Windows MSI, macOS PKG, and Linux DEB installers. To build installers locally from an existing release binary:
 
 ```bash
-./scripts/package-linux.sh target/release/mesh "$(cat VERSION)" dist amd64
-./scripts/package-macos.sh target/release/mesh "$(cat VERSION)" dist
+./scripts/package-linux.sh target/release/hocmesh "$(cat VERSION)" dist amd64
+./scripts/package-macos.sh target/release/hocmesh "$(cat VERSION)" dist
 ```
 
 ```powershell
 dotnet tool install --global wix --version 6.0.2
-./scripts/package-windows.ps1 -Binary target/release/mesh.exe -Version (Get-Content VERSION -Raw).Trim() -OutputDirectory dist
+./scripts/package-windows.ps1 -Binary target/release/hocmesh.exe -Version (Get-Content VERSION -Raw).Trim() -OutputDirectory dist
 ```
 
 Install a downloaded release package with the native platform tool:
 
 ```bash
-sudo apt install ./mesh_0.3.0_amd64.deb
-sudo installer -pkg ./mesh-0.3.0.pkg -target /
+sudo apt install ./hocmesh_0.3.0_amd64.deb
+sudo installer -pkg ./hocmesh-0.3.0.pkg -target /
 ```
 
 ```powershell
-Start-Process msiexec.exe -Wait -ArgumentList '/i', '.\mesh-0.3.0-x86_64.msi'
+Start-Process msiexec.exe -Wait -ArgumentList '/i', '.\hocmesh-0.3.0-x86_64.msi'
 ```
 
 ---
@@ -298,7 +298,7 @@ Start-Process msiexec.exe -Wait -ArgumentList '/i', '.\mesh-0.3.0-x86_64.msi'
 
 The script creates `dist/` containing the three native binaries plus the documentation/config files required to deploy them.
 
-For a participant-only machine, only `mesh` is required.
+For a participant-only machine, only `hocmesh` is required.
 
 ---
 
@@ -309,34 +309,34 @@ This mode uses the coordinator's local SQLite ledger and is useful only for deve
 Terminal 1:
 
 ```bash
-mesh-coordinator seed --db mesh.db --start 2 --end 5000000 --shards 32
-mesh-coordinator serve --db mesh.db --listen 127.0.0.1:8080
+hocmesh-coordinator seed --db hocmesh.db --start 2 --end 5000000 --shards 32
+hocmesh-coordinator serve --db hocmesh.db --listen 127.0.0.1:8080
 ```
 
 Terminal 2:
 
 ```bash
-mesh --home .mesh-node-a init
-mesh --home .mesh-node-a daemon --workers 2
+hocmesh --home .hocmesh-node-a init
+hocmesh --home .hocmesh-node-a daemon --workers 2
 ```
 
 Terminal 3:
 
 ```bash
-mesh --home .mesh-node-b init
-mesh --home .mesh-node-b daemon --workers 2
+hocmesh --home .hocmesh-node-b init
+hocmesh --home .hocmesh-node-b daemon --workers 2
 ```
 
 After a node completes community-funded work:
 
 ```bash
-mesh --home .mesh-node-a balance
+hocmesh --home .hocmesh-node-a balance
 ```
 
 Then submit a paid distributed job:
 
 ```bash
-mesh --home .mesh-node-a submit-prime --start 2 --end 10000000 --shards 32
+hocmesh --home .hocmesh-node-a submit-prime --start 2 --end 10000000 --shards 32
 ```
 
 A requester is excluded from executing its own paid shards.
@@ -352,16 +352,16 @@ A four-validator lab uses four independent identities and a 3-of-4 threshold.
 ## 1. Generate validator identities
 
 ```bash
-mesh-validator id --home .validator-1
-mesh-validator id --home .validator-2
-mesh-validator id --home .validator-3
-mesh-validator id --home .validator-4
+hocmesh-validator id --home .validator-1
+hocmesh-validator id --home .validator-2
+hocmesh-validator id --home .validator-3
+hocmesh-validator id --home .validator-4
 ```
 
 Each command prints:
 
 ```text
-validator_id=mesh_...
+validator_id=hocmesh_...
 public_key_b64=...
 ```
 
@@ -375,22 +375,22 @@ Example:
   "community_issuance_limit_mcu": 1000000000,
   "members": [
     {
-      "validator_id": "mesh_...",
+      "validator_id": "hocmesh_...",
       "url": "http://127.0.0.1:9101",
       "public_key_b64": "..."
     },
     {
-      "validator_id": "mesh_...",
+      "validator_id": "hocmesh_...",
       "url": "http://127.0.0.1:9102",
       "public_key_b64": "..."
     },
     {
-      "validator_id": "mesh_...",
+      "validator_id": "hocmesh_...",
       "url": "http://127.0.0.1:9103",
       "public_key_b64": "..."
     },
     {
-      "validator_id": "mesh_...",
+      "validator_id": "hocmesh_...",
       "url": "http://127.0.0.1:9104",
       "public_key_b64": "..."
     }
@@ -405,7 +405,7 @@ Example:
 Terminal 1:
 
 ```bash
-mesh-validator serve \
+hocmesh-validator serve \
   --home .validator-1 \
   --db validator-1.db \
   --listen 127.0.0.1:9101 \
@@ -415,7 +415,7 @@ mesh-validator serve \
 Terminal 2:
 
 ```bash
-mesh-validator serve \
+hocmesh-validator serve \
   --home .validator-2 \
   --db validator-2.db \
   --listen 127.0.0.1:9102 \
@@ -425,7 +425,7 @@ mesh-validator serve \
 Terminal 3:
 
 ```bash
-mesh-validator serve \
+hocmesh-validator serve \
   --home .validator-3 \
   --db validator-3.db \
   --listen 127.0.0.1:9103 \
@@ -435,7 +435,7 @@ mesh-validator serve \
 Terminal 4:
 
 ```bash
-mesh-validator serve \
+hocmesh-validator serve \
   --home .validator-4 \
   --db validator-4.db \
   --listen 127.0.0.1:9104 \
@@ -447,8 +447,8 @@ For a real Internet deployment, validators should be operated by independent par
 ## 3. Reserve community bootstrap work through quorum
 
 ```bash
-mesh-coordinator seed \
-  --db mesh.db \
+hocmesh-coordinator seed \
+  --db hocmesh.db \
   --validators validators.json \
   --start 2 \
   --end 5000000 \
@@ -465,8 +465,8 @@ The coordinator cannot simply credit a user balance.
 ## 4. Start the scheduler
 
 ```bash
-mesh-coordinator serve \
-  --db mesh.db \
+hocmesh-coordinator serve \
+  --db hocmesh.db \
   --listen 127.0.0.1:8080 \
   --validators validators.json
 ```
@@ -476,15 +476,15 @@ In this mode the validators are authoritative for balances.
 ## 5. Start participant nodes
 
 ```bash
-mesh --home .mesh-a init
-mesh --home .mesh-a daemon --workers 4
+hocmesh --home .hocmesh-a init
+hocmesh --home .hocmesh-a daemon --workers 4
 ```
 
 On another machine:
 
 ```bash
-mesh --coordinator https://coordinator.example.org --home .mesh init
-mesh --coordinator https://coordinator.example.org --home .mesh daemon --workers 4
+hocmesh --coordinator https://coordinator.example.org --home .hocmesh init
+hocmesh --coordinator https://coordinator.example.org --home .hocmesh daemon --workers 4
 ```
 
 Workers only need outbound access to the coordinator. They do not need an inbound listening port unless they opt into answering other nodes' latency probes.
@@ -495,18 +495,18 @@ A contributor lends a share, not the whole box. The share is stored under
 `--home` and is what the node advertises; the coordinator never sees the rest.
 
 ```bash
-mesh --home .mesh-a limits
-mesh --home .mesh-a limits --cpu-percent 50 --memory-percent 25 --gpu-percent 0
+hocmesh --home .hocmesh-a limits
+hocmesh --home .hocmesh-a limits --cpu-percent 50 --memory-percent 25 --gpu-percent 0
 ```
 
-Limits apply from the first contact: `mesh init` registers the same share the
+Limits apply from the first contact: `hocmesh init` registers the same share the
 daemon will advertise. Setting `--gpu-percent 0` withdraws the GPU entirely, and
 the node stops advertising accelerators at all.
 
 ### Seeing where the node sits
 
 ```bash
-mesh --home .mesh-a proximity
+hocmesh --home .hocmesh-a proximity
 ```
 
 A node that has not yet measured enough peers reports that it has no place yet
@@ -514,7 +514,7 @@ rather than inventing one. To also answer other nodes' probes, give the daemon a
 port to listen on:
 
 ```bash
-mesh --home .mesh-a daemon --workers 4 --probe-listen 0.0.0.0:8646
+hocmesh --home .hocmesh-a daemon --workers 4 --probe-listen 0.0.0.0:8646
 ```
 
 ---
@@ -576,7 +576,7 @@ Every normal transaction must sum to zero.
 The only issuance source is:
 
 ```text
-mesh:community:issuance
+hocmesh:community:issuance
 ```
 
 and that account is limited by `community_issuance_limit_mcu` in the pinned validator membership file.
@@ -603,7 +603,7 @@ See `docs/LEDGER.md`.
 Participant nodes can query validators directly.
 
 ```bash
-mesh --home .mesh-a ledger-status --validators validators.json
+hocmesh --home .hocmesh-a ledger-status --validators validators.json
 ```
 
 This requires a quorum of validators to independently agree on both:
@@ -614,17 +614,17 @@ This requires a quorum of validators to independently agree on both:
 Mirror the entire ledger locally:
 
 ```bash
-mesh --home .mesh-a ledger-sync \
+hocmesh --home .hocmesh-a ledger-sync \
   --validators validators.json \
-  --db .mesh-a/ledger-mirror.db
+  --db .hocmesh-a/ledger-mirror.db
 ```
 
 Audit it later without trusting the coordinator:
 
 ```bash
-mesh --home .mesh-a ledger-audit \
+hocmesh --home .hocmesh-a ledger-audit \
   --validators validators.json \
-  --db .mesh-a/ledger-mirror.db
+  --db .hocmesh-a/ledger-mirror.db
 ```
 
 The audit checks:
@@ -647,12 +647,12 @@ The audit checks:
 
 # Coordinator settlement recovery
 
-In quorum mode, MESH persists the exact ledger transaction locally **before** asking validators to certify it. If the coordinator crashes or loses connectivity during reservation/reward settlement, the local job/shard remains blocked in `funding` or `settling` rather than being double-spent or reissued.
+In quorum mode, hocMESH persists the exact ledger transaction locally **before** asking validators to certify it. If the coordinator crashes or loses connectivity during reservation/reward settlement, the local job/shard remains blocked in `funding` or `settling` rather than being double-spent or reissued.
 
 Recovery runs automatically when the coordinator starts with `--validators`. It can also be run explicitly:
 
 ```bash
-mesh-coordinator recover --db mesh.db --validators validators.json
+hocmesh-coordinator recover --db hocmesh.db --validators validators.json
 ```
 
 Recovery asks independent validators for a signed quorum claim proof. If the claim is already certified, it finalizes local state. If it is not yet certified, it retries the **same persisted transaction** so existing validator vote locks remain compatible.
@@ -662,7 +662,7 @@ Recovery asks independent validators for a signed quorum claim proof. If the cla
 A validator that was offline can catch up from peers:
 
 ```bash
-mesh-validator sync \
+hocmesh-validator sync \
   --db validator-3.db \
   --validators validators.json
 ```
@@ -670,7 +670,7 @@ mesh-validator sync \
 Then verify its entire local replica:
 
 ```bash
-mesh-validator audit \
+hocmesh-validator audit \
   --db validator-3.db \
   --validators validators.json
 ```
@@ -679,7 +679,7 @@ mesh-validator audit \
 
 # Why this is not a blockchain or cryptocurrency
 
-MESH deliberately borrows useful distributed-ledger ideas without introducing a financial token.
+hocMESH deliberately borrows useful distributed-ledger ideas without introducing a financial token.
 
 Used concepts:
 
@@ -711,7 +711,7 @@ CU is a non-transferable accounting unit representing previously contributed com
 The node identity is stored under the selected `--home` directory:
 
 ```text
-.mesh/identity.json
+.hocmesh/identity.json
 ```
 
 On Unix, the implementation attempts to set the file to mode `0600`.
@@ -730,7 +730,7 @@ For a production client, the next security step should be OS-native secure key s
 
 # Security model
 
-MESH workers do not expose SSH, RDP, shell access, or arbitrary host command execution.
+hocMESH workers do not expose SSH, RDP, shell access, or arbitrary host command execution.
 
 The current runtime only accepts a known `WorkSpec` enum.
 
@@ -808,12 +808,12 @@ This is intentionally expensive verification for an MVP. Future workload types n
 
 ---
 
-# MESH AI layer
+# hocMESH AI layer
 
 The implemented architecture is:
 
 ```text
-MESH AI
+hocMESH AI
    │
    ├── model registry
    ├── content-addressed model chunks
@@ -831,7 +831,7 @@ MESH AI
    └── failure-aware rerouting
          │
          ▼
-MESH Compute Core
+hocMESH Compute Core
 ```
 
 Batch inference and authenticated scheduling/rerouting run end to end. Pipeline and model/tensor planning plus ordered tensor transport are implemented as the control/data plane; actual partial-layer and collective kernels remain the responsibility of the configured backend runtime.
@@ -852,7 +852,7 @@ This repository intentionally documents the remaining work instead of disguising
 8. Key storage is file-based rather than OS hardware-backed.
 9. Installers are unsigned until platform signing identities are configured in the release environment.
 10. P2P model seeding uses authenticated HTTP peers; NAT traversal and peer discovery remain deployment concerns.
-11. Coordinator crash recovery for certified reservations/rewards is implemented through durable ledger intents and `mesh-coordinator recover`; a full multi-coordinator BFT view-change protocol remains a production blocker.
+11. Coordinator crash recovery for certified reservations/rewards is implemented through durable ledger intents and `hocmesh-coordinator recover`; a full multi-coordinator BFT view-change protocol remains a production blocker.
 
 These are specifically called out in `CODEX_HANDOFF.md` as next engineering targets.
 
@@ -860,7 +860,7 @@ These are specifically called out in `CODEX_HANDOFF.md` as next engineering targ
 
 # Development principles
 
-When extending MESH, preserve these invariants:
+When extending hocMESH, preserve these invariants:
 
 1. **No purchased CU.**
 2. **New identities start at zero.**

@@ -1,8 +1,8 @@
-# MESH Quorum Ledger
+# hocMESH Quorum Ledger
 
 ## Goal
 
-The MESH ledger exists to prevent any single scheduler, administrator, database, or participant from being able to manufacture or erase Compute Units undetectably.
+The hocMESH ledger exists to prevent any single scheduler, administrator, database, or participant from being able to manufacture or erase Compute Units undetectably.
 
 It is a replicated accounting log, not a cryptocurrency.
 
@@ -192,7 +192,7 @@ votes
 Any ordinary participant can execute:
 
 ```bash
-mesh ledger-sync --validators validators.json --db .mesh/ledger-mirror.db
+hocmesh ledger-sync --validators validators.json --db .hocmesh/ledger-mirror.db
 ```
 
 The client downloads quorum-certified entries and applies them locally.
@@ -200,7 +200,7 @@ The client downloads quorum-certified entries and applies them locally.
 It can then run:
 
 ```bash
-mesh ledger-audit --validators validators.json --db .mesh/ledger-mirror.db
+hocmesh ledger-audit --validators validators.json --db .hocmesh/ledger-mirror.db
 ```
 
 This means full replicas are not restricted to validator operators.
@@ -229,7 +229,7 @@ This implementation is intentionally a practical v0.2 quorum-certified linear lo
 Before hostile Internet-scale deployment, the recommended next step is to either:
 
 1. implement a formally specified BFT consensus protocol around these transaction rules, or
-2. embed a mature consensus library/protocol while keeping MESH's ledger transaction validation logic.
+2. embed a mature consensus library/protocol while keeping hocMESH's ledger transaction validation logic.
 
 Do not replace the current voting rules with an ad-hoc "majority wins" implementation that permits double voting.
 
@@ -237,7 +237,7 @@ Do not replace the current voting rules with an ad-hoc "majority wins" implement
 
 Before quorum submission, the coordinator persists a `ledger_intents` record containing the exact serialized transaction and leaves affected work in a non-runnable state (`funding` or `settling`).
 
-After a restart, `mesh-coordinator recover` or automatic startup recovery asks validators for a signed quorum claim proof. A certified claim is finalized locally; an absent claim causes the coordinator to retry the exact same transaction. This avoids creating a second debit/reward after an ambiguous network failure.
+After a restart, `hocmesh-coordinator recover` or automatic startup recovery asks validators for a signed quorum claim proof. A certified claim is finalized locally; an absent claim causes the coordinator to retry the exact same transaction. This avoids creating a second debit/reward after an ambiguous network failure.
 
 The validator proposal client also serializes proposals within one process to reduce accidental same-height races. This does not replace a full BFT leader/view-change protocol for multiple independent proposers.
 

@@ -1,12 +1,12 @@
 # Verification
 
-MESH pays providers in CU for work the network cannot re-do cheaply. The whole
+hocMESH pays providers in CU for work the network cannot re-do cheaply. The whole
 economy therefore rests on one question: **how does anyone know a submitted
 result is real?**
 
 Until v0.4 the answer was "recompute it". The coordinator recomputed every
 shard before settling it, and every ledger validator recomputed it again while
-replaying the block. With `V` validators the mesh burned `V + 2` times the
+replaying the block. With `V` validators the hocmesh burned `V + 2` times the
 compute it delivered, and the harder a job was, the worse the multiplier hurt.
 That is not a performance bug; it is a design that cannot scale past a toy.
 
@@ -92,7 +92,7 @@ work already performed, so slashing it destroys something money cannot replace.
 
 ## Reproducing the numbers
 
-    cargo run --release -p mesh-core --example verification_proof
+    cargo run --release -p hocmesh-core --example verification_proof
 
 Every figure in this document is printed by that example, measured on the
 machine that runs it. It asserts its own claims, so it fails rather than lies.

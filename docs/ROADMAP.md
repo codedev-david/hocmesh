@@ -1,4 +1,4 @@
-# MESH Roadmap
+# hocMESH Roadmap
 
 ## Already implemented in this repository
 
@@ -61,7 +61,7 @@
 - Explicit capability model for filesystem/network.
 - Thermal and user-activity controls.
 
-## Priority 4 — MESH AI independent GPU jobs
+## Priority 4 — hocMESH AI independent GPU jobs
 
 - CUDA backend first.
 - GPU benchmark/profile.

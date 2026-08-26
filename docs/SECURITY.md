@@ -1,4 +1,4 @@
-# MESH Security Model
+# hocMESH Security Model
 
 ## Primary rule
 
@@ -18,7 +18,7 @@ A remote requester must not receive:
 
 ## Current execution model
 
-The Rust worker matches an allow-listed `WorkSpec` enum and runs native trusted code shipped with the MESH client.
+The Rust worker matches an allow-listed `WorkSpec` enum and runs native trusted code shipped with the hocMESH client.
 
 This is significantly safer than accepting arbitrary uploaded programs.
 

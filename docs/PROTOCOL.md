@@ -1,4 +1,4 @@
-# MESH Protocol v4
+# hocMESH Protocol v4
 
 ## Authentication
 
@@ -14,7 +14,7 @@ signature_b64
 Canonical signed message:
 
 ```text
-mesh-v4|ACTION|NODE_ID|TIMESTAMP|NONCE|BODY_HASH
+hocmesh-v4|ACTION|NODE_ID|TIMESTAMP|NONCE|BODY_HASH
 ```
 
 The server verifies:

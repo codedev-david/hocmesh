@@ -1,6 +1,13 @@
 # MeshCompute / MeshAI
 ## Community Distributed AI Compute Mesh — Full Technical Specification
 
+> **Historical document.** This is the original specification, kept verbatim
+> for the record — including the naming exploration that eventually produced
+> "MESH". The project is now called **hocMESH**; every other document and all
+> code use that name. Nothing here was renamed, so that the trail of how the
+> design arrived where it did stays readable.
+
+
 ## 1. Project Summary
 
 The proposed platform is a **community-owned distributed compute network** that combines idle CPUs, GPUs, RAM, and network capacity from computers around the world into a shared virtual data center.

@@ -2,7 +2,7 @@
 *.db
 *.db-shm
 *.db-wal
-.mesh/
+.hocmesh/
 node-*/
 dist/
 validator-*.db

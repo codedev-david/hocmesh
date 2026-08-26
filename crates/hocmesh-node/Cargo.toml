@@ -1,0 +1,25 @@
+[package]
+name = "hocmesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+hocmesh-core = { path = "../hocmesh-core" }
+hocmesh-ai = { path = "../hocmesh-ai" }
+hocmesh-ledger = { path = "../hocmesh-ledger" }
+hocmesh-model = { path = "../hocmesh-model" }
+hocmesh-gpu = { path = "../hocmesh-gpu" }
+hocmesh-protocol = { path = "../hocmesh-protocol" }
+hocmesh-transport = { path = "../hocmesh-transport" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
