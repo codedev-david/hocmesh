@@ -16,10 +16,7 @@ use hocmesh_ledger::{
 };
 use hocmesh_protocol::{WorkSpec, now_unix};
 use rusqlite::{OptionalExtension, params};
-use std::{
-    fs,
-    sync::{Arc, Mutex},
-};
+use std::{fs, sync::Arc};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -182,14 +179,14 @@ async fn serve(listen: &str, db_path: &str, validators: Option<&str>) -> Result<
             }
         });
     }
-    let conn = db::open(db_path)?;
+    let pool = db::Pool::open(db_path)?;
     let mode = if ledger.is_some() {
         "quorum"
     } else {
         "local-mvp"
     };
     let state = AppState {
-        db: Arc::new(Mutex::new(conn)),
+        db: Arc::new(pool),
         ledger,
     };
     let app = api::router(state);

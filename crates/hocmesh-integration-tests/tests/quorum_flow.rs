@@ -1,10 +1,20 @@
 use anyhow::{Context, Result, anyhow, bail};
-use hocmesh_core::{compute::execute_work, identity::NodeIdentity};
-use hocmesh_ledger::types::{LedgerHead, ValidatorSet};
+use hocmesh_core::{
+    compute::{execute_work, split_work, work_cost_mcu},
+    identity::NodeIdentity,
+};
+use hocmesh_ledger::{
+    network::LedgerNetwork,
+    types::{
+        COMMUNITY_ISSUANCE_ACCOUNT, LedgerHead, LedgerTransaction, Posting, TransactionEvidence,
+        TransactionKind, ValidatorSet, escrow_account,
+    },
+};
 use hocmesh_protocol::{
     BalanceResponse, ErrorResponse, JobStatusResponse, NodeCapabilities, PollRequest, PollResponse,
     RegisterRequest, ResultRequest, SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkSpec,
-    empty_body_hash, job_id_from_auth, register_body_hash, result_body_hash, submit_body_hash,
+    empty_body_hash, job_id_from_auth, now_unix, register_body_hash, result_body_hash,
+    submit_body_hash,
 };
 use reqwest::Client;
 use serde_json::json;
@@ -398,6 +408,46 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
             "audit validator ledger",
         )?;
     }
+
+    // A checkpoint has to be reachable the way an operator would reach it:
+    // mirror the ledger, ask the quorum what state it holds, keep that
+    // answer, throw away the history it vouches for, and audit anyway.
+    let node_bin = bin_dir.join(exe("hocmesh"));
+    let mirror = tmp.path.join("mirror.db");
+    let mirror = mirror.to_string_lossy().to_string();
+    for (cmd, label) in [
+        ("ledger-sync", "mirror the quorum ledger"),
+        ("ledger-checkpoint", "record a quorum checkpoint"),
+        ("ledger-prune", "prune below the checkpoint"),
+        ("ledger-audit", "audit from the checkpoint"),
+    ] {
+        run_ok(
+            Command::new(&node_bin)
+                .arg(cmd)
+                .arg("--db")
+                .arg(&mirror)
+                .arg("--validators")
+                .arg(&validators_path),
+            label,
+        )?;
+    }
+
+    // And the pruning has to be real: replaying from genesis must now be
+    // impossible rather than quietly succeeding on a shortened history.
+    assert!(
+        run_ok(
+            Command::new(&node_bin)
+                .arg("ledger-audit")
+                .arg("--full")
+                .arg("--db")
+                .arg(&mirror)
+                .arg("--validators")
+                .arg(&validators_path),
+            "genesis audit of a pruned mirror",
+        )
+        .is_err(),
+        "a pruned ledger must refuse to claim it audited from genesis"
+    );
 
     Ok(())
 }
@@ -936,4 +986,101 @@ fn exe(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// Concurrent settlements have to share entries, or the ledger is capped at
+/// one consensus round per CU movement no matter how much hardware is behind
+/// it. This is the load-bearing claim of the batching work, so it is measured
+/// against four real validators rather than argued about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_settlements_share_ledger_entries() -> Result<()> {
+    const SETTLEMENTS: usize = 16;
+
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+
+    let tmp = TestDir::new()?;
+    let http = Client::new();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let (validators_path, validator_homes, validator_dbs, set) =
+        create_validator_set(&tmp, &validator_bin, &validator_ports)?;
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    let net = LedgerNetwork::new(set)?;
+    let before = net.head_quorum().await?.sequence;
+    let work = WorkSpec::PrimeCount { start: 2, end: 200 };
+    let cost: i64 = split_work(&work, 1).iter().map(work_cost_mcu).sum();
+    let mut handles = Vec::new();
+    for index in 0..SETTLEMENTS {
+        let job_id = format!("job_batching_{index}");
+        let tx = LedgerTransaction {
+            transaction_id: format!("community_reserve_{job_id}"),
+            kind: TransactionKind::CommunityReserve,
+            postings: vec![
+                Posting {
+                    account_id: COMMUNITY_ISSUANCE_ACCOUNT.into(),
+                    delta_mcu: -cost,
+                },
+                Posting {
+                    account_id: escrow_account(&job_id),
+                    delta_mcu: cost,
+                },
+            ],
+            evidence: TransactionEvidence::CommunityReserve {
+                job_id,
+                work: work.clone(),
+                shards: 1,
+            },
+            created_at: now_unix(),
+        };
+        let net = net.clone();
+        handles.push(tokio::spawn(async move { net.transact(tx).await }));
+    }
+    let mut entries = std::collections::HashSet::new();
+    for handle in handles {
+        entries.insert(handle.await??.entry.entry_hash);
+    }
+    let after = net.head_quorum().await?.sequence;
+    let rounds = after - before;
+    println!("{SETTLEMENTS} concurrent settlements took {rounds} consensus rounds");
+    assert_eq!(
+        rounds as usize,
+        entries.len(),
+        "every settled entry must show up in the chain exactly once"
+    );
+    assert!(
+        rounds < SETTLEMENTS as u64,
+        "{SETTLEMENTS} concurrent settlements took {rounds} rounds; batching is not happening"
+    );
+
+    // And the batching must not have loosened any rule: every validator has to
+    // be able to replay what it just agreed to.
+    for db in &validator_dbs {
+        run_ok(
+            Command::new(&validator_bin)
+                .arg("audit")
+                .arg("--db")
+                .arg(db)
+                .arg("--validators")
+                .arg(&validators_path),
+            "audit validator ledger after batched settlements",
+        )?;
+    }
+    drop(validators);
+    Ok(())
 }

@@ -195,7 +195,28 @@ enum Command {
         batch: u64,
     },
     /// Offline audit of a previously mirrored ledger.
+    ///
+    /// Starts from the newest stored checkpoint when there is one, so the cost
+    /// tracks how much has happened since rather than the whole history.
     LedgerAudit {
+        #[arg(long)]
+        validators: String,
+        #[arg(long, default_value = ".hocmesh/ledger-mirror.db")]
+        db: String,
+        /// Ignore any checkpoint and replay every entry from genesis.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Ask the validators for a quorum-signed statement of the whole ledger
+    /// state and record it locally as an audit starting point.
+    LedgerCheckpoint {
+        #[arg(long)]
+        validators: String,
+        #[arg(long, default_value = ".hocmesh/ledger-mirror.db")]
+        db: String,
+    },
+    /// Drop certificates the newest stored checkpoint already vouches for.
+    LedgerPrune {
         #[arg(long)]
         validators: String,
         #[arg(long, default_value = ".hocmesh/ledger-mirror.db")]
@@ -751,14 +772,43 @@ stored at: {}",
                 }
             }
         }
-        Command::LedgerAudit { validators, db } => {
+        Command::LedgerAudit {
+            validators,
+            db,
+            full,
+        } => {
             let set = load_set(&validators)?;
             let store = LedgerStore::open(&db)?;
-            let h = store.audit(&set)?;
+            let from = if full {
+                None
+            } else {
+                store.latest_checkpoint()?
+            };
+            let h = store.audit_from(&set, from.as_ref())?;
+            let start = from.as_ref().map_or(0, |c| c.head.sequence);
             println!(
-                "LEDGER AUDIT OK: height={} head={}",
-                h.sequence, h.entry_hash
+                "LEDGER AUDIT OK: height={} head={} replayed_from={}",
+                h.sequence, h.entry_hash, start
             );
+        }
+        Command::LedgerCheckpoint { validators, db } => {
+            let net = load_network(&validators)?;
+            let store = LedgerStore::open(&db)?;
+            let cp = net.checkpoint_quorum().await?;
+            store.store_checkpoint(&cp, &net.set)?;
+            println!(
+                "CHECKPOINT STORED: height={} head={} state={} signatures={}",
+                cp.head.sequence,
+                cp.head.entry_hash,
+                cp.state_hash,
+                cp.signatures.len()
+            );
+        }
+        Command::LedgerPrune { validators, db } => {
+            let set = load_set(&validators)?;
+            let store = LedgerStore::open(&db)?;
+            let removed = store.prune_below_checkpoint(&set)?;
+            println!("PRUNED {removed} certificates already covered by a checkpoint");
         }
     }
     Ok(())

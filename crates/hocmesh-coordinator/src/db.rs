@@ -1,14 +1,28 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use hocmesh_core::compute::{split_work, work_cost_mcu};
 use hocmesh_protocol::{WorkSpec, now_unix};
 use rusqlite::{Connection, params};
+use std::marker::PhantomData;
+use std::sync::{Condvar, Mutex, MutexGuard};
 
+/// Opens a standalone connection with the schema in place.
+///
+/// For the one-shot paths - seeding, recovery - that run outside the server
+/// and have no pool to borrow from.
 pub fn open(path: &str) -> Result<Connection> {
+    let conn = connect(path)?;
+    init_schema(&conn)?;
+    Ok(conn)
+}
+
+fn connect(path: &str) -> Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("opening coordinator database {path}"))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    init_schema(&conn)?;
+    // Writers serialise no matter how many connections there are, so a reader
+    // that arrives mid-write should wait for it rather than fail outright.
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     Ok(conn)
 }
 
@@ -171,4 +185,122 @@ pub fn seed_system_job_with_id(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// A small pool of SQLite connections.
+///
+/// The coordinator used to share a single connection behind a mutex, so every
+/// request queued behind every other one however unrelated: a status poll
+/// waited on somebody else's settlement write. SQLite in WAL mode reads
+/// concurrently and serialises only writers, so the answer is more
+/// connections rather than a longer queue.
+pub struct Pool {
+    path: String,
+    state: Mutex<PoolState>,
+    returned: Condvar,
+    max: usize,
+}
+
+struct PoolState {
+    idle: Vec<Connection>,
+    /// Connections that exist, whether idle or lent out. Never above `max`.
+    live: usize,
+}
+
+impl Pool {
+    /// Opens the database, creating the schema, and sizes the pool.
+    ///
+    /// The cap is the machine's parallelism because a connection is only ever
+    /// held by a thread that is actively using it - never across an await -
+    /// so more connections than threads could not be in use at once.
+    pub fn open(path: &str) -> Result<Self> {
+        let conn = connect(path)?;
+        init_schema(&conn)?;
+        let max = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4)
+            .clamp(4, 32);
+        Ok(Self {
+            path: path.into(),
+            state: Mutex::new(PoolState {
+                idle: vec![conn],
+                live: 1,
+            }),
+            returned: Condvar::new(),
+            max,
+        })
+    }
+
+    /// Borrows a connection, opening one if the pool has room to grow.
+    ///
+    /// Blocks only when every connection is already lent out, which cannot
+    /// outlast the request holding one, because a borrowed connection can
+    /// never be held across an await point.
+    pub fn get(&self) -> Result<PooledConnection<'_>> {
+        let mut state = self.lock()?;
+        loop {
+            if let Some(conn) = state.idle.pop() {
+                return Ok(self.lend(conn));
+            }
+            if state.live < self.max {
+                state.live += 1;
+                drop(state);
+                // Opened outside the lock: a new file handle is slow enough
+                // that holding the pool shut for it would defeat the point.
+                return connect(&self.path).map(|c| self.lend(c)).inspect_err(|_| {
+                    if let Ok(mut s) = self.lock() {
+                        s.live -= 1;
+                    }
+                });
+            }
+            state = self
+                .returned
+                .wait(state)
+                .map_err(|_| anyhow!("coordinator database pool poisoned"))?;
+        }
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, PoolState>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow!("coordinator database pool poisoned"))
+    }
+    fn lend(&self, conn: Connection) -> PooledConnection<'_> {
+        PooledConnection {
+            pool: self,
+            conn: Some(conn),
+            not_send: PhantomData,
+        }
+    }
+}
+
+/// A borrowed connection, returned to the pool when it goes out of scope.
+///
+/// Deliberately not `Send`. That is what the old `MutexGuard` gave for free,
+/// and it is what keeps a connection from being held across an await point -
+/// which is in turn what bounds how many can be in use at once.
+pub struct PooledConnection<'a> {
+    pool: &'a Pool,
+    conn: Option<Connection>,
+    not_send: PhantomData<*const ()>,
+}
+impl Drop for PooledConnection<'_> {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else { return };
+        if let Ok(mut state) = self.pool.lock() {
+            state.idle.push(conn);
+            self.pool.returned.notify_one();
+        }
+    }
+}
+impl std::ops::Deref for PooledConnection<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("connection taken before drop")
+    }
+}
+impl std::ops::DerefMut for PooledConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.conn.as_mut().expect("connection taken before drop")
+    }
 }

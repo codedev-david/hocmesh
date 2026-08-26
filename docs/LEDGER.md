@@ -50,10 +50,17 @@ Each entry contains:
 ```text
 sequence
 previous_hash
-transaction
-transaction_hash
+transactions
+transactions_hash
 entry_hash
 ```
+
+An entry carries a *batch* of transactions, not one. A consensus round costs
+the same three network phases whether it settles one CU movement or five
+hundred, and entries chain by `previous_hash` so rounds are inherently
+sequential: batching is what stops the ledger being capped at one settlement
+per round. Sixteen concurrent settlements measured against four validators
+take two rounds.
 
 Conceptually:
 
@@ -70,18 +77,19 @@ Entry 2 hash B
 Entry 3 hash C
 ```
 
-Changing an old transaction changes its transaction hash, entry hash, and every later previous-hash relationship.
+Changing an old transaction changes its transaction hash, its entry's transactions hash and entry hash, and every later previous-hash relationship.
 
 ## Quorum certificate
 
-A coordinator proposes one exact transaction to all validators.
+A coordinator proposes one exact batch of transactions to all validators.
 
-Each validator:
+Each validator, for every transaction in the batch:
 
 1. verifies policy,
 2. verifies signatures/evidence,
-3. verifies account balances,
-4. checks duplicate claims,
+3. verifies account balances against a running overlay, so two transactions
+   that each pass alone cannot jointly overdraw an account,
+4. checks duplicate claims, both against history and within the batch,
 5. checks its local ledger head,
 6. persists a one-vote-per-height lock,
 7. signs the proposed entry hash.
@@ -204,6 +212,43 @@ hocmesh ledger-audit --validators validators.json --db .hocmesh/ledger-mirror.db
 ```
 
 This means full replicas are not restricted to validator operators.
+
+## Checkpoints and pruning
+
+An audit that always replays from genesis costs more every day the network
+runs. A checkpoint is a quorum-signed statement about the whole ledger state at
+one height:
+
+```bash
+hocmesh ledger-checkpoint --validators validators.json --db .hocmesh/ledger-mirror.db
+```
+
+Each validator answers `GET /v1/ledger/state` with its own head, a digest of
+the state it holds, and a signature over exactly the message a checkpoint is
+verified against. Enough validators agreeing on the same
+`(sequence, entry_hash, state_hash)` triple *is* the checkpoint.
+
+A checkpoint is only stored after the local store proves it can reproduce it:
+the store rewinds its own tables back to that height by undoing the entries
+above it, and the resulting digest must equal the one the quorum signed. A
+checkpoint the store disagrees with is refused rather than kept.
+
+Because rewinding needs only the entries *above* the checkpoint, everything
+below it can be discarded:
+
+```bash
+hocmesh ledger-prune --validators validators.json --db .hocmesh/ledger-mirror.db
+```
+
+`ledger-audit` then starts from the newest stored checkpoint by default, so its
+cost tracks how much has happened since rather than the whole history. Pass
+`--full` to force a genesis replay; on a pruned mirror that fails outright
+rather than quietly auditing a shortened history.
+
+Pruning keeps the checkpoint's own entry, so a pruned node still reports the
+height it is really at, and it keeps `account_activity`: earned and spent
+totals are part of the balance proofs validators have to agree on, and a node
+whose totals had been reset would disagree with every node that had not pruned.
 
 ## What makes history difficult to fake
 
