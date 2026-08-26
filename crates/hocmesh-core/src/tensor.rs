@@ -207,6 +207,90 @@ pub fn witnessed_committed(
 ) -> bool {
     commit(payload) == commitment && witnessed(a, b, payload, shape, nonce)
 }
+
+/// Why the ledger cannot simply run the witness above.
+///
+/// Freivalds checks a product you already hold. A validator that never
+/// receives `C` cannot run it, and a provider that never computed `C` can
+/// answer any challenge about it for free: `C r` and `A (B r)` are the same
+/// vector, and the second costs `O(n^2)`. The test detects a wrong answer; it
+/// does not prove anyone ever did the work.
+///
+/// So possession has to be forced before the challenge is drawn, exactly as
+/// the prime audit forces it. The shard is committed one row block at a time.
+/// The provider publishes `BLOCKS` digests before it knows which the audit
+/// will open; the challenge then names `verify::AUDIT_BUCKETS` of them and the
+/// provider must reveal those rows. A validator re-executes only those rows.
+///
+/// A provider that skipped `m` blocks is caught unless every opened block
+/// falls in the part it did compute, so it pays the same hypergeometric
+/// escape rate the prime audit charges, and the two challenges the beacon
+/// draws still compose.
+pub const BLOCKS: u32 = crate::verify::BUCKETS;
+
+/// The half-open row range block `index` covers.
+pub fn block_rows(shape: Shape, index: u32) -> (usize, usize) {
+    let (start, end) = crate::verify::bucket_bounds(0, shape.rows as u64, index, BLOCKS);
+    (start as usize, end as usize)
+}
+
+/// The rows of `product` that block `index` covers.
+pub fn block_payload(product: &[f32], shape: Shape, index: u32) -> &[f32] {
+    let (start, end) = block_rows(shape, index);
+    &product[start * shape.cols..end * shape.cols]
+}
+
+/// One digest per row block, published before the challenge exists.
+pub fn block_commitments(product: &[f32], shape: Shape) -> Vec<String> {
+    (0..BLOCKS)
+        .map(|index| commit(block_payload(product, shape, index)))
+        .collect()
+}
+
+/// The blocks a challenge opens for reveal.
+pub fn opened_blocks(nonce: crate::verify::AuditNonce) -> Vec<u32> {
+    crate::verify::audit_indices(nonce, BLOCKS, crate::verify::AUDIT_BUCKETS)
+}
+
+/// Re-execute one opened block and check the revealed rows against it.
+///
+/// The digest binds the reveal to what was committed before the challenge; the
+/// re-execution decides whether what was committed is the answer. Both have to
+/// hold, and neither alone is worth anything.
+pub fn block_reexecuted(
+    a: &[f32],
+    b: &[f32],
+    shape: Shape,
+    index: u32,
+    revealed: &[f32],
+    commitment: &str,
+) -> bool {
+    let (start, end) = block_rows(shape, index);
+    if revealed.len() != (end - start) * shape.cols || commit(revealed) != commitment {
+        return false;
+    }
+    let mut worst = 0.0f32;
+    let mut scale = 0.0f32;
+    for row in start..end {
+        for col in 0..shape.cols {
+            let mut acc = 0.0f64;
+            for k in 0..shape.inner {
+                acc += f64::from(a[row * shape.inner + k]) * f64::from(b[k * shape.cols + col]);
+            }
+            let honest = acc as f32;
+            let claim = revealed[(row - start) * shape.cols + col];
+            worst = worst.max((honest - claim).abs());
+            scale = scale.max(honest.abs());
+        }
+    }
+    // A block of exact zeros has no scale to be relative to, so it has to
+    // match exactly; anything else is compared against its own magnitude.
+    if scale == 0.0 {
+        return worst == 0.0;
+    }
+    worst / scale <= TOLERANCE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +455,125 @@ mod tests {
         assert!(
             payload / entry > 500,
             "a commitment must be much smaller than {payload} bytes"
+        );
+    }
+
+    /// The reveal is checked by re-executing it, so a kernel that sums in a
+    /// different order than the validator's must still be accepted.
+    #[test]
+    fn an_honest_reveal_survives_re_execution() {
+        let s = shape();
+        let a = matrix(0xa11, s.rows * s.inner);
+        let b = matrix(0xb22, s.inner * s.cols);
+        let product = multiply_blocked(&a, &b, s);
+        let commitments = block_commitments(&product, s);
+        for index in opened_blocks(crate::verify::AuditNonce::draw(7)) {
+            let revealed = block_payload(&product, s, index);
+            assert!(
+                block_reexecuted(&a, &b, s, index, revealed, &commitments[index as usize]),
+                "block {index} was computed honestly and must be accepted"
+            );
+        }
+    }
+
+    /// The whole point of committing block by block: a provider that never did
+    /// the work has to commit to something, and whatever it commits to cannot
+    /// survive being re-executed.
+    #[test]
+    fn a_block_that_was_never_computed_cannot_be_revealed() {
+        let s = shape();
+        let a = matrix(0xa11, s.rows * s.inner);
+        let b = matrix(0xb22, s.inner * s.cols);
+        let mut product = multiply(&a, &b, s);
+        let (start, end) = block_rows(s, 5);
+        let invented = matrix(0xdead, (end - start) * s.cols);
+        product[start * s.cols..end * s.cols].copy_from_slice(&invented);
+        let commitments = block_commitments(&product, s);
+        assert!(
+            !block_reexecuted(&a, &b, s, 5, block_payload(&product, s, 5), &commitments[5]),
+            "an invented block passed re-execution"
+        );
+    }
+
+    /// Revealing the right answer for the wrong commitment is how a provider
+    /// would compute the opened blocks only after seeing the challenge.
+    #[test]
+    fn a_reveal_that_does_not_match_its_commitment_is_refused() {
+        let s = shape();
+        let a = matrix(0xa11, s.rows * s.inner);
+        let b = matrix(0xb22, s.inner * s.cols);
+        let product = multiply(&a, &b, s);
+        let honest = block_payload(&product, s, 9);
+        let stale = commit(block_payload(&product, s, 10));
+        assert!(!block_reexecuted(&a, &b, s, 9, honest, &stale));
+    }
+
+    /// Blocks that left a gap would be blocks nobody can be audited on.
+    #[test]
+    fn the_blocks_cover_every_element_exactly_once() {
+        let s = shape();
+        let product = matrix(0xc33, s.rows * s.cols);
+        let mut seen = Vec::new();
+        for index in 0..BLOCKS {
+            seen.extend_from_slice(block_payload(&product, s, index));
+        }
+        assert_eq!(seen, product, "the blocks must reassemble the shard");
+        assert_eq!(block_commitments(&product, s).len(), BLOCKS as usize);
+    }
+
+    /// Skipping work has to cost the same escape rate the prime audit charges,
+    /// or float shards would be the cheap place to cheat.
+    #[test]
+    fn skipping_blocks_is_caught_at_the_sampled_audit_rate() {
+        let s = shape();
+        let a = matrix(0xa11, s.rows * s.inner);
+        let b = matrix(0xb22, s.inner * s.cols);
+        let honest = multiply(&a, &b, s);
+        let skipped = 16u32;
+        let mut lazy = honest.clone();
+        let junk = matrix(0xbad, s.rows * s.cols);
+        // The lazy provider computed the first `BLOCKS - skipped` blocks and
+        // filled the rest with something it never multiplied.
+        for index in (BLOCKS - skipped)..BLOCKS {
+            let (start, end) = block_rows(s, index);
+            let span = start * s.cols..end * s.cols;
+            lazy[span.clone()].copy_from_slice(&junk[span]);
+        }
+        let commitments = block_commitments(&lazy, s);
+        let trials = 4_000u32;
+        let mut escapes = 0u32;
+        for seed in 0..trials {
+            let opened = opened_blocks(crate::verify::AuditNonce::draw(u64::from(seed)));
+            let caught = opened.iter().any(|index| {
+                let revealed = block_payload(&lazy, s, *index);
+                !block_reexecuted(&a, &b, s, *index, revealed, &commitments[*index as usize])
+            });
+            escapes += u32::from(!caught);
+        }
+        let measured = f64::from(escapes) / f64::from(trials);
+        // C(48,3)/C(64,3): every opened block lands in the honest part.
+        let predicted = (48.0 / 64.0) * (47.0 / 63.0) * (46.0 / 62.0);
+        assert!(
+            (measured - predicted).abs() < 0.03,
+            "measured {measured:.4} against predicted {predicted:.4}"
+        );
+    }
+
+    /// The reveal has to be small, or the audit costs what shipping the whole
+    /// product costs and the commitment bought nothing.
+    #[test]
+    fn the_reveal_is_a_small_slice_of_the_payload() {
+        let s = shape();
+        let product = matrix(0xc33, s.rows * s.cols);
+        let opened = opened_blocks(crate::verify::AuditNonce::draw(11));
+        let revealed: usize = opened
+            .iter()
+            .map(|index| block_payload(&product, s, *index).len())
+            .sum();
+        assert!(
+            revealed * 10 < product.len(),
+            "reveal {revealed} of {}",
+            product.len()
         );
     }
 }

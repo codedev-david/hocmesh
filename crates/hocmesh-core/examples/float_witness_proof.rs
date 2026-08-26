@@ -11,6 +11,7 @@
 //! this example fails rather than overstates.
 
 use hocmesh_core::tensor::{self, ROUNDS, Shape, TOLERANCE};
+use hocmesh_core::verify::AuditNonce;
 use std::time::Instant;
 
 /// A projection the size of one attention head's output in a small model.
@@ -31,6 +32,66 @@ fn main() {
     detection(&a, &b, &honest);
     cost(&a, &b, &honest);
     ledger_size(&honest);
+    sampled_reveal(&a, &b, &honest);
+}
+
+/// The witness above is the requester's tool: it checks a product you hold.
+/// A validator holds a ledger entry, so it needs possession forced first.
+fn sampled_reveal(a: &[f32], b: &[f32], honest: &[f32]) {
+    rule("5. What a validator can check without the payload");
+    println!(
+        "  the shard is committed in {} row blocks; the challenge opens 3",
+        tensor::BLOCKS
+    );
+    println!("  and the provider must reveal them.\n");
+    println!(
+        "  {:>9}  {:>10}  {:>11}  {:>11}",
+        "skipped", "caught", "escape", "predicted"
+    );
+    let junk = matrix(0xBADF00D, SHAPE.rows * SHAPE.cols);
+    for skipped in [4u32, 16, 32, 64] {
+        let mut lazy = honest.to_vec();
+        for index in (tensor::BLOCKS - skipped)..tensor::BLOCKS {
+            let (start, end) = tensor::block_rows(SHAPE, index);
+            let span = start * SHAPE.cols..end * SHAPE.cols;
+            lazy[span.clone()].copy_from_slice(&junk[span]);
+        }
+        let commitments = tensor::block_commitments(&lazy, SHAPE);
+        let mut caught = 0u64;
+        for seed in 0..TRIALS {
+            let opened = tensor::opened_blocks(AuditNonce::draw(seed));
+            if opened.iter().any(|index| {
+                let revealed = tensor::block_payload(&lazy, SHAPE, *index);
+                let digest = &commitments[*index as usize];
+                !tensor::block_reexecuted(a, b, SHAPE, *index, revealed, digest)
+            }) {
+                caught += 1;
+            }
+        }
+        let kept = f64::from(tensor::BLOCKS - skipped);
+        let total = f64::from(tensor::BLOCKS);
+        let predicted =
+            (kept / total) * ((kept - 1.0) / (total - 1.0)) * ((kept - 2.0) / (total - 2.0));
+        let escape = 1.0 - caught as f64 / TRIALS as f64;
+        println!(
+            "  {:>6}/{:<2}  {caught:>4}/{TRIALS:<5}  {:>10.1}%  {:>10.1}%",
+            skipped,
+            tensor::BLOCKS,
+            escape * 100.0,
+            predicted.max(0.0) * 100.0
+        );
+    }
+    let opened = tensor::opened_blocks(AuditNonce::draw(1));
+    let revealed: usize = opened
+        .iter()
+        .map(|index| size_of_val(tensor::block_payload(honest, SHAPE, *index)))
+        .sum();
+    let payload = size_of_val(honest);
+    println!(
+        "\n  reveal {revealed} of {payload} bytes ({:.1}% of the shard), and the validator",
+        revealed as f64 / payload as f64 * 100.0
+    );
+    println!("  re-executes exactly those rows: the same fraction of the work.");
 }
 
 /// The tolerance has to separate two populations. Show both.

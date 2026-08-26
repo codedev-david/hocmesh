@@ -102,16 +102,55 @@ A witness needs the whole product, but a ledger entry cannot carry a 262 KB
 matrix. The entry therefore carries a 64-byte SHA-256 commitment over the
 IEEE-754 bit pattern of every element (domain tag `hocmesh-tensor-commit-v1`),
 and the payload itself rides along with the answer the requester wanted anyway.
-A validator hashes the payload and compares it against the committed digest
+The holder of the payload hashes it and compares it against the committed digest
 before spending a single multiply, so a provider that has already seen the
 challenge cannot swap in a different matrix that satisfies it. That is 4096x
 less ledger per shard, and it keeps the commitment-before-nonce rule below
 intact for float work.
 
-**Not yet wired.** `hocmesh-core::tensor` proves the witness works; there is no
-`WorkSpec` for inference yet, so no inference shard is priced, escrowed or paid
-through the ledger. That is the next piece of work, and it is now an
-engineering job rather than an open question.
+### Why a validator cannot just run the witness
+
+Freivalds checks a product you already hold, and that is a narrower claim than
+it first looks. A validator holds a ledger entry, not a 262 KB matrix. Worse,
+a provider that never computed `C` can answer any Freivalds challenge about it
+for free, because `C r` and `A (B r)` are the same vector and the second costs
+`O(n^2)`. The test detects a wrong answer. It does not prove anyone did the
+work. So the witness is the requester's tool - the requester holds the payload
+and wants it checked cheaply - and the ledger needs something else.
+
+That something else is the prime audit again, with row blocks in place of
+buckets. The shard is committed one row block at a time, so the provider
+publishes 64 digests before it knows anything about the challenge. The
+authoritative nonce then names three blocks and the provider must reveal those
+rows. A validator re-executes only those rows and compares them to the reveal
+within the same tolerance, and the digest binds the reveal to what was
+committed before the challenge existed.
+
+A provider that skipped `m` blocks cannot answer for them, so it escapes only
+when all three opened blocks land in the part it did compute - the same
+hypergeometric rate the prime audit charges, which means float work and integer
+work cost the same to cheat and compose with the beacon the same way:
+
+
+| blocks skipped | escape measured | predicted |
+|----------------|-----------------|-----------|
+| 4/64           | 85.0%           | 82.1%     |
+| 16/64          | 43.5%           | 41.5%     |
+| 32/64          | 12.5%           | 11.9%     |
+| 64/64          | 0.0%            | 0.0%      |
+
+The reveal is 12,288 of 262,144 bytes - 4.7% of the shard - and the validator
+re-executes exactly those rows, so it pays 4.7% of the job. Both numbers fall
+out of `AUDIT_BUCKETS / BUCKETS`, unchanged from the integer path.
+
+**Not yet wired.** `hocmesh-core::tensor` proves both halves work: the witness
+for whoever holds the payload, the block audit for whoever does not. Neither is
+reachable from a job yet. There is no `WorkSpec` for inference, so no inference
+shard is priced, escrowed or paid through the ledger, and the protocol has no
+reveal round: the block audit needs the provider to answer a challenge after
+settlement is proposed, which is a message that does not exist today. Both are
+engineering jobs rather than open questions, and that is the whole change in
+their status.
 
 ## The nonce must come after the commitment
 
