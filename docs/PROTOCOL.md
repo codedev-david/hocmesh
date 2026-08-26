@@ -120,7 +120,7 @@ GET  /v1/ledger/entries?from=N&limit=M
 
 ## Versioning
 
-`PROTOCOL_VERSION` is currently `4`.
+`PROTOCOL_VERSION` is currently `5`.
 
 Breaking wire changes should bump the protocol version and preserve explicit migration/compatibility behavior rather than silently changing serialized structures.
 

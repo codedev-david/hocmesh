@@ -37,6 +37,12 @@ pub struct ProviderRewardEvidence {
     pub work: WorkSpec,
     pub result: WorkResult,
     pub system_funded: bool,
+    /// The challenge the coordinator drew after this result was signed.
+    ///
+    /// Recorded so a validator replays the identical audit instead of taking
+    /// the coordinator's word that one happened.
+    #[serde(default)]
+    pub audit_nonce: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

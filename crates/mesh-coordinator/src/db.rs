@@ -121,6 +121,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_ai_assignments_node_status ON ai_assignments(assigned_node_id,status);
         CREATE INDEX IF NOT EXISTS idx_ai_assignments_lease ON ai_assignments(lease_until);
+
+        CREATE TABLE IF NOT EXISTS reputation (
+            node_id TEXT PRIMARY KEY REFERENCES nodes(node_id) ON DELETE CASCADE,
+            accepted INTEGER NOT NULL DEFAULT 0,
+            rejected INTEGER NOT NULL DEFAULT 0,
+            streak INTEGER NOT NULL DEFAULT 0
+        );
         "#,
     )?;
     Ok(())

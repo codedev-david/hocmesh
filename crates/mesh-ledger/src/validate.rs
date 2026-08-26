@@ -2,7 +2,8 @@ use crate::types::*;
 use anyhow::{Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use mesh_core::compute::{split_work, verify_work, work_cost_mcu};
+use mesh_core::compute::{split_work, work_cost_mcu};
+use mesh_core::verify::{self, AuditNonce};
 use mesh_protocol::{hash_json, result_body_hash, submit_body_hash, verify_auth_signature};
 
 pub fn validate_validator_set(set: &ValidatorSet) -> Result<()> {
@@ -200,7 +201,7 @@ fn validate_reward(tx: &LedgerTransaction, e: &ProviderRewardEvidence) -> Result
     )?;
     verify_auth_signature(&e.provider_public_key_b64, &e.provider_auth, "result", &bh)
         .map_err(anyhow::Error::msg)?;
-    if !verify_work(&e.work, &e.result) {
+    if !witnessed(&e.work, &e.result, e.audit_nonce) {
         bail!("provider result does not verify")
     };
     let reward = work_cost_mcu(&e.work);
@@ -409,7 +410,7 @@ pub fn verify_historical_evidence(tx: &LedgerTransaction) -> Result<()> {
             )?;
             verify_auth_signature(&e.provider_public_key_b64, &e.provider_auth, "result", &bh)
                 .map_err(anyhow::Error::msg)?;
-            if !verify_work(&e.work, &e.result) {
+            if !witnessed(&e.work, &e.result, e.audit_nonce) {
                 bail!("historical work result invalid")
             }
         }
@@ -417,6 +418,29 @@ pub fn verify_historical_evidence(tx: &LedgerTransaction) -> Result<()> {
     Ok(())
 }
 
+/// Check a historical result the cheap way.
+///
+/// Every validator runs this on every entry, which is affordable precisely
+/// because it is a witness check and not a recomputation: a validator spends a
+/// few percent of what the worker spent instead of all of it. That single
+/// change is what stops `V` validators from costing the network `V` times the
+/// work they are validating.
+///
+/// The nonce is the one the coordinator recorded, so this replays the audit
+/// that actually happened rather than inventing a fresh one. A workload with
+/// no witness falls back to recomputation: sound, but expensive enough to be a
+/// standing argument for designing workloads that can be checked cheaply.
+fn witnessed(
+    work: &mesh_protocol::WorkSpec,
+    result: &mesh_protocol::WorkResult,
+    nonce: u64,
+) -> bool {
+    let verdict = verify::witness_check(work, result, AuditNonce::replay(nonce));
+    if verdict == verify::Verdict::Inconclusive {
+        return verify::adjudicate(work, result).is_accepted();
+    }
+    verdict.is_accepted()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +699,7 @@ mod tests {
                 work: work.clone(),
                 result,
                 system_funded,
+                audit_nonce: 0,
             }),
             created_at: 1,
         }

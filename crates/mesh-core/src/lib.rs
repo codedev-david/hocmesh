@@ -2,4 +2,7 @@ pub mod compute;
 pub mod hardware;
 pub mod identity;
 pub mod limits;
+pub mod matrix;
 pub mod proximity;
+pub mod reputation;
+pub mod verify;

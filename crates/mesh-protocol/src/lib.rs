@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const AUTH_MAX_CLOCK_SKEW_SECS: i64 = 300;
 pub const DEFAULT_LEASE_SECONDS: i64 = 900;
 
@@ -124,7 +124,22 @@ pub struct PollRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkSpec {
-    PrimeCount { start: u64, end: u64 },
+    PrimeCount {
+        start: u64,
+        end: u64,
+    },
+    /// Rows `[row_start, row_end)` of `C = A x B` over the field of integers
+    /// modulo 2^31-1. `A` and `B` are not transmitted: both are generated
+    /// element-wise from their seed, so the spec stays a handful of bytes no
+    /// matter how large the multiplication is. That is what makes this workload
+    /// worth distributing -- the compute-to-bytes ratio scales with `dim`.
+    MatrixMultiply {
+        seed_a: u64,
+        seed_b: u64,
+        dim: u32,
+        row_start: u32,
+        row_end: u32,
+    },
 }
 impl WorkSpec {
     pub fn validate(&self) -> Result<(), String> {
@@ -135,6 +150,15 @@ impl WorkSpec {
             WorkSpec::PrimeCount { start, end } if end.saturating_sub(*start) > 2_000_000_000 => {
                 Err("prime_count range is too large for one submitted job".into())
             }
+            WorkSpec::MatrixMultiply { dim, .. } if *dim == 0 || *dim > 512 => {
+                Err("matrix_multiply dim must be between 1 and 512".into())
+            }
+            WorkSpec::MatrixMultiply {
+                row_start, row_end, ..
+            } if row_start >= row_end => Err("matrix_multiply requires row_start < row_end".into()),
+            WorkSpec::MatrixMultiply { dim, row_end, .. } if row_end > dim => {
+                Err("matrix_multiply row_end must not exceed dim".into())
+            }
             _ => Ok(()),
         }
     }
@@ -143,7 +167,15 @@ impl WorkSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkResult {
-    PrimeCount { count: u64, duration_ms: u64 },
+    PrimeCount {
+        count: u64,
+        bucket_counts: Vec<u64>,
+        duration_ms: u64,
+    },
+    MatrixMultiply {
+        rows: Vec<u32>,
+        duration_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

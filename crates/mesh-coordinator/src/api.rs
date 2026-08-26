@@ -12,8 +12,10 @@ use mesh_ai::{
     fail_inference_body_hash, plan_body_hash, plan_parallelism, rank_candidates,
     register_model_body_hash, report_inference_body_hash, submit_inference_body_hash,
 };
-use mesh_core::compute::{split_work, verify_work, work_cost_mcu};
+use mesh_core::compute::{split_work, work_cost_mcu};
 use mesh_core::proximity;
+use mesh_core::reputation::Reputation;
+use mesh_core::verify::{self, AuditNonce, Verdict};
 use mesh_gpu::{BackendKind, DeviceCapability};
 use mesh_ledger::{
     network::LedgerNetwork,
@@ -722,13 +724,18 @@ async fn report_result(
         };
         (db_work, job_id, reward_mcu, sf, provider_pk)
     };
-    if !verify_work(&work, &req.result) {
+    let nonce = AuditNonce::draw(draw_randomness());
+    let reputation = load_reputation(&state, &req.auth.node_id)?;
+    let settlement = verify::settle(&work, &req.result, &reputation, nonce);
+    if settlement.verdict.is_rejected() || settlement.verdict == Verdict::Inconclusive {
+        record_reputation(&state, &req.auth.node_id, false)?;
         let conn = state.db.lock().map_err(ApiError::internal)?;
         conn.execute("UPDATE assignments SET status='pending',leased_to=NULL,lease_until=NULL WHERE assignment_id=?1",params![req.assignment_id]).map_err(ApiError::internal)?;
         return Err(ApiError::conflict(
             "work verification failed; assignment returned to queue",
         ));
     }
+    record_reputation(&state, &req.auth.node_id, true)?;
 
     let mut ledger_hash = None;
     if let Some(ledger) = &state.ledger {
@@ -755,6 +762,7 @@ async fn report_result(
                 work: work.clone(),
                 result: req.result.clone(),
                 system_funded,
+                audit_nonce: settlement.nonce,
             }),
             created_at: now_unix(),
         };
@@ -1026,6 +1034,9 @@ async fn job_status(
                 has = true;
                 prime_total = prime_total.saturating_add(count)
             }
+            // Matrix shards have no scalar total to roll up; the answer is the
+            // rows themselves, which the caller fetches per shard.
+            WorkResult::MatrixMultiply { .. } => {}
         }
     }
     Ok(Json(JobStatusResponse {
@@ -1328,6 +1339,74 @@ fn apply_ledger_delta(
         return Err(ApiError::not_found("balance record not found"));
     }
     tx.execute("INSERT INTO ledger(node_id,delta_mcu,category,job_id,assignment_id,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![node_id,delta_mcu,category,job_id,assignment_id,now_unix()]).map_err(ApiError::internal)?;
+
+    Ok(())
+}
+
+/// Entropy for an audit challenge.
+///
+/// Drawn only after a worker's signed result is already in hand, so a worker
+/// cannot know which of its submissions will be checked, nor which part of one.
+/// A deployment facing a coordinator that may collude with a worker wants a
+/// verifiable random beacon here instead; see `verify`'s module docs.
+fn draw_randomness() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+}
+
+fn load_reputation(state: &AppState, node_id: &str) -> Result<Reputation, ApiError> {
+    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let row = conn
+        .query_row(
+            "SELECT accepted,rejected,streak FROM reputation WHERE node_id=?1",
+            params![node_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    Ok(
+        row.map_or_else(Reputation::new, |(accepted, rejected, streak)| Reputation {
+            accepted: accepted.max(0) as u64,
+            rejected: rejected.max(0) as u64,
+            streak: streak.clamp(0, i64::from(u32::MAX)) as u32,
+        }),
+    )
+}
+
+/// Fold one settled result into a node's standing.
+///
+/// A rejection zeroes the streak, so trust is re-earned from nothing and the
+/// next results from that node are audited at the full rate.
+fn record_reputation(state: &AppState, node_id: &str, accepted: bool) -> Result<(), ApiError> {
+    let mut current = load_reputation(state, node_id)?;
+    if accepted {
+        current.record_accepted();
+    } else {
+        current.record_rejected();
+    }
+    let conn = state.db.lock().map_err(ApiError::internal)?;
+    conn.execute(
+        "INSERT INTO reputation(node_id,accepted,rejected,streak) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(node_id) DO UPDATE SET accepted=?2,rejected=?3,streak=?4",
+        params![
+            node_id,
+            current.accepted as i64,
+            current.rejected as i64,
+            i64::from(current.streak)
+        ],
+    )
+    .map_err(ApiError::internal)?;
     Ok(())
 }
 fn cache_balance(state: &AppState, node_id: &str, balance: i64) -> Result<(), ApiError> {
