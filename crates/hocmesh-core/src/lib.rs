@@ -5,4 +5,5 @@ pub mod limits;
 pub mod matrix;
 pub mod proximity;
 pub mod reputation;
+pub mod tensor;
 pub mod verify;

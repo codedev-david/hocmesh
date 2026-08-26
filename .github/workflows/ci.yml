@@ -24,6 +24,10 @@ jobs:
         run: cargo test --workspace --all-features --locked
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Proofs
+        run: |
+          cargo run --release --locked -p hocmesh-core --example verification_proof
+          cargo run --release --locked -p hocmesh-core --example float_witness_proof
 
   supply-chain:
     runs-on: ubuntu-latest

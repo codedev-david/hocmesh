@@ -52,11 +52,59 @@ three audited buckets fall outside the `m` it faked, with probability
 `C(64 - m, 3) / C(64, 3)`. Skipping a single bucket - the smallest cheat the
 scheme can express - is caught 4.7% of the time; skipping half is caught 86%.
 
+### Neural network inference - float Freivalds
+
+Everything above assumes exact arithmetic: two honest nodes produce identical
+answers, so any difference is a cheat. Inference does not work that way. Float
+addition is not associative, every GEMM kernel sums in its own order, and the
+same weights on different hardware give slightly different logits. Bit-equality
+would reject every honest node.
+
+This matters more than the other two tiers put together: prime counting is a
+demo, and inference is the workload people actually want to buy. If float work
+cannot be witnessed, none of the economics above reaches it.
+
+It can. Transformer inference is a stack of matrix products, so the same
+Freivalds test applies - the only change is the comparison. Instead of asking
+whether the residual is zero, ask whether it is small enough to be rounding:
+
+    max |C r - A (B r)| / max |C r|  <=  TOLERANCE
+
+That threshold is measured, not chosen. It has to sit in the gap between two
+populations, and it does, by a wide margin:
+
+    two honest kernels, different summation order    1.733e-7
+    tolerance                                        1.000e-3
+    stopped at 511 of 512 accumulation steps         6.609e-2
+
+The tolerance sits about 5,800x above honest hardware drift and 66x below the
+smallest cheat the workload can express - skipping one of 512 accumulation
+steps, a 0.2% saving. Over 200 independent challenges that cheat was caught 200
+times, and honest work was rejected zero times.
+
+One round of Freivalds over the reals is weaker than one round over a large
+prime field: a plus-or-minus-one challenge catches a wrong product with
+probability at least 1/2, not 1 - 5e-10. So the witness runs `ROUNDS = 8`
+independent challenges and requires all of them, which puts the escape
+probability below 1 in 250 even for an adversary who knows the algorithm.
+
+The eight challenges are stacked into one block so each matrix is read once
+rather than eight times. On a 128x512x512 projection that lands at 8.2x cheaper
+than the product measured, against 10.7x predicted from operation counts:
+
+    cargo run --release -p hocmesh-core --example float_witness_proof
+
+**Not yet wired.** `hocmesh-core::tensor` proves the witness works; there is no
+`WorkSpec` for inference yet, so no inference shard is priced, escrowed or paid
+through the ledger. That is the next piece of work, and it is now an
+engineering job rather than an open question.
+
 ## The nonce must come after the commitment
 
-Both witnesses need a challenge the worker could not predict: the vector `r` for
-Freivalds, the bucket choice for prime counts. If the challenge were derived
-from the result - the obvious, tempting design - a lazy worker could grind it.
+All three witnesses need a challenge the worker could not predict: the vector
+`r` for Freivalds, the bucket choice for prime counts. If the challenge were
+derived from the result - the obvious, tempting design - a lazy worker could
+grind it.
 
 Compute 48 of 64 buckets honestly, guess 16, then vary the guesses until the
 derived challenge happens to select three buckets you really did compute. At
