@@ -95,10 +95,7 @@ mod tests {
         for _ in 0..500 {
             node.record_accepted();
             let rate = node.audit_rate();
-            assert!(
-                rate <= previous,
-                "audit rate must not rise on clean work"
-            );
+            assert!(rate <= previous, "audit rate must not rise on clean work");
             assert!(
                 rate >= FLOOR_AUDIT_RATE,
                 "no streak may buy a node out of auditing"
