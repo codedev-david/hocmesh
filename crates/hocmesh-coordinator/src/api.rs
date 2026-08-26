@@ -38,13 +38,13 @@ use hocmesh_protocol::{
     result_body_hash, submit_body_hash, verify_auth,
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 #[cfg(test)]
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Arc<Mutex<Connection>>,
+    pub db: Arc<crate::db::Pool>,
     pub ledger: Option<LedgerNetwork>,
 }
 
@@ -97,7 +97,7 @@ async fn register_model(
         .digest()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let json = serde_json::to_string(&req.manifest).map_err(ApiError::internal)?;
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     authenticate_known_node(&conn, &req.auth, "register_model", &body_hash)?;
     conn.execute(
         "INSERT INTO model_manifests(manifest_digest,model_id,revision,manifest_json,publisher_node_id,created_at)
@@ -114,7 +114,7 @@ async fn register_model(
 }
 
 async fn list_models(State(state): State<AppState>) -> Result<Json<Vec<ModelManifest>>, ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     let mut statement = conn
         .prepare("SELECT manifest_json FROM model_manifests ORDER BY model_id,revision")
         .map_err(ApiError::internal)?;
@@ -134,7 +134,7 @@ async fn get_model(
     State(state): State<AppState>,
     Path((model, revision)): Path<(String, String)>,
 ) -> Result<Json<ModelManifest>, ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     let json: Option<String> = conn
         .query_row(
             "SELECT manifest_json FROM model_manifests WHERE model_id=?1 AND revision=?2",
@@ -155,7 +155,7 @@ async fn plan_ai(
 ) -> Result<Json<PlanResponse>, ApiError> {
     let body_hash = plan_body_hash(&req).map_err(ApiError::internal)?;
     let (manifest, nodes) = {
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         authenticate_known_node(&conn, &req.auth, "plan_ai", &body_hash)?;
         let json: Option<String> = conn
             .query_row(
@@ -264,7 +264,7 @@ async fn submit_inference(
     // choose after the fact is what stops an escrow being re-pointed later.
     let job_id = hocmesh_protocol::inference_job_id_from_auth(&req.auth);
     let (manifest, digest, plan, seed_peers, requester_pk, total_cost_mcu) = {
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         authenticate_known_node(&conn, &req.auth, "submit_inference", &body_hash)?;
         let (manifest, nodes, seed_peers) =
             ai_context(&conn, &req.auth.node_id, &req.model_id, &req.revision)?;
@@ -345,7 +345,7 @@ async fn submit_inference(
     });
     let ready = ledger_tx.is_none();
     {
-        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let mut conn = state.db.get().map_err(ApiError::internal)?;
         let transaction = conn.transaction().map_err(ApiError::internal)?;
         transaction.execute(
             "INSERT INTO ai_jobs(job_id,requester_node_id,request_json,plan_json,manifest_digest,status,created_at)
@@ -486,7 +486,7 @@ fn finalize_inference_reservation(
     claim: &str,
     entry_hash: &str,
 ) -> Result<(), ApiError> {
-    let mut conn = state.db.lock().map_err(ApiError::internal)?;
+    let mut conn = state.db.get().map_err(ApiError::internal)?;
     let tx = conn.transaction().map_err(ApiError::internal)?;
     crate::db::certify_ledger_intent(&tx, claim, entry_hash).map_err(ApiError::internal)?;
     tx.execute(
@@ -507,7 +507,7 @@ async fn poll_inference(
     State(state): State<AppState>,
     Json(req): Json<PollInferenceRequest>,
 ) -> Result<Json<PollInferenceResponse>, ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     authenticate_known_node(&conn, &req.auth, "poll_inference", &empty_body_hash())?;
     let now = now_unix();
     conn.execute("UPDATE ai_assignments SET status='pending',lease_until=NULL WHERE status='leased' AND lease_until<?1", params![now]).map_err(ApiError::internal)?;
@@ -544,7 +544,7 @@ async fn report_inference(
     }
     let body_hash = report_inference_body_hash(&req).map_err(ApiError::internal)?;
     let (job_id, provider_pk) = {
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         authenticate_known_node(&conn, &req.auth, "report_inference", &body_hash)?;
         let row: Option<(String, String, String)> = conn.query_row(
             "SELECT job_id,assignment_json,status FROM ai_assignments WHERE assignment_id=?1 AND assigned_node_id=?2",
@@ -650,7 +650,7 @@ async fn report_inference(
         })?;
     }
     let job_completed = {
-        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let mut conn = state.db.get().map_err(ApiError::internal)?;
         let transaction = conn.transaction().map_err(ApiError::internal)?;
         transaction.execute(
         "UPDATE ai_assignments SET status=?4,outputs_json=?2,lease_until=NULL,completed_at=?3 WHERE assignment_id=?1",
@@ -705,7 +705,7 @@ async fn refund_inference(
 ) -> Result<Json<RefundInferenceResponse>, ApiError> {
     let body_hash = refund_inference_body_hash(&req).map_err(ApiError::internal)?;
     let (requester_pk, reserved_at) = {
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         authenticate_known_node(&conn, &req.auth, "refund_inference", &body_hash)?;
         let row: Option<(String, i64)> = conn
             .query_row(
@@ -801,7 +801,7 @@ async fn refund_inference(
         })?;
     }
     {
-        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let mut conn = state.db.get().map_err(ApiError::internal)?;
         let transaction = conn.transaction().map_err(ApiError::internal)?;
         transaction
             .execute(
@@ -837,7 +837,7 @@ async fn fail_inference(
         return Err(ApiError::bad_request("invalid failure reason"));
     }
     let body_hash = fail_inference_body_hash(&req).map_err(ApiError::internal)?;
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     authenticate_known_node(&conn, &req.auth, "fail_inference", &body_hash)?;
     let row: Option<(String, String, String, String, i64)> = conn.query_row(
         "SELECT a.job_id,j.request_json,a.assignment_json,a.failed_nodes_json,a.failure_count FROM ai_assignments a JOIN ai_jobs j ON j.job_id=a.job_id WHERE a.assignment_id=?1 AND a.assigned_node_id=?2",
@@ -878,7 +878,7 @@ async fn inference_status(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<InferenceJobStatus>, ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     let status: Option<String> = conn
         .query_row(
             "SELECT status FROM ai_jobs WHERE job_id=?1",
@@ -1062,7 +1062,7 @@ async fn register(
     let caps_json = serde_json::to_string(&req.capabilities).map_err(ApiError::internal)?;
     let now = now_unix();
     {
-        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let mut conn = state.db.get().map_err(ApiError::internal)?;
         consume_nonce(&conn, &req.auth)?;
         let tx = conn.transaction().map_err(ApiError::internal)?;
         tx.execute(r#"INSERT INTO nodes(node_id,public_key_b64,capabilities_json,registered_at,last_seen)
@@ -1092,7 +1092,7 @@ async fn heartbeat(
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let body_hash = heartbeat_body_hash(&req.capabilities).map_err(ApiError::internal)?;
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     authenticate_known_node(&conn, &req.auth, "heartbeat", &body_hash)?;
     let caps_json = serde_json::to_string(&req.capabilities).map_err(ApiError::internal)?;
     conn.execute(
@@ -1107,7 +1107,7 @@ async fn poll_work(
     State(state): State<AppState>,
     Json(req): Json<PollRequest>,
 ) -> Result<Json<PollResponse>, ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     authenticate_known_node(&conn, &req.auth, "poll", &empty_body_hash())?;
     let now = now_unix();
     conn.execute("UPDATE assignments SET status='pending',leased_to=NULL,lease_until=NULL WHERE status='leased' AND lease_until < ?1", params![now]).map_err(ApiError::internal)?;
@@ -1158,7 +1158,7 @@ async fn report_result(
     )
     .map_err(ApiError::internal)?;
     let (work, job_id, reward_mcu, system_funded, provider_pk) = {
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         authenticate_known_node(&conn, &req.auth, "result", &body_hash)?;
         let provider_pk: String = conn
             .query_row(
@@ -1212,7 +1212,7 @@ async fn report_result(
     let settlement = verify::settle(&work, &req.result, &reputation, nonce);
     if settlement.verdict.is_rejected() || settlement.verdict == Verdict::Inconclusive {
         record_reputation(&state, &req.auth.node_id, false)?;
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         conn.execute("UPDATE assignments SET status='pending',leased_to=NULL,lease_until=NULL WHERE assignment_id=?1",params![req.assignment_id]).map_err(ApiError::internal)?;
         return Err(ApiError::conflict(
             "work verification failed; assignment returned to queue",
@@ -1253,7 +1253,7 @@ async fn report_result(
         let tx_json = serde_json::to_string(&tx_record).map_err(ApiError::internal)?;
         let result_json = serde_json::to_string(&req.result).map_err(ApiError::internal)?;
         {
-            let mut conn = state.db.lock().map_err(ApiError::internal)?;
+            let mut conn = state.db.get().map_err(ApiError::internal)?;
             let local = conn.transaction().map_err(ApiError::internal)?;
             let updated=local.execute("UPDATE assignments SET status='settling',result_json=?2,lease_until=NULL WHERE assignment_id=?1 AND status='leased' AND leased_to=?3",params![req.assignment_id,result_json,req.auth.node_id]).map_err(ApiError::internal)?;
             if updated == 0 {
@@ -1279,7 +1279,7 @@ async fn report_result(
         ledger_hash = Some(cert.entry.entry_hash.clone());
         finalize_reward(&state, &req.assignment_id, &ck, &cert.entry.entry_hash)?;
     } else {
-        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let mut conn = state.db.get().map_err(ApiError::internal)?;
         let tx = conn.transaction().map_err(ApiError::internal)?;
         let updated=tx.execute("UPDATE assignments SET status='completed',result_json=?2,completed_at=?3,lease_until=NULL WHERE assignment_id=?1 AND status='leased' AND leased_to=?4",params![req.assignment_id,serde_json::to_string(&req.result).map_err(ApiError::internal)?,now_unix(),req.auth.node_id]).map_err(ApiError::internal)?;
         if updated == 0 {
@@ -1299,7 +1299,7 @@ async fn report_result(
         tx.commit().map_err(ApiError::internal)?;
     }
     let job_completed = {
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         conn.query_row(
             "SELECT status='completed' FROM jobs WHERE job_id=?1",
             params![job_id],
@@ -1327,7 +1327,7 @@ async fn refund_shard(
     Json(req): Json<RefundRequest>,
 ) -> Result<Json<RefundResponse>, ApiError> {
     let row = {
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         conn.query_row(
             "SELECT a.job_id,a.shard_index,a.work_json,a.status,j.system_funded,j.requester_node_id,j.created_at FROM assignments a JOIN jobs j ON j.job_id=a.job_id WHERE a.assignment_id=?1",
             params![req.assignment_id],
@@ -1402,7 +1402,7 @@ async fn refund_shard(
                     "only the requester who funded this job can reclaim its escrow",
                 ));
             }
-            let conn = state.db.lock().map_err(ApiError::internal)?;
+            let conn = state.db.get().map_err(ApiError::internal)?;
             authenticate_known_node(&conn, auth, "refund", &body_hash)?;
             let pk: String = conn
                 .query_row(
@@ -1454,7 +1454,7 @@ async fn refund_shard(
             .map_err(|e| ApiError::conflict(format!("refund refused by the ledger: {e}")))?;
         ledger_entry_hash = Some(cert.entry.entry_hash.clone());
         {
-            let mut conn = state.db.lock().map_err(ApiError::internal)?;
+            let mut conn = state.db.get().map_err(ApiError::internal)?;
             let local = conn.transaction().map_err(ApiError::internal)?;
             crate::db::persist_ledger_intent(
                 &local,
@@ -1470,7 +1470,7 @@ async fn refund_shard(
             local.commit().map_err(ApiError::internal)?;
         }
     } else {
-        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let mut conn = state.db.get().map_err(ApiError::internal)?;
         let tx = conn.transaction().map_err(ApiError::internal)?;
         // Without a ledger the coordinator keeps the balances itself, so it
         // hands the CU back by hand. Minted escrow has no node to return to:
@@ -1555,7 +1555,7 @@ async fn submit_job(
     let total_cost_mcu: i64 = parts.iter().map(work_cost_mcu).sum();
     let job_id = job_id_from_auth(&req.auth);
     let requester_pk = {
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         authenticate_known_node(&conn, &req.auth, "submit", &body_hash)?;
         if conn
             .query_row("SELECT 1 FROM jobs WHERE job_id=?1", params![job_id], |r| {
@@ -1609,7 +1609,7 @@ async fn submit_job(
     });
     let mut ledger_hash = None;
     {
-        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let mut conn = state.db.get().map_err(ApiError::internal)?;
         let local = conn.transaction().map_err(ApiError::internal)?;
         let now = now_unix();
         let ready = ledger_tx.is_none();
@@ -1668,7 +1668,7 @@ async fn balance(
     Path(node_id): Path<String>,
 ) -> Result<Json<BalanceResponse>, ApiError> {
     {
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         if conn
             .query_row(
                 "SELECT 1 FROM nodes WHERE node_id=?1",
@@ -1689,7 +1689,7 @@ async fn job_status(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     let job: Option<(Option<String>, i64, String, i64, i64)> = conn
         .query_row(
             "SELECT requester_node_id,system_funded,status,reserved_mcu,created_at FROM jobs WHERE job_id=?1",
@@ -1781,7 +1781,7 @@ async fn node_status(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
 ) -> Result<Json<NodeStatusResponse>, ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     let row: Option<(i64, String)> = conn
         .query_row(
             "SELECT last_seen,capabilities_json FROM nodes WHERE node_id=?1",
@@ -1806,7 +1806,7 @@ async fn node_status(
 async fn network_stats(
     State(state): State<AppState>,
 ) -> Result<Json<NetworkStatsResponse>, ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     let registered_nodes = scalar_u64(&conn, "SELECT COUNT(*) FROM nodes")?;
     let online_nodes = conn
         .query_row(
@@ -1866,7 +1866,7 @@ const PEER_SAMPLE_SIZE: usize = 8;
 async fn network_peers(
     State(state): State<AppState>,
 ) -> Result<Json<PeerSampleResponse>, ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     let mut stmt = conn
         .prepare(
             "SELECT node_id, capabilities_json FROM nodes \
@@ -1908,7 +1908,7 @@ fn finalize_reservation(
     claim: &str,
     entry_hash: &str,
 ) -> Result<(), ApiError> {
-    let mut conn = state.db.lock().map_err(ApiError::internal)?;
+    let mut conn = state.db.get().map_err(ApiError::internal)?;
     let tx = conn.transaction().map_err(ApiError::internal)?;
     crate::db::certify_ledger_intent(&tx, claim, entry_hash).map_err(ApiError::internal)?;
     tx.execute(
@@ -1930,7 +1930,7 @@ fn finalize_reward(
     claim: &str,
     entry_hash: &str,
 ) -> Result<(), ApiError> {
-    let mut conn = state.db.lock().map_err(ApiError::internal)?;
+    let mut conn = state.db.get().map_err(ApiError::internal)?;
     let tx = conn.transaction().map_err(ApiError::internal)?;
     crate::db::certify_ledger_intent(&tx, claim, entry_hash).map_err(ApiError::internal)?;
     let job_id: String = tx
@@ -2073,7 +2073,7 @@ fn draw_randomness() -> u64 {
 }
 
 fn load_reputation(state: &AppState, node_id: &str) -> Result<Reputation, ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     let row = conn
         .query_row(
             "SELECT accepted,rejected,streak FROM reputation WHERE node_id=?1",
@@ -2108,7 +2108,7 @@ fn record_reputation(state: &AppState, node_id: &str, accepted: bool) -> Result<
     } else {
         current.record_rejected();
     }
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     conn.execute(
         "INSERT INTO reputation(node_id,accepted,rejected,streak) VALUES(?1,?2,?3,?4)
          ON CONFLICT(node_id) DO UPDATE SET accepted=?2,rejected=?3,streak=?4",
@@ -2123,7 +2123,7 @@ fn record_reputation(state: &AppState, node_id: &str, accepted: bool) -> Result<
     Ok(())
 }
 fn cache_balance(state: &AppState, node_id: &str, balance: i64) -> Result<(), ApiError> {
-    let conn = state.db.lock().map_err(ApiError::internal)?;
+    let conn = state.db.get().map_err(ApiError::internal)?;
     conn.execute(
         "UPDATE balances SET balance_mcu=?2 WHERE node_id=?1",
         params![node_id, balance],
@@ -2155,9 +2155,7 @@ mod ai_api_tests {
         fs::create_dir_all(&root).unwrap();
         let db_path = root.join("coordinator.db");
         let state = AppState {
-            db: Arc::new(Mutex::new(
-                crate::db::open(db_path.to_str().unwrap()).unwrap(),
-            )),
+            db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2391,9 +2389,7 @@ mod ai_api_tests {
         fs::create_dir_all(&root).unwrap();
         let db_path = root.join("coordinator.db");
         let state = AppState {
-            db: Arc::new(Mutex::new(
-                crate::db::open(db_path.to_str().unwrap()).unwrap(),
-            )),
+            db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2578,9 +2574,7 @@ mod ai_api_tests {
         fs::create_dir_all(&root).unwrap();
         let db_path = root.join("coordinator.db");
         let state = AppState {
-            db: Arc::new(Mutex::new(
-                crate::db::open(db_path.to_str().unwrap()).unwrap(),
-            )),
+            db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2796,9 +2790,7 @@ mod ai_api_tests {
         fs::create_dir_all(&root).unwrap();
         let db_path = root.join("coordinator.db");
         let state = AppState {
-            db: Arc::new(Mutex::new(
-                crate::db::open(db_path.to_str().unwrap()).unwrap(),
-            )),
+            db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2937,9 +2929,7 @@ mod ai_api_tests {
         fs::create_dir_all(&root).unwrap();
         let db_path = root.join("coordinator.db");
         let state = AppState {
-            db: Arc::new(Mutex::new(
-                crate::db::open(db_path.to_str().unwrap()).unwrap(),
-            )),
+            db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3006,9 +2996,9 @@ mod ai_api_tests {
         let root = std::env::temp_dir().join(format!("hocmesh-peer-cap-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let state = AppState {
-            db: Arc::new(Mutex::new(
-                crate::db::open(root.join("coordinator.db").to_str().unwrap()).unwrap(),
-            )),
+            db: Arc::new(
+                crate::db::Pool::open(root.join("coordinator.db").to_str().unwrap()).unwrap(),
+            ),
             ledger: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3178,7 +3168,7 @@ async fn authoritative_balance(
             ledger_head: Some(p.head.entry_hash),
         })
     } else {
-        let conn = state.db.lock().map_err(ApiError::internal)?;
+        let conn = state.db.get().map_err(ApiError::internal)?;
         let b: Option<i64> = conn
             .query_row(
                 "SELECT balance_mcu FROM balances WHERE node_id=?1",

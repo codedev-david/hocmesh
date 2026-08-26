@@ -48,21 +48,24 @@ pub fn membership_hash(set: &ValidatorSet) -> Result<String> {
 pub fn transaction_hash(tx: &LedgerTransaction) -> Result<String> {
     Ok(hash_json(tx)?)
 }
+pub fn transactions_hash(txs: &[LedgerTransaction]) -> Result<String> {
+    Ok(hash_json(txs)?)
+}
 pub fn entry_hash(sequence: u64, previous_hash: &str, tx_hash: &str) -> Result<String> {
     Ok(hash_json(&(sequence, previous_hash, tx_hash))?)
 }
 pub fn build_entry(
     sequence: u64,
     previous_hash: String,
-    tx: LedgerTransaction,
+    transactions: Vec<LedgerTransaction>,
 ) -> Result<LedgerEntry> {
-    let th = transaction_hash(&tx)?;
+    let th = transactions_hash(&transactions)?;
     let eh = entry_hash(sequence, &previous_hash, &th)?;
     Ok(LedgerEntry {
         sequence,
         previous_hash,
-        transaction: tx,
-        transaction_hash: th,
+        transactions,
+        transactions_hash: th,
         entry_hash: eh,
     })
 }
@@ -79,6 +82,32 @@ pub fn claim_key(tx: &LedgerTransaction) -> String {
     }
 }
 
+/// Checks a whole entry's worth of transactions the way they will be applied.
+///
+/// Each transaction is judged against the balances its predecessors in the
+/// batch left behind. Checking them all against the same opening balances
+/// would let two separately affordable settlements jointly overdraw an
+/// account, which is exactly what batching would otherwise make possible.
+pub fn validate_batch(
+    transactions: &[LedgerTransaction],
+    previous_hash: &str,
+    balance: impl Fn(&str) -> Result<i64>,
+    community_issuance_limit_mcu: i64,
+) -> Result<()> {
+    let mut overlay = std::collections::HashMap::<String, i64>::new();
+    for tx in transactions {
+        validate_transaction(
+            tx,
+            previous_hash,
+            |a| Ok(balance(a)? + overlay.get(a).copied().unwrap_or(0)),
+            community_issuance_limit_mcu,
+        )?;
+        for p in &tx.postings {
+            *overlay.entry(p.account_id.clone()).or_default() += p.delta_mcu;
+        }
+    }
+    Ok(())
+}
 pub fn validate_transaction(
     tx: &LedgerTransaction,
     previous_hash: &str,
@@ -679,8 +708,21 @@ pub fn verify_certificate(cert: &QuorumCertificate, set: &ValidatorSet) -> Resul
     if cert.membership_hash != membership_hash(set)? {
         bail!("membership hash mismatch")
     };
-    let th = transaction_hash(&cert.entry.transaction)?;
-    if th != cert.entry.transaction_hash {
+    if cert.entry.transactions.is_empty() {
+        bail!("ledger entry carries no transactions")
+    };
+    // A batch must not settle the same claim twice. Across entries the claim
+    // table enforces exactly-once; within one entry it has to be enforced
+    // here, before any of the postings are applied.
+    let mut seen = std::collections::HashSet::new();
+    for t in &cert.entry.transactions {
+        let ck = claim_key(t);
+        if !seen.insert(ck.clone()) {
+            bail!("ledger entry settles claim {ck} twice")
+        }
+    }
+    let th = transactions_hash(&cert.entry.transactions)?;
+    if th != cert.entry.transactions_hash {
         bail!("transaction hash mismatch")
     };
     if entry_hash(cert.entry.sequence, &cert.entry.previous_hash, &th)? != cert.entry.entry_hash {
@@ -709,6 +751,54 @@ pub fn verify_certificate(cert: &QuorumCertificate, set: &ValidatorSet) -> Resul
     if good < set.threshold {
         bail!(
             "certificate has {good} valid signatures; threshold is {}",
+            set.threshold
+        )
+    }
+    Ok(())
+}
+
+pub fn checkpoint_signing_message(
+    membership_hash: &str,
+    sequence: u64,
+    entry_hash: &str,
+    state_hash: &str,
+) -> String {
+    format!("hocmesh-checkpoint-v1|{membership_hash}|{sequence}|{entry_hash}|{state_hash}")
+}
+
+/// Checks that a quorum really did sign for this state at this height.
+///
+/// Same shape as `verify_certificate`, and for the same reason: a checkpoint
+/// is only worth starting an audit from if enough validators independently
+/// staked their key on the state being exactly this.
+pub fn verify_checkpoint(cp: &LedgerCheckpoint, set: &ValidatorSet) -> Result<()> {
+    if cp.head.membership_hash != membership_hash(set)? {
+        bail!("checkpoint membership hash mismatch")
+    };
+    let message = checkpoint_signing_message(
+        &cp.head.membership_hash,
+        cp.head.sequence,
+        &cp.head.entry_hash,
+        &cp.state_hash,
+    );
+    let mut ids = std::collections::HashSet::new();
+    let mut good = 0usize;
+    for s in &cp.signatures {
+        if !ids.insert(&s.validator_id) {
+            continue;
+        }
+        if let Some(m) = set
+            .members
+            .iter()
+            .find(|m| m.validator_id == s.validator_id)
+            && verify_validator_signature(m, &message, &s.signature_b64).is_ok()
+        {
+            good += 1
+        }
+    }
+    if good < set.threshold {
+        bail!(
+            "checkpoint has {good} valid signatures; threshold is {}",
             set.threshold
         )
     }
@@ -1136,7 +1226,7 @@ mod tests {
         let set = validator_set("tampered-cert");
         let mut cert = certified_community_reserve(&set, "job-cert", 1, "GENESIS");
         verify_certificate(&cert, &set.set).unwrap();
-        cert.entry.transaction.postings[1].delta_mcu += 1;
+        cert.entry.transactions[0].postings[1].delta_mcu += 1;
 
         assert!(verify_certificate(&cert, &set.set).is_err());
     }
@@ -1269,7 +1359,18 @@ mod tests {
         sequence: u64,
         previous_hash: &str,
     ) -> QuorumCertificate {
-        let entry = build_entry(sequence, previous_hash.into(), tx).unwrap();
+        certify_batch(validators, vec![tx], sequence, previous_hash)
+    }
+
+    /// Certifies several transactions into a single entry, the way the batching
+    /// proposer does.
+    fn certify_batch(
+        validators: &TestValidatorSet,
+        transactions: Vec<LedgerTransaction>,
+        sequence: u64,
+        previous_hash: &str,
+    ) -> QuorumCertificate {
+        let entry = build_entry(sequence, previous_hash.into(), transactions).unwrap();
         let membership_hash = membership_hash(&validators.set).unwrap();
         let message = ledger_entry_signing_message(&membership_hash, &entry.entry_hash);
         let signatures = validators
@@ -1737,5 +1838,265 @@ mod tests {
             0,
             "CU minted for work nobody did is unminted"
         );
+    }
+
+    /// A batched entry is a real entry: it hashes, verifies and carries every
+    /// settlement it was given.
+    #[test]
+    fn batched_entry_carries_every_transaction() {
+        let v = validator_set("batch-verify");
+        let a = certified_community_reserve(&v, "batch-a", 1, "GENESIS")
+            .entry
+            .transactions[0]
+            .clone();
+        let b = certified_community_reserve(&v, "batch-b", 1, "GENESIS")
+            .entry
+            .transactions[0]
+            .clone();
+        let cert = certify_batch(&v, vec![a, b], 1, "GENESIS");
+        verify_certificate(&cert, &v.set).unwrap();
+        assert_eq!(cert.entry.transactions.len(), 2);
+    }
+
+    /// Across entries the claims table enforces exactly-once. Inside one entry
+    /// nothing else will, so the certificate check has to.
+    #[test]
+    fn batched_entry_cannot_settle_one_claim_twice() {
+        let v = validator_set("batch-double");
+        let tx = certified_community_reserve(&v, "batch-dup", 1, "GENESIS")
+            .entry
+            .transactions[0]
+            .clone();
+        let cert = certify_batch(&v, vec![tx.clone(), tx], 1, "GENESIS");
+        let err = verify_certificate(&cert, &v.set).unwrap_err().to_string();
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    /// An entry with nothing in it would still move the head and chain a hash,
+    /// so an empty batch has to be refused outright.
+    #[test]
+    fn empty_entry_is_rejected() {
+        let v = validator_set("batch-empty");
+        let cert = certify_batch(&v, vec![], 1, "GENESIS");
+        let err = verify_certificate(&cert, &v.set).unwrap_err().to_string();
+        assert!(err.contains("no transactions"), "{err}");
+    }
+
+    /// The reason batching needs its own check: two settlements that each fit
+    /// under the issuance limit can breach it together, and a batch that
+    /// judged both against the same opening balance would let them.
+    #[test]
+    fn batch_cannot_overdraw_across_transactions() {
+        let v = validator_set("batch-overdraw");
+        let a = certified_community_reserve(&v, "over-a", 1, "GENESIS")
+            .entry
+            .transactions[0]
+            .clone();
+        let b = certified_community_reserve(&v, "over-b", 1, "GENESIS")
+            .entry
+            .transactions[0]
+            .clone();
+        let cost = -a.postings[0].delta_mcu;
+        let limit = cost + cost / 2;
+        // Each alone leaves the issuance account inside the limit.
+        validate_transaction(&a, "GENESIS", |_| Ok(0), limit).unwrap();
+        validate_transaction(&b, "GENESIS", |_| Ok(0), limit).unwrap();
+        let err = validate_batch(&[a, b], "GENESIS", |_| Ok(0), limit)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("issuance limit"), "{err}");
+    }
+
+    fn checkpoint(validators: &TestValidatorSet, signers: usize) -> LedgerCheckpoint {
+        let head = LedgerHead {
+            sequence: 7,
+            entry_hash: "entry7".into(),
+            membership_hash: membership_hash(&validators.set).unwrap(),
+        };
+        let state_hash = "state-digest".to_string();
+        let message = checkpoint_signing_message(
+            &head.membership_hash,
+            head.sequence,
+            &head.entry_hash,
+            &state_hash,
+        );
+        LedgerCheckpoint {
+            head,
+            state_hash,
+            signatures: validators
+                .identities
+                .iter()
+                .take(signers)
+                .map(|i| ValidatorSignature {
+                    validator_id: i.node_id(),
+                    signature_b64: i.sign_bytes_b64(message.as_bytes()),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn checkpoint_needs_a_quorum_of_signatures() {
+        let v = validator_set("cp-quorum");
+        assert!(verify_checkpoint(&checkpoint(&v, v.set.threshold), &v.set).is_ok());
+        assert!(verify_checkpoint(&checkpoint(&v, v.set.threshold - 1), &v.set).is_err());
+    }
+
+    /// The state hash is the whole point of a checkpoint: if it could be
+    /// changed after signing, an auditor could be handed any starting state.
+    #[test]
+    fn checkpoint_state_hash_cannot_be_swapped_after_signing() {
+        let v = validator_set("cp-swap");
+        let mut cp = checkpoint(&v, v.set.threshold);
+        cp.state_hash = "some-other-state".into();
+        assert!(verify_checkpoint(&cp, &v.set).is_err());
+    }
+
+    #[test]
+    fn checkpoint_signatures_do_not_count_twice() {
+        let v = validator_set("cp-dup");
+        let mut cp = checkpoint(&v, 1);
+        let only = cp.signatures[0].clone();
+        cp.signatures = vec![only.clone(), only.clone(), only];
+        assert!(verify_checkpoint(&cp, &v.set).is_err());
+    }
+
+    /// A checkpoint signed against a different validator set says nothing
+    /// about this one, however many valid-looking signatures it carries.
+    #[test]
+    fn checkpoint_from_another_validator_set_is_rejected() {
+        let (a, b) = (validator_set("cp-set-a"), validator_set("cp-set-b"));
+        assert!(verify_checkpoint(&checkpoint(&a, a.set.threshold), &b.set).is_err());
+    }
+
+    /// Signs whatever the store currently holds, the way a validator answering
+    /// `/v1/ledger/state` does.
+    fn signed_checkpoint(
+        v: &TestValidatorSet,
+        store: &crate::store::LedgerStore,
+    ) -> LedgerCheckpoint {
+        signed_checkpoint_at(v, store, None)
+    }
+
+    /// The same, but able to sign for a state the store does not actually
+    /// hold, which is the only way to test that the store checks.
+    fn signed_checkpoint_at(
+        v: &TestValidatorSet,
+        store: &crate::store::LedgerStore,
+        state_hash: Option<&str>,
+    ) -> LedgerCheckpoint {
+        let head = store.head(&v.set).unwrap();
+        let state_hash = state_hash
+            .map(str::to_string)
+            .unwrap_or_else(|| store.state().unwrap().digest().unwrap());
+        let message = checkpoint_signing_message(
+            &head.membership_hash,
+            head.sequence,
+            &head.entry_hash,
+            &state_hash,
+        );
+        LedgerCheckpoint {
+            head,
+            state_hash,
+            signatures: v
+                .identities
+                .iter()
+                .take(v.set.threshold)
+                .map(|i| ValidatorSignature {
+                    validator_id: i.node_id(),
+                    signature_b64: i.sign_bytes_b64(message.as_bytes()),
+                })
+                .collect(),
+        }
+    }
+
+    /// A file rather than `:memory:`, so a test can close the store and open it
+    /// again - which is where a pruned ledger has to prove it stayed intact.
+    fn checkpoint_db(v: &TestValidatorSet) -> String {
+        v._dir.join("ledger.db").to_string_lossy().to_string()
+    }
+
+    /// Builds a ledger deep enough for a checkpoint to have history both
+    /// below and above it: a reservation, its refund, a checkpoint there, and
+    /// a second reservation on top.
+    fn checkpointed_ledger(v: &TestValidatorSet) -> (crate::store::LedgerStore, LedgerCheckpoint) {
+        let work = WorkSpec::PrimeCount { start: 2, end: 20 };
+        let at = 1 + hocmesh_protocol::SETTLEMENT_WINDOW_SECS + 1;
+        let mut store = crate::store::LedgerStore::open(&checkpoint_db(v)).unwrap();
+        let reserve = certified_community_reserve(v, "job-cp", 1, "GENESIS");
+        store.apply(&reserve, &v.set).unwrap();
+        let refund = refund_tx("job-cp", 0, &work, true, None, at);
+        let cert = certify(v, refund, 2, &reserve.entry.entry_hash);
+        store.apply(&cert, &v.set).unwrap();
+        let cp = signed_checkpoint(v, &store);
+        store.store_checkpoint(&cp, &v.set).unwrap();
+        let later = certified_community_reserve(v, "job-cp-later", 3, &cert.entry.entry_hash);
+        store.apply(&later, &v.set).unwrap();
+        (store, cp)
+    }
+
+    /// An audit that starts from a checkpoint has to reach exactly the same
+    /// place as one that replays everything, or the shortcut is not one.
+    #[test]
+    fn audit_from_a_checkpoint_lands_where_a_full_audit_does() {
+        let v = validator_set("cp-audit");
+        let (store, cp) = checkpointed_ledger(&v);
+        let full = store.audit(&v.set).unwrap();
+        let short = store.audit_from(&v.set, Some(&cp)).unwrap();
+        assert_eq!(
+            (full.sequence, full.entry_hash),
+            (short.sequence, short.entry_hash)
+        );
+    }
+
+    /// Pruning is only safe if what it removes was never needed again. After
+    /// it, the checkpoint route still works and the genesis route says plainly
+    /// that it cannot rather than auditing a shortened history.
+    #[test]
+    fn pruning_below_a_checkpoint_keeps_the_ledger_auditable() {
+        let v = validator_set("cp-prune");
+        let (store, cp) = checkpointed_ledger(&v);
+        store.prune_below_checkpoint(&v.set).unwrap();
+        store
+            .audit_from(&v.set, Some(&cp))
+            .expect("a pruned ledger still audits from its checkpoint");
+        let err = store.audit(&v.set).unwrap_err().to_string();
+        assert!(err.contains("has been pruned"), "{err}");
+    }
+
+    /// A checkpoint the store cannot reproduce from its own tables is a
+    /// disagreement, not a shortcut, and has to be refused before it is kept.
+    #[test]
+    fn a_checkpoint_the_store_disagrees_with_is_refused() {
+        let v = validator_set("cp-disagree");
+        let (store, _) = checkpointed_ledger(&v);
+        // Properly signed by a quorum, and still wrong about the state.
+        let wrong = signed_checkpoint_at(&v, &store, Some("not-the-state-this-store-holds"));
+        verify_checkpoint(&wrong, &v.set).expect("the signatures themselves are valid");
+        let err = store
+            .store_checkpoint(&wrong, &v.set)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("checkpoint mismatch"), "{err}");
+    }
+
+    /// Reopening is where pruning nearly went wrong: the store rebuilds its
+    /// derived tables from the certificates on every open, and once the ones
+    /// below the checkpoint are gone that rebuild would erase state the
+    /// quorum has already signed for.
+    #[test]
+    fn a_pruned_ledger_survives_being_reopened() {
+        let v = validator_set("cp-reopen");
+        let (store, cp) = checkpointed_ledger(&v);
+        store.prune_below_checkpoint(&v.set).unwrap();
+        let before = store.state().unwrap().digest().unwrap();
+        drop(store);
+        let reopened = crate::store::LedgerStore::open(&checkpoint_db(&v)).unwrap();
+        assert_eq!(
+            before,
+            reopened.state().unwrap().digest().unwrap(),
+            "reopening a pruned ledger must not change the state it holds"
+        );
+        reopened.audit_from(&v.set, Some(&cp)).unwrap();
     }
 }

@@ -510,7 +510,7 @@ pub fn inference_refund_body_hash(
     ))
 }
 
-pub fn hash_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+pub fn hash_json<T: Serialize + ?Sized>(value: &T) -> Result<String, serde_json::Error> {
     Ok(hash_bytes(&serde_json::to_vec(value)?))
 }
 pub fn node_id_from_public_key(public_key: &[u8; 32]) -> String {

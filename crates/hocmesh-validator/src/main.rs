@@ -11,8 +11,8 @@ use hocmesh_ledger::{
     store::LedgerStore,
     types::*,
     validate::{
-        build_entry, claim_key, ledger_entry_signing_message, membership_hash,
-        validate_transaction, validate_validator_set, verify_certificate,
+        build_entry, checkpoint_signing_message, claim_key, ledger_entry_signing_message,
+        membership_hash, validate_batch, validate_validator_set, verify_certificate,
     },
 };
 use serde::Deserialize;
@@ -134,6 +134,7 @@ async fn serve(listen: &str, db: &str, home: &FsPath, validators: &str) -> Resul
     let r = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/ledger/head", get(head))
+        .route("/v1/ledger/state", get(ledger_state))
         .route("/v1/ledger/balance/{account}", get(balance))
         .route("/v1/ledger/claim/{claim}", get(claim))
         .route("/v1/ledger/propose", post(propose))
@@ -158,6 +159,31 @@ async fn head(State(a): State<App>) -> Result<Json<HeadProof>, String> {
     );
     Ok(Json(HeadProof {
         head: h,
+        validator_id: a.id.node_id(),
+        signature_b64: a.id.sign_bytes_b64(msg.as_bytes()),
+    }))
+}
+/// This validator's own view of the whole ledger state, signed.
+///
+/// The signature is over exactly the message a checkpoint is checked against,
+/// so a caller that collects a quorum of these has a checkpoint already.
+async fn ledger_state(State(a): State<App>) -> Result<Json<StateProof>, String> {
+    let s = a.store.lock().map_err(|_| "lock".to_string())?;
+    let head = s.head(&a.set).map_err(|e| e.to_string())?;
+    let state_hash = s
+        .state()
+        .and_then(|st| st.digest())
+        .map_err(|e| e.to_string())?;
+    drop(s);
+    let msg = checkpoint_signing_message(
+        &head.membership_hash,
+        head.sequence,
+        &head.entry_hash,
+        &state_hash,
+    );
+    Ok(Json(StateProof {
+        head,
+        state_hash,
         validator_id: a.id.node_id(),
         signature_b64: a.id.sign_bytes_b64(msg.as_bytes()),
     }))
@@ -219,19 +245,22 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
             .store
             .lock()
             .map_err(|_| anyhow::anyhow!("ledger lock poisoned"))?;
-        let ck = claim_key(&r.transaction);
-        if s.has_claim(&ck)? {
-            bail!("claim already settled: {ck}")
-        };
-        validate_settlement_membership(&s, &r.transaction)?;
         let h = s.head(&a.set)?;
-        validate_transaction(
-            &r.transaction,
+        let mut settled = std::collections::HashSet::new();
+        for t in &r.transactions {
+            let ck = claim_key(t);
+            if s.has_claim(&ck)? || !settled.insert(ck.clone()) {
+                bail!("claim already settled: {ck}")
+            };
+            validate_settlement_membership(&s, t)?;
+        }
+        validate_batch(
+            &r.transactions,
             &h.entry_hash,
             |x| s.balance(x),
             a.set.community_issuance_limit_mcu,
         )?;
-        let e = build_entry(h.sequence + 1, h.entry_hash.clone(), r.transaction)?;
+        let e = build_entry(h.sequence + 1, h.entry_hash.clone(), r.transactions)?;
         s.lock_vote(e.sequence, &e.entry_hash)?;
         let mh = membership_hash(&a.set)?;
         let sig =
@@ -272,9 +301,11 @@ async fn commit(
         }
         return Err("conflicting/stale certificate".into());
     }
-    validate_settlement_membership(&s, &c.entry.transaction).map_err(|e| e.to_string())?;
-    validate_transaction(
-        &c.entry.transaction,
+    for t in &c.entry.transactions {
+        validate_settlement_membership(&s, t).map_err(|e| e.to_string())?;
+    }
+    validate_batch(
+        &c.entry.transactions,
         &c.entry.previous_hash,
         |x| s.balance(x),
         a.set.community_issuance_limit_mcu,

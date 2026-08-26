@@ -10,6 +10,7 @@ publish = false
 anyhow.workspace = true
 base64.workspace = true
 ed25519-dalek.workspace = true
+futures.workspace = true
 hocmesh-core = { path = "../hocmesh-core" }
 hocmesh-protocol = { path = "../hocmesh-protocol" }
 reqwest.workspace = true

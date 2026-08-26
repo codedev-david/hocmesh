@@ -93,8 +93,14 @@ pub struct LedgerTransaction {
 pub struct LedgerEntry {
     pub sequence: u64,
     pub previous_hash: String,
-    pub transaction: LedgerTransaction,
-    pub transaction_hash: String,
+    /// Every settlement that shares this slot in the chain.
+    ///
+    /// One entry per transaction meant one full consensus round - three
+    /// network phases - per CU movement, which capped the whole network at a
+    /// couple of settlements a second. A round costs the same whether it
+    /// carries one transaction or five hundred, so entries carry a batch.
+    pub transactions: Vec<LedgerTransaction>,
+    pub transactions_hash: String,
     pub entry_hash: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,7 +160,8 @@ pub struct ClaimProof {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalRequest {
-    pub transaction: LedgerTransaction,
+    /// Every transaction the proposer wants settled in this one entry.
+    pub transactions: Vec<LedgerTransaction>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalVote {
@@ -222,4 +229,26 @@ pub struct InferenceRefundEvidence {
     pub refund_mcu: i64,
     pub requester_public_key_b64: String,
     pub requester_auth: AuthProof,
+}
+
+/// One validator's signed statement about the state it holds right now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateProof {
+    pub head: LedgerHead,
+    pub state_hash: String,
+    pub validator_id: String,
+    pub signature_b64: String,
+}
+
+/// A quorum's agreement about the whole ledger state at one height.
+///
+/// An audit that always replays from genesis costs more every day the network
+/// runs, until eventually nobody can afford to check anything. A checkpoint
+/// gives an auditor a starting point a quorum has vouched for, so the work is
+/// bounded by how much has happened since rather than by the whole history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerCheckpoint {
+    pub head: LedgerHead,
+    pub state_hash: String,
+    pub signatures: Vec<ValidatorSignature>,
 }
