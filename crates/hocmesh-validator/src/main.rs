@@ -323,6 +323,9 @@ fn validate_settlement_membership(store: &LedgerStore, tx: &LedgerTransaction) -
             e.requester_auth.as_ref().map(|a| a.node_id.as_str()),
             true,
         ),
+        TransactionEvidence::InferenceReward(_) | TransactionEvidence::InferenceRefund(_) => {
+            return validate_inference_membership(store, tx);
+        }
         _ => return Ok(()),
     };
     let Some((root_work, shards, reserved_funding, requester, reserved_at)) =
@@ -356,6 +359,81 @@ fn validate_settlement_membership(store: &LedgerStore, tx: &LedgerTransaction) -
     }
     if !is_refund && tx.created_at > deadline {
         bail!("reward arrived after the shard's settlement window")
+    }
+    Ok(())
+}
+/// The same membership check as a shard settlement, for a batch of inference.
+///
+/// A validator cannot re-run the model, so what it checks is everything
+/// *around* the answer: that the batch is one the reservation certified, that
+/// the node claiming it is the node that was given it, that the amount is what
+/// the signed billing prices the batch at, and that a reward and a refund for
+/// one batch never share a moment.
+fn validate_inference_membership(store: &LedgerStore, tx: &LedgerTransaction) -> Result<()> {
+    let (job_id, assignment_id, batch_start, batch_end, amount, payee, is_refund) =
+        match &tx.evidence {
+            TransactionEvidence::InferenceReward(e) => (
+                &e.job_id,
+                &e.assignment_id,
+                e.batch_start,
+                e.batch_end,
+                e.reward_mcu,
+                e.provider_auth.node_id.as_str(),
+                false,
+            ),
+            TransactionEvidence::InferenceRefund(e) => (
+                &e.job_id,
+                &e.assignment_id,
+                e.batch_start,
+                e.batch_end,
+                e.refund_mcu,
+                e.requester_auth.node_id.as_str(),
+                true,
+            ),
+            _ => return Ok(()),
+        };
+    let Some(reservation) = store.inference_reservation(job_id)? else {
+        bail!("inference settlement references a job with no certified reservation")
+    };
+    let Some(index) = (0..reservation.batches.len() as u32)
+        .find(|i| hocmesh_protocol::inference_assignment_id(job_id, *i) == *assignment_id)
+    else {
+        bail!("inference settlement names a batch that was never certified")
+    };
+    let batch = &reservation.batches[index as usize];
+    if batch.batch_start != batch_start || batch.batch_end != batch_end {
+        bail!("inference settlement changes the bounds of the batch it claims")
+    }
+    if is_refund {
+        // The escrow returns where it came from, never to whoever asks.
+        if reservation.requester != payee {
+            bail!("inference refund pays someone other than the requester")
+        }
+    } else {
+        if batch.node_id != payee {
+            bail!("inference reward paid to a node the batch was not assigned to")
+        }
+        if reservation.requester == payee {
+            bail!("requester cannot receive a reward from its own paid job")
+        }
+    }
+    let expected = hocmesh_core::compute::inference_batch_cost_mcu(
+        &reservation.billing.prompt_bytes,
+        batch_start,
+        batch_end,
+        reservation.billing.max_tokens,
+        reservation.billing.parameter_count,
+    );
+    if expected != amount {
+        bail!("inference settlement is not what the batch prices at")
+    }
+    // A batch settles once, and which way is decided by the clock.
+    let deadline = reservation.reserved_at + hocmesh_protocol::SETTLEMENT_WINDOW_SECS;
+    if is_refund && tx.created_at <= deadline {
+        bail!("inference refund inside the batch settlement window")
+    }
+    if !is_refund && tx.created_at > deadline {
+        bail!("inference reward arrived after the batch settlement window")
     }
     Ok(())
 }

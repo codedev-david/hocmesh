@@ -232,6 +232,161 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
                 && pair[0].entry_hash == pair[1].entry_hash),
         "all validator heads should match after rejoin"
     );
+    // ---- Inference, under quorum ----
+    //
+    // This is the leg the whole network exists for: one node lends its GPU,
+    // another spends the CU it earned counting primes to use it. Until now
+    // AI ran entirely outside the ledger, so contributing a GPU earned
+    // nothing and using one cost nothing. Every number below is certified by
+    // the validator set and replayed by the audit at the end of this test.
+    let gpu_node = TestNode::new(&tmp.path.join("node-gpu"))?;
+    register_with(&http, &coordinator, &gpu_node, ai_capabilities()).await?;
+
+    let manifest = hocmesh_model::ModelManifest {
+        schema_version: 1,
+        model_id: "quorum-tiny".into(),
+        revision: "v1".into(),
+        format: hocmesh_model::ModelFormat::Gguf,
+        architecture: "llama".into(),
+        // Small enough that a prime shard can pay for a prompt.
+        parameter_count: Some(1_000),
+        tensor_dtype: Some("q4".into()),
+        total_size_bytes: 4_096,
+        chunks: vec![hocmesh_model::ChunkRef {
+            index: 0,
+            sha256: hocmesh_protocol::hash_bytes(b"weights"),
+            size_bytes: 4_096,
+        }],
+        metadata: Default::default(),
+    };
+    let register_model = hocmesh_ai::RegisterModelRequest {
+        auth: node_a.identity.auth(
+            "register_model",
+            &hocmesh_ai::register_model_body_hash(&manifest)?,
+        ),
+        manifest: manifest.clone(),
+    };
+    let _: hocmesh_ai::RegisterModelResponse = post_json(
+        &http,
+        &coordinator,
+        "/v1/ai/models/register",
+        &register_model,
+    )
+    .await?;
+
+    // The requester prices its own job from the published manifest and signs
+    // that price. Nothing downstream is allowed to raise it.
+    let prompts = vec!["what is a compute unit".to_string()];
+    let billing = hocmesh_ai::bill_for_prompts(
+        &manifest.digest()?,
+        manifest
+            .parameter_count
+            .context("manifest must be priceable")?,
+        manifest.total_size_bytes,
+        &prompts,
+        16,
+    )?;
+    let inference_price = billing.max_cost_mcu;
+    let spender_before = balance(&http, &coordinator, &node_a).await?.balance_mcu;
+    let gpu_before = balance(&http, &coordinator, &gpu_node).await?.balance_mcu;
+    assert!(
+        spender_before >= inference_price,
+        "CU earned on the CPU has to be able to buy GPU time: have {spender_before}, need {inference_price}"
+    );
+
+    let mut submit_ai = hocmesh_ai::SubmitInferenceRequest {
+        auth: node_a.identity.auth("unused", &empty_body_hash()),
+        model_id: "quorum-tiny".into(),
+        revision: "v1".into(),
+        prompts: prompts.clone(),
+        max_tokens: 16,
+        temperature_milli: 0,
+        seed: 1,
+        requirements: hocmesh_ai::InferenceRequirements {
+            required_backends: [hocmesh_gpu::BackendKind::Cuda].into_iter().collect(),
+            minimum_memory_bytes: 1,
+            needs_fp16: true,
+            needs_bf16: false,
+            needs_int8: false,
+            batch_size: 1,
+            pipeline_stages: 1,
+            tensor_parallelism: 1,
+        },
+        layer_count: 2,
+        billing: billing.clone(),
+    };
+    submit_ai.auth = node_a.identity.auth(
+        "submit_inference",
+        &hocmesh_ai::submit_inference_body_hash(&submit_ai)?,
+    );
+    let ai_job: hocmesh_ai::SubmitInferenceResponse =
+        post_json(&http, &coordinator, "/v1/ai/jobs/submit", &submit_ai).await?;
+
+    // Escrow left the requester for exactly the number it signed - and the
+    // ledger, not the coordinator, is what says so.
+    let spender_after_submit = balance(&http, &coordinator, &node_a).await?.balance_mcu;
+    assert_eq!(
+        spender_after_submit,
+        spender_before - inference_price,
+        "reserving inference must move exactly the priced CU into escrow"
+    );
+
+    let ai_poll = hocmesh_ai::PollInferenceRequest {
+        auth: gpu_node.identity.auth("poll_inference", &empty_body_hash()),
+    };
+    let leased: hocmesh_ai::PollInferenceResponse =
+        post_json(&http, &coordinator, "/v1/ai/work/poll", &ai_poll).await?;
+    let assignment = leased
+        .assignment
+        .context("the GPU node should be handed the inference batch")?;
+
+    // The provider prices its own batch from the assignment. Because the
+    // price is closed form, it is the same number the ledger recomputes.
+    let (batch_start, batch_end, reward_mcu) = hocmesh_ai::assignment_claim(&assignment)
+        .context("an assignment must carry a priceable batch")?;
+    assert_eq!(
+        reward_mcu, inference_price,
+        "one batch, whole job, whole price"
+    );
+
+    let answer = "a unit of machine work";
+    let mut report = hocmesh_ai::ReportInferenceRequest {
+        auth: gpu_node.identity.auth("unused", &empty_body_hash()),
+        assignment_id: assignment.assignment_id.clone(),
+        job_id: ai_job.job_id.clone(),
+        batch_start,
+        batch_end,
+        reward_mcu,
+        outputs: vec![hocmesh_ai::PromptOutput {
+            prompt_index: 0,
+            text: answer.into(),
+            output_sha256: hocmesh_protocol::hash_bytes(answer.as_bytes()),
+            duration_ms: 1,
+        }],
+    };
+    report.auth = gpu_node.identity.auth(
+        "report_inference",
+        &hocmesh_ai::report_inference_body_hash(&report)?,
+    );
+    let settled: hocmesh_ai::ReportInferenceResponse =
+        post_json(&http, &coordinator, "/v1/ai/work/result", &report).await?;
+    assert!(settled.accepted);
+    assert_eq!(settled.reward_mcu, inference_price);
+
+    // CPU work paid for GPU work, across the ledger, with nothing minted:
+    // this is the trade the network is for, and it is now enforceable.
+    let gpu_after = balance(&http, &coordinator, &gpu_node).await?.balance_mcu;
+    assert_eq!(gpu_after, gpu_before + inference_price);
+    assert_eq!(
+        balance(&http, &coordinator, &node_a).await?.balance_mcu,
+        spender_before - inference_price
+    );
+    assert_eq!(
+        (spender_after_submit - spender_before) + (gpu_after - gpu_before),
+        0,
+        "an inference job must neither mint nor burn CU"
+    );
+
     for db in &validator_dbs {
         run_ok(
             Command::new(&validator_bin)
@@ -657,6 +812,48 @@ async fn wait_health(http: &Client, port: u16) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     bail!("service on port {port} did not become healthy")
+}
+
+/// A node that can actually answer an inference batch.
+///
+/// The scheduler refuses to place AI work on hardware that never claimed to
+/// have any, so proving the inference economy needs a node that did.
+fn ai_capabilities() -> NodeCapabilities {
+    let mut caps = capabilities();
+    caps.ai_runtime_ready = true;
+    caps.gpus = vec![hocmesh_protocol::GpuCapability {
+        stable_id: "gpu-integration".into(),
+        vendor: "nvidia".into(),
+        name: "test".into(),
+        backend: "cuda".into(),
+        memory_mb: Some(1024),
+        driver_version: None,
+        compute_version: Some("8.0".into()),
+        supports_fp16: true,
+        supports_bf16: true,
+        supports_int8: true,
+        benchmark_bytes_per_second: Some(1),
+        benchmark_p95_micros: Some(1),
+    }];
+    caps.shared_gpu_percent = 100;
+    caps
+}
+
+async fn register_with(
+    http: &Client,
+    coordinator: &str,
+    node: &TestNode,
+    caps: NodeCapabilities,
+) -> Result<()> {
+    let public_key_b64 = node.identity.public_key_b64();
+    let body_hash = register_body_hash(&public_key_b64, &caps)?;
+    let req = RegisterRequest {
+        auth: node.identity.auth("register", &body_hash),
+        public_key_b64,
+        capabilities: caps,
+    };
+    let _: serde_json::Value = post_json(http, coordinator, "/v1/nodes/register", &req).await?;
+    Ok(())
 }
 
 fn capabilities() -> NodeCapabilities {

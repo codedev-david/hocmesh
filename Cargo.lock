@@ -694,6 +694,7 @@ name = "hocmesh-ai"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "hocmesh-core",
  "hocmesh-gpu",
  "hocmesh-model",
  "hocmesh-protocol",
@@ -756,8 +757,11 @@ name = "hocmesh-integration-tests"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "hocmesh-ai",
  "hocmesh-core",
+ "hocmesh-gpu",
  "hocmesh-ledger",
+ "hocmesh-model",
  "hocmesh-protocol",
  "reqwest",
  "serde",

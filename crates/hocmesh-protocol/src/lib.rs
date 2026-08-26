@@ -403,6 +403,113 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
     h.update(bytes);
     hex_lower(&h.finalize())
 }
+/// What an inference job costs, as the requester declares it.
+///
+/// The prompts never reach the ledger: only their digest and their sizes,
+/// which is all a price depends on. A validator can check the bill exactly
+/// without reading anybody's text, and a requester does not have to publish a
+/// private prompt to prove they were charged correctly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceBilling {
+    pub manifest_digest: String,
+    pub parameter_count: u64,
+    pub total_size_bytes: u64,
+    pub prompts_digest: String,
+    pub prompt_bytes: Vec<u64>,
+    pub max_tokens: u32,
+    pub max_cost_mcu: i64,
+}
+
+/// One contiguous run of prompts, and the node that agreed to run it.
+///
+/// Position in the reservation's list is the batch index, so an assignment id
+/// is derivable rather than assignable: a coordinator cannot invent a batch
+/// after the fact and it cannot rename one it already certified.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PricedBatch {
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub node_id: String,
+}
+
+/// A model cannot hold more parameters than its bytes can store.
+///
+/// Four-bit quantisation is the densest thing anyone ships, at half a byte a
+/// parameter, so twice the file size is a hard ceiling. Without it a publisher
+/// could declare a toy model as a frontier one and bill inference on it at a
+/// hundred times what it costs to run - and the file size is the one number in
+/// a manifest that content-addressed chunks already pin down.
+pub fn parameter_count_is_plausible(parameter_count: u64, total_size_bytes: u64) -> bool {
+    parameter_count > 0 && parameter_count <= total_size_bytes.saturating_mul(2)
+}
+
+/// An inference job's id, bound to the nonce its requester signed.
+///
+/// The requester fixes the id, not the coordinator: an id nobody can choose
+/// after the fact is what stops a coordinator quietly re-pointing an escrow.
+pub fn inference_job_id_from_auth(proof: &AuthProof) -> String {
+    format!("ai_{}", &hash_bytes(proof.nonce_b64.as_bytes())[..32])
+}
+
+/// The deterministic id of one batch of an inference job.
+pub fn inference_assignment_id(job_id: &str, index: u32) -> String {
+    format!("aiasg_{}_{}", &hash_bytes(job_id.as_bytes())[..20], index)
+}
+
+pub fn inference_billing_hash(billing: &InferenceBilling) -> Result<String, serde_json::Error> {
+    hash_json(billing)
+}
+
+/// What a requester signs to authorise an inference job.
+///
+/// Split in two so that a validator holding only the billing and a digest of
+/// the settings can recompute it. That is what keeps prompt text off the
+/// ledger while leaving the signature checkable.
+pub fn inference_submit_body_hash(
+    billing_hash: &str,
+    settings_digest: &str,
+) -> Result<String, serde_json::Error> {
+    hash_json(&("inference_submit", billing_hash, settings_digest))
+}
+
+/// What a provider signs to claim one batch.
+pub fn inference_reward_body_hash(
+    assignment_id: &str,
+    job_id: &str,
+    batch_start: u32,
+    batch_end: u32,
+    reward_mcu: i64,
+    outputs_digest: &str,
+) -> Result<String, serde_json::Error> {
+    hash_json(&(
+        "inference_reward",
+        assignment_id,
+        job_id,
+        batch_start,
+        batch_end,
+        reward_mcu,
+        outputs_digest,
+    ))
+}
+
+/// What a requester signs to reclaim one batch nobody delivered.
+pub fn inference_refund_body_hash(
+    assignment_id: &str,
+    job_id: &str,
+    batch_start: u32,
+    batch_end: u32,
+    refund_mcu: i64,
+) -> Result<String, serde_json::Error> {
+    hash_json(&(
+        "inference_refund",
+        assignment_id,
+        job_id,
+        batch_start,
+        batch_end,
+        refund_mcu,
+    ))
+}
+
 pub fn hash_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
     Ok(hash_bytes(&serde_json::to_vec(value)?))
 }

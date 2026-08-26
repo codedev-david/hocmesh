@@ -2525,7 +2525,7 @@ Laptop ─────┐
 Gaming PC ──┤
 Mac Studio ─┤
 Server ─────┤
-Workstation ┼──► GLOBAL COMPUTE MESH
+Workstation ┼──► THE hocMESH NETWORK
 Home Lab ───┤
 Linux Box ──┤
 GPU Rig ────┘

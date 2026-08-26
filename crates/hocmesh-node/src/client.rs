@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
 use hocmesh_ai::{
     FailInferenceRequest, FailInferenceResponse, InferenceJobStatus, PlanRequest, PlanResponse,
-    PollInferenceRequest, PollInferenceResponse, RegisterModelRequest, RegisterModelResponse,
-    ReportInferenceRequest, ReportInferenceResponse, SubmitInferenceRequest,
-    SubmitInferenceResponse, fail_inference_body_hash, plan_body_hash, register_model_body_hash,
-    report_inference_body_hash, submit_inference_body_hash,
+    PollInferenceRequest, PollInferenceResponse, RefundInferenceRequest, RefundInferenceResponse,
+    RegisterModelRequest, RegisterModelResponse, ReportInferenceRequest, ReportInferenceResponse,
+    SubmitInferenceRequest, SubmitInferenceResponse, fail_inference_body_hash, plan_body_hash,
+    register_model_body_hash, report_inference_body_hash, submit_inference_body_hash,
 };
 use hocmesh_core::identity::NodeIdentity;
 use hocmesh_model::ModelManifest;
@@ -180,14 +180,31 @@ impl HocMeshClient {
         self.post("/v1/ai/work/poll", &request).await
     }
 
+    /// Fetch a published manifest so a requester can price its own job.
+    ///
+    /// The requester needs the parameter count and the digest to write a bill,
+    /// and it has to get them from the published manifest rather than from
+    /// whoever is about to be paid.
+    pub async fn get_model(&self, model_id: &str, revision: &str) -> Result<ModelManifest> {
+        self.get(&format!("/v1/ai/models/{model_id}/{revision}"))
+            .await
+    }
     pub async fn report_inference(
         &self,
         assignment_id: String,
+        job_id: String,
+        batch_start: u32,
+        batch_end: u32,
+        reward_mcu: i64,
         outputs: Vec<hocmesh_ai::PromptOutput>,
     ) -> Result<ReportInferenceResponse> {
         let mut request = ReportInferenceRequest {
             auth: self.identity.auth("unused", &empty_body_hash()),
             assignment_id,
+            job_id,
+            batch_start,
+            batch_end,
+            reward_mcu,
             outputs,
         };
         let body_hash = report_inference_body_hash(&request)?;
@@ -222,6 +239,37 @@ impl HocMeshClient {
 
     pub async fn inference_status(&self, job_id: &str) -> Result<InferenceJobStatus> {
         self.get(&format!("/v1/ai/jobs/{job_id}")).await
+    }
+
+    /// Takes back the escrow on every batch of an inference job the mesh let
+    /// lapse.
+    ///
+    /// The coordinator says which batches lapsed and what they were priced at,
+    /// but it is not believed: the requester signs each claim itself, and the
+    /// ledger re-derives the amount from the billing it certified at reserve
+    /// time before any CU moves.
+    pub async fn reclaim_inference(&self, job_id: &str) -> Result<Vec<RefundInferenceResponse>> {
+        let job = self.inference_status(job_id).await?;
+        let mut reclaimed = Vec::new();
+        for batch in job.refundable {
+            let body_hash = hocmesh_protocol::inference_refund_body_hash(
+                &batch.assignment_id,
+                job_id,
+                batch.batch_start,
+                batch.batch_end,
+                batch.refund_mcu,
+            )?;
+            let req = RefundInferenceRequest {
+                auth: self.identity.auth("refund_inference", &body_hash),
+                job_id: job_id.to_string(),
+                assignment_id: batch.assignment_id,
+                batch_start: batch.batch_start,
+                batch_end: batch.batch_end,
+                refund_mcu: batch.refund_mcu,
+            };
+            reclaimed.push(self.post("/v1/ai/jobs/refund", &req).await?);
+        }
+        Ok(reclaimed)
     }
 
     async fn post<TReq: serde::Serialize + ?Sized, TResp: DeserializeOwned>(

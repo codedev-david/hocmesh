@@ -1,7 +1,7 @@
 use anyhow::{Result, bail, ensure};
 use hocmesh_gpu::{BackendKind, DeviceCapability};
 use hocmesh_model::ModelManifest;
-use hocmesh_protocol::AuthProof;
+use hocmesh_protocol::{AuthProof, InferenceBilling};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,6 +43,7 @@ pub struct SubmitInferenceRequest {
     pub revision: String,
     pub prompts: Vec<String>,
     pub max_tokens: u32,
+    pub billing: InferenceBilling,
     pub temperature_milli: u32,
     pub seed: u64,
     pub requirements: InferenceRequirements,
@@ -136,12 +137,18 @@ impl PromptOutput {
 pub struct ReportInferenceRequest {
     pub auth: AuthProof,
     pub assignment_id: String,
+    pub job_id: String,
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub reward_mcu: i64,
     pub outputs: Vec<PromptOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReportInferenceResponse {
     pub accepted: bool,
+    pub reward_mcu: i64,
+    pub balance_mcu: i64,
     pub job_completed: bool,
 }
 
@@ -165,6 +172,21 @@ pub struct InferenceJobStatus {
     pub total_assignments: u32,
     pub completed_assignments: u32,
     pub outputs: Vec<PromptOutput>,
+    pub refundable: Vec<RefundableBatch>,
+}
+
+/// A batch nobody delivered, and what its escrow is worth back.
+///
+/// The requester cannot price a batch it never saw assigned, so the
+/// coordinator lists what is reclaimable - but it lists the amount the
+/// assignment already committed to, and the ledger recomputes that amount
+/// from the certified billing before it moves anything.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefundableBatch {
+    pub assignment_id: String,
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub refund_mcu: i64,
 }
 
 pub fn register_model_body_hash(manifest: &ModelManifest) -> Result<String, serde_json::Error> {
@@ -181,14 +203,30 @@ pub fn plan_body_hash(request: &PlanRequest) -> Result<String, serde_json::Error
     ))
 }
 
+/// What a requester signs to ask for inference.
+///
+/// The prompts are not in it. Their digest and their sizes are, carried in
+/// the billing, and those are what decide the price - so the ledger can hold
+/// a signature it can still check without ever holding the prompt text.
 pub fn submit_inference_body_hash(
+    request: &SubmitInferenceRequest,
+) -> Result<String, serde_json::Error> {
+    let billing = hocmesh_protocol::inference_billing_hash(&request.billing)?;
+    let settings = inference_settings_digest(request)?;
+    hocmesh_protocol::inference_submit_body_hash(&billing, &settings)
+}
+
+/// Everything about an inference request except what it costs.
+///
+/// Kept separate from the billing so a validator can check the signature while
+/// holding only a digest of these settings - it has no business knowing which
+/// model or seed somebody chose, but it does have to know the bill was signed.
+pub fn inference_settings_digest(
     request: &SubmitInferenceRequest,
 ) -> Result<String, serde_json::Error> {
     hocmesh_protocol::hash_json(&(
         &request.model_id,
         &request.revision,
-        &request.prompts,
-        request.max_tokens,
         request.temperature_milli,
         request.seed,
         &request.requirements,
@@ -196,10 +234,108 @@ pub fn submit_inference_body_hash(
     ))
 }
 
+/// The sizes a bill is computed from, one entry per prompt.
+pub fn prompt_bytes(prompts: &[String]) -> Vec<u64> {
+    prompts.iter().map(|p| p.len() as u64).collect()
+}
+
+/// A digest that binds a bill to the exact prompts it was written for,
+/// without putting any of them on the ledger.
+pub fn prompts_digest(prompts: &[String]) -> Result<String, serde_json::Error> {
+    hocmesh_protocol::hash_json(&prompts)
+}
+
+/// Write the bill a requester signs for a set of prompts.
+///
+/// The requester computes its own price rather than being told one: the whole
+/// point of a closed-form cost is that nobody has to take the coordinator at
+/// its word. `max_cost_mcu` is the ceiling the requester consents to, so the
+/// price is agreed in the same round trip that asks for the work.
+pub fn bill_for_prompts(
+    manifest_digest: &str,
+    parameter_count: u64,
+    total_size_bytes: u64,
+    prompts: &[String],
+    max_tokens: u32,
+) -> Result<InferenceBilling, serde_json::Error> {
+    let bytes = prompt_bytes(prompts);
+    let cost = hocmesh_core::compute::inference_cost_mcu(&bytes, max_tokens, parameter_count);
+    Ok(InferenceBilling {
+        manifest_digest: manifest_digest.to_string(),
+        parameter_count,
+        total_size_bytes,
+        prompts_digest: prompts_digest(prompts)?,
+        prompt_bytes: bytes,
+        max_tokens,
+        max_cost_mcu: cost,
+    })
+}
+
+/// What a provider should claim for the batch it was handed.
+///
+/// Derived from the assignment itself rather than from anything the
+/// coordinator says the batch is worth. The provider signs this number, so it
+/// had better be one the provider worked out - and because the price is closed
+/// form, the number it arrives at is the same one the ledger will check.
+pub fn assignment_claim(assignment: &InferenceAssignment) -> Option<(u32, u32, i64)> {
+    let first = assignment.prompts.first()?.0;
+    let last = assignment.prompts.last()?.0;
+    let parameter_count = assignment.manifest.parameter_count?;
+    let bytes: Vec<u64> = assignment
+        .prompts
+        .iter()
+        .map(|(_, prompt)| prompt.len() as u64)
+        .collect();
+    let reward =
+        hocmesh_core::compute::inference_cost_mcu(&bytes, assignment.max_tokens, parameter_count);
+    Some((first, last + 1, reward))
+}
+/// What a provider signs to claim one batch.
+///
+/// The coordinator only relays this. The provider signs the amount, the
+/// batch, and a digest of what it produced, so a coordinator cannot inflate a
+/// reward or move one onto a different batch after the fact.
 pub fn report_inference_body_hash(
     request: &ReportInferenceRequest,
 ) -> Result<String, serde_json::Error> {
-    hocmesh_protocol::hash_json(&(&request.assignment_id, &request.outputs))
+    hocmesh_protocol::inference_reward_body_hash(
+        &request.assignment_id,
+        &request.job_id,
+        request.batch_start,
+        request.batch_end,
+        request.reward_mcu,
+        &hocmesh_protocol::hash_json(&request.outputs)?,
+    )
+}
+
+/// A requester reclaiming the escrow on a batch nobody delivered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundInferenceRequest {
+    pub auth: AuthProof,
+    pub job_id: String,
+    pub assignment_id: String,
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub refund_mcu: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefundInferenceResponse {
+    pub refunded_mcu: i64,
+    pub balance_mcu: i64,
+}
+
+/// What a requester signs to reclaim one batch.
+pub fn refund_inference_body_hash(
+    request: &RefundInferenceRequest,
+) -> Result<String, serde_json::Error> {
+    hocmesh_protocol::inference_refund_body_hash(
+        &request.assignment_id,
+        &request.job_id,
+        request.batch_start,
+        request.batch_end,
+        request.refund_mcu,
+    )
 }
 
 pub fn fail_inference_body_hash(
@@ -553,6 +689,10 @@ mod tests {
         }
     }
 
+    fn billing() -> InferenceBilling {
+        bill_for_prompts("digest", 1_000, 500, &["hello".into()], 1).unwrap()
+    }
+
     #[test]
     fn scheduler_accounts_for_latency_and_cache_locality() {
         let ranked = rank_candidates(
@@ -631,6 +771,7 @@ mod tests {
                 ..requirements()
             },
             layer_count: 1,
+            billing: billing(),
         };
         valid.validate().unwrap();
         let mut invalid = valid.clone();

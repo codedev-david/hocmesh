@@ -6,6 +6,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, bail};
+use hocmesh_protocol::{InferenceBilling, PricedBatch};
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub struct LedgerStore {
@@ -13,6 +14,14 @@ pub struct LedgerStore {
 }
 
 type ReservationRecord = (hocmesh_protocol::WorkSpec, u32, bool, Option<String>, i64);
+/// What the ledger remembers about a certified inference job.
+#[derive(Debug, Clone)]
+pub struct InferenceReservation {
+    pub billing: InferenceBilling,
+    pub batches: Vec<PricedBatch>,
+    pub requester: String,
+    pub reserved_at: i64,
+}
 
 fn sqlite_sequence(sequence: u64) -> Result<i64> {
     i64::try_from(sequence).context("ledger sequence exceeds SQLite INTEGER range")
@@ -64,6 +73,14 @@ impl LedgerStore {
                 system_funded INTEGER NOT NULL,
                 requester_node_id TEXT,
                 reserved_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS inference_reservations(
+                job_id TEXT PRIMARY KEY,
+                sequence INTEGER NOT NULL,
+                billing_json TEXT NOT NULL,
+                batches_json TEXT NOT NULL,
+                requester_node_id TEXT NOT NULL,
+                reserved_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS assignment_rewards(
                 assignment_id TEXT PRIMARY KEY,
@@ -164,6 +181,34 @@ impl LedgerStore {
             .optional()?
             .is_some())
     }
+    /// The certified facts about an inference job: what it was billed for and
+    /// which batch the coordinator promised to whom.
+    pub fn inference_reservation(&self, job_id: &str) -> Result<Option<InferenceReservation>> {
+        self.conn
+            .query_row(
+                "SELECT billing_json,batches_json,requester_node_id,reserved_at FROM inference_reservations WHERE job_id=?1",
+                params![job_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(billing, batches, requester, reserved_at)| {
+                Ok(InferenceReservation {
+                    billing: serde_json::from_str(&billing)?,
+                    batches: serde_json::from_str(&batches)?,
+                    requester,
+                    reserved_at,
+                })
+            })
+            .transpose()
+    }
+
     pub fn reservation(&self, job_id: &str) -> Result<Option<ReservationRecord>> {
         self.conn
             .query_row(
@@ -287,6 +332,7 @@ impl LedgerStore {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM account_activity", [])?;
         tx.execute("DELETE FROM job_reservations", [])?;
+        tx.execute("DELETE FROM inference_reservations", [])?;
         tx.execute("DELETE FROM assignment_rewards", [])?;
         for cert in &certs {
             index_certificate(&tx, cert)?;
@@ -303,6 +349,10 @@ impl LedgerStore {
         let mut reservations = std::collections::HashMap::<
             String,
             (hocmesh_protocol::WorkSpec, u32, bool, Option<String>, i64),
+        >::new();
+        let mut inference = std::collections::HashMap::<
+            String,
+            (InferenceBilling, Vec<PricedBatch>, String, i64),
         >::new();
         for c in certs {
             verify_certificate(&c, set)?;
@@ -357,6 +407,89 @@ impl LedgerStore {
                         .is_some()
                     {
                         bail!("duplicate community job reservation: {job_id}")
+                    }
+                }
+                TransactionEvidence::InferenceReserve(e) => {
+                    if inference
+                        .insert(
+                            e.job_id.clone(),
+                            (
+                                e.billing.clone(),
+                                e.batches.clone(),
+                                e.requester_auth.node_id.clone(),
+                                c.entry.transaction.created_at,
+                            ),
+                        )
+                        .is_some()
+                    {
+                        bail!("duplicate inference reservation: {}", e.job_id)
+                    }
+                }
+                TransactionEvidence::InferenceReward(e) => {
+                    let Some((billing, batches, requester, reserved_at)) = inference.get(&e.job_id)
+                    else {
+                        bail!(
+                            "inference reward references missing reservation: {}",
+                            e.job_id
+                        )
+                    };
+                    // The batch has to be one the coordinator certified, at
+                    // the index its own assignment id names. Anything else is
+                    // a batch invented after the escrow was funded.
+                    let Some(index) = (0..batches.len() as u32).find(|i| {
+                        hocmesh_protocol::inference_assignment_id(&e.job_id, *i) == e.assignment_id
+                    }) else {
+                        bail!("inference reward names a batch that was never certified")
+                    };
+                    let batch = &batches[index as usize];
+                    if batch.batch_start != e.batch_start || batch.batch_end != e.batch_end {
+                        bail!("inference reward changes the bounds of the batch it claims")
+                    }
+                    if batch.node_id != e.provider_auth.node_id {
+                        bail!("inference reward paid to a node the batch was not assigned to")
+                    }
+                    if requester == &e.provider_auth.node_id {
+                        bail!("requester cannot receive reward from its own paid job")
+                    }
+                    if inference_batch_price(billing, e.batch_start, e.batch_end) != e.reward_mcu {
+                        bail!("inference reward is not what the batch prices at")
+                    }
+                    // A reward and a refund for one batch are disjoint in
+                    // time, exactly as they are for a prime shard.
+                    if c.entry.transaction.created_at
+                        > reserved_at + hocmesh_protocol::SETTLEMENT_WINDOW_SECS
+                    {
+                        bail!("inference reward arrived after the settlement window")
+                    }
+                }
+                TransactionEvidence::InferenceRefund(e) => {
+                    let Some((billing, batches, requester, reserved_at)) = inference.get(&e.job_id)
+                    else {
+                        bail!(
+                            "inference refund references missing reservation: {}",
+                            e.job_id
+                        )
+                    };
+                    let Some(index) = (0..batches.len() as u32).find(|i| {
+                        hocmesh_protocol::inference_assignment_id(&e.job_id, *i) == e.assignment_id
+                    }) else {
+                        bail!("inference refund names a batch that was never certified")
+                    };
+                    let batch = &batches[index as usize];
+                    if batch.batch_start != e.batch_start || batch.batch_end != e.batch_end {
+                        bail!("inference refund changes the bounds of the batch it reclaims")
+                    }
+                    // The escrow goes back where it came from.
+                    if requester != &e.requester_auth.node_id {
+                        bail!("inference refund pays someone other than the requester")
+                    }
+                    if inference_batch_price(billing, e.batch_start, e.batch_end) != e.refund_mcu {
+                        bail!("inference refund is not what the batch prices at")
+                    }
+                    if c.entry.transaction.created_at
+                        <= reserved_at + hocmesh_protocol::SETTLEMENT_WINDOW_SECS
+                    {
+                        bail!("inference refund inside the settlement window")
                     }
                 }
                 TransactionEvidence::ProviderReward(e) => {
@@ -445,6 +578,20 @@ impl LedgerStore {
     }
 }
 
+/// What one batch of a certified inference job is worth.
+///
+/// Derived from the billing every time rather than trusted from the claim: the
+/// price of a batch is a fact about the signed request, not something a
+/// provider or a coordinator gets to assert.
+fn inference_batch_price(billing: &InferenceBilling, start: u32, end: u32) -> i64 {
+    hocmesh_core::compute::inference_batch_cost_mcu(
+        &billing.prompt_bytes,
+        start,
+        end,
+        billing.max_tokens,
+        billing.parameter_count,
+    )
+}
 fn index_certificate(tx: &rusqlite::Transaction<'_>, cert: &QuorumCertificate) -> Result<()> {
     let sequence = sqlite_sequence(cert.entry.sequence)?;
     for (posting_index, posting) in cert.entry.transaction.postings.iter().enumerate() {
@@ -492,6 +639,38 @@ fn index_certificate(tx: &rusqlite::Transaction<'_>, cert: &QuorumCertificate) -
                     cert.entry.transaction.created_at,
                 ],
             )?;
+        }
+        TransactionEvidence::InferenceReserve(e) => {
+            tx.execute(
+                "INSERT OR REPLACE INTO inference_reservations(job_id,sequence,billing_json,batches_json,requester_node_id,reserved_at)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    e.job_id,
+                    sequence,
+                    serde_json::to_string(&e.billing)?,
+                    serde_json::to_string(&e.batches)?,
+                    e.requester_auth.node_id,
+                    cert.entry.transaction.created_at,
+                ],
+            )?;
+        }
+        TransactionEvidence::InferenceReward(e) => {
+            tx.execute(
+                "INSERT OR REPLACE INTO assignment_rewards(assignment_id,sequence,job_id,provider_node_id,reward_mcu,system_funded)
+                 VALUES(?1,?2,?3,?4,?5,0)",
+                params![
+                    e.assignment_id,
+                    sequence,
+                    e.job_id,
+                    e.provider_auth.node_id,
+                    e.reward_mcu,
+                ],
+            )?;
+        }
+        TransactionEvidence::InferenceRefund(_) => {
+            // Nothing to index, for the same reason a shard refund indexes
+            // nothing: the claim key is already recorded and the escrow it
+            // empties is visible in the postings.
         }
         TransactionEvidence::ProviderReward(e) => {
             tx.execute(

@@ -8,7 +8,10 @@ publish = false
 
 [dev-dependencies]
 anyhow.workspace = true
+hocmesh-ai = { path = "../hocmesh-ai" }
 hocmesh-core = { path = "../hocmesh-core" }
+hocmesh-gpu = { path = "../hocmesh-gpu" }
+hocmesh-model = { path = "../hocmesh-model" }
 hocmesh-ledger = { path = "../hocmesh-ledger" }
 hocmesh-protocol = { path = "../hocmesh-protocol" }
 reqwest.workspace = true

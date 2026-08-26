@@ -103,6 +103,50 @@ pub fn work_cost_mcu(work: &WorkSpec) -> i64 {
     mcu.max(1).min(i64::MAX as u64) as i64
 }
 
+/// Bytes of prompt text that count as one token.
+///
+/// A tokeniser lives inside the model, so a coordinator cannot run one and a
+/// validator cannot either. Four bytes a token is the standard rule of thumb
+/// for English, and using it keeps the price a pure function of the request.
+pub const BYTES_PER_TOKEN: u64 = 4;
+
+/// Price an inference batch from the request alone.
+///
+/// A forward pass costs about two operations per parameter per token, and the
+/// job asks for `max_tokens` on top of whatever the prompt already holds. That
+/// is the whole formula, and every term of it is in the signed request, so the
+/// price does not depend on which machine answers or how long it took.
+///
+/// Priced against `REFERENCE_OPS_PER_MCU` like every other workload, which is
+/// what lets a CPU that counted primes pay for a GPU that ran a model.
+pub fn inference_cost_mcu(prompt_bytes: &[u64], max_tokens: u32, parameter_count: u64) -> i64 {
+    let tokens = prompt_bytes.iter().fold(0_u64, |sum, bytes| {
+        sum.saturating_add(bytes.div_ceil(BYTES_PER_TOKEN))
+            .saturating_add(u64::from(max_tokens))
+    });
+    let ops = tokens.saturating_mul(parameter_count).saturating_mul(2);
+    ops.div_ceil(REFERENCE_OPS_PER_MCU)
+        .max(1)
+        .min(i64::MAX as u64) as i64
+}
+
+/// The slice of a job's prompts one batch is responsible for.
+///
+/// Batches partition the prompt list, so batch prices sum to the job price
+/// exactly - which is what lets an escrow drain to zero with nothing stranded
+/// and nothing conjured.
+pub fn inference_batch_cost_mcu(
+    prompt_bytes: &[u64],
+    batch_start: u32,
+    batch_end: u32,
+    max_tokens: u32,
+    parameter_count: u64,
+) -> i64 {
+    let lo = (batch_start as usize).min(prompt_bytes.len());
+    let hi = (batch_end as usize).clamp(lo, prompt_bytes.len());
+    inference_cost_mcu(&prompt_bytes[lo..hi], max_tokens, parameter_count)
+}
+
 pub fn split_work(work: &WorkSpec, shards: u32) -> Vec<WorkSpec> {
     let shards = shards.max(1);
     match work {

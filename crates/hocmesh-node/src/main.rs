@@ -159,6 +159,10 @@ enum Command {
     AiJob {
         job_id: String,
     },
+    /// Take back the escrow on batches of your AI job that nobody delivered.
+    AiReclaim {
+        job_id: String,
+    },
     SubmitPrime {
         #[arg(long)]
         start: u64,
@@ -552,6 +556,24 @@ stored at: {}",
             client
                 .register(&hardware::detect_capabilities(false))
                 .await?;
+            // The requester prices its own job from the published manifest, and
+            // signs that price. Nothing downstream gets to raise it.
+            let manifest = client.get_model(&model_id, &revision).await?;
+            let digest = manifest.digest()?;
+            let parameter_count = manifest.parameter_count.ok_or_else(|| {
+                anyhow::anyhow!("model does not declare a parameter count, so it cannot be priced")
+            })?;
+            let billing = hocmesh_ai::bill_for_prompts(
+                &digest,
+                parameter_count,
+                manifest.total_size_bytes,
+                &prompt,
+                max_tokens,
+            )?;
+            println!(
+                "job priced at {:.3} CU",
+                billing.max_cost_mcu as f64 / 1000.0
+            );
             let request = SubmitInferenceRequest {
                 auth: hocmesh_protocol::AuthProof {
                     node_id: String::new(),
@@ -575,6 +597,7 @@ stored at: {}",
                 max_tokens,
                 temperature_milli,
                 seed,
+                billing,
                 layer_count: layers,
             };
             let response = client.submit_inference(request).await?;
@@ -589,6 +612,21 @@ stored at: {}",
         Command::AiJob { job_id } => {
             let status = client.inference_status(&job_id).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Command::AiReclaim { job_id } => {
+            let refunds = client.reclaim_inference(&job_id).await?;
+            if refunds.is_empty() {
+                println!(
+                    "Nothing to reclaim: every batch of {job_id} either settled or is still inside its window."
+                );
+            }
+            for r in &refunds {
+                println!(
+                    "Returned {:.3} CU - balance now {:.3} CU",
+                    r.refunded_mcu as f64 / 1000.0,
+                    r.balance_mcu as f64 / 1000.0
+                );
+            }
         }
         Command::SubmitPrime { start, end, shards } => {
             let r = client

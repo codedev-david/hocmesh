@@ -189,9 +189,24 @@ async fn ai_worker_loop(client: HocMeshClient, config: AiWorkerConfig, poll_ms: 
             continue;
         };
         let assignment_id = assignment.assignment_id.clone();
+        let job_id = assignment.job_id.clone();
+        // The provider prices its own batch. It signs the amount, so it is the
+        // one party that must not be taking somebody else's word for it.
+        let Some((batch_start, batch_end, reward_mcu)) = hocmesh_ai::assignment_claim(&assignment)
+        else {
+            tracing::warn!(%assignment_id, "assignment cannot be priced; skipping");
+            continue;
+        };
         match execute_inference_assignment(&config, assignment).await {
             Ok(outputs) => match client
-                .report_inference(assignment_id.clone(), outputs)
+                .report_inference(
+                    assignment_id.clone(),
+                    job_id,
+                    batch_start,
+                    batch_end,
+                    reward_mcu,
+                    outputs,
+                )
                 .await
             {
                 Ok(response) => {

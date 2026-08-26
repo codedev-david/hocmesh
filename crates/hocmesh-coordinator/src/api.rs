@@ -7,10 +7,11 @@ use axum::{
 use hocmesh_ai::{
     FailInferenceRequest, FailInferenceResponse, InferenceAssignment, InferenceJobStatus,
     NodeProfile, PlanRequest, PlanResponse, PollInferenceRequest, PollInferenceResponse,
-    PromptOutput, RegisterModelRequest, RegisterModelResponse, ReportInferenceRequest,
-    ReportInferenceResponse, SubmitInferenceRequest, SubmitInferenceResponse,
-    fail_inference_body_hash, plan_body_hash, plan_parallelism, rank_candidates,
-    register_model_body_hash, report_inference_body_hash, submit_inference_body_hash,
+    PromptOutput, RefundInferenceRequest, RefundInferenceResponse, RegisterModelRequest,
+    RegisterModelResponse, ReportInferenceRequest, ReportInferenceResponse, SubmitInferenceRequest,
+    SubmitInferenceResponse, fail_inference_body_hash, inference_settings_digest, plan_body_hash,
+    plan_parallelism, rank_candidates, refund_inference_body_hash, register_model_body_hash,
+    report_inference_body_hash, submit_inference_body_hash,
 };
 use hocmesh_core::compute::{split_work, work_cost_mcu};
 use hocmesh_core::proximity;
@@ -20,8 +21,9 @@ use hocmesh_gpu::{BackendKind, DeviceCapability};
 use hocmesh_ledger::{
     network::LedgerNetwork,
     types::{
-        COMMUNITY_ISSUANCE_ACCOUNT, JobRefundEvidence, JobReserveEvidence, LedgerTransaction,
-        Posting, ProviderRewardEvidence, TransactionEvidence, TransactionKind, escrow_account,
+        COMMUNITY_ISSUANCE_ACCOUNT, InferenceRefundEvidence, InferenceReserveEvidence,
+        InferenceRewardEvidence, JobRefundEvidence, JobReserveEvidence, LedgerTransaction, Posting,
+        ProviderRewardEvidence, TransactionEvidence, TransactionKind, escrow_account,
     },
     validate::claim_key,
 };
@@ -29,14 +31,15 @@ use hocmesh_model::ModelManifest;
 use hocmesh_protocol::{
     BalanceResponse, DEFAULT_LEASE_SECONDS, HeartbeatRequest, JobStatusResponse, NetworkCoordinate,
     NetworkStatsResponse, NodeCapabilities, NodeStatusResponse, PeerSample, PeerSampleResponse,
-    PollRequest, PollResponse, RefundRequest, RefundResponse, RefundableShard, RegisterRequest,
-    RegisterResponse, ResultRequest, ResultResponse, SETTLEMENT_WINDOW_SECS, SubmitJobRequest,
-    SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, empty_body_hash, heartbeat_body_hash,
-    job_id_from_auth, now_unix, refund_body_hash, register_body_hash, result_body_hash,
-    submit_body_hash, verify_auth,
+    PollRequest, PollResponse, PricedBatch, RefundRequest, RefundResponse, RefundableShard,
+    RegisterRequest, RegisterResponse, ResultRequest, ResultResponse, SETTLEMENT_WINDOW_SECS,
+    SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, empty_body_hash,
+    heartbeat_body_hash, job_id_from_auth, now_unix, refund_body_hash, register_body_hash,
+    result_body_hash, submit_body_hash, verify_auth,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -69,6 +72,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/ai/models/{model}/{revision}", get(get_model))
         .route("/v1/ai/plan", post(plan_ai))
         .route("/v1/ai/jobs/submit", post(submit_inference))
+        .route("/v1/ai/jobs/refund", post(refund_inference))
         .route("/v1/ai/jobs/{id}", get(inference_status))
         .route("/v1/ai/work/poll", post(poll_inference))
         .route("/v1/ai/work/result", post(report_inference))
@@ -256,54 +260,247 @@ async fn submit_inference(
     req.validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let body_hash = submit_inference_body_hash(&req).map_err(ApiError::internal)?;
-    let mut conn = state.db.lock().map_err(ApiError::internal)?;
-    authenticate_known_node(&conn, &req.auth, "submit_inference", &body_hash)?;
-    let (manifest, nodes, seed_peers) =
-        ai_context(&conn, &req.auth.node_id, &req.model_id, &req.revision)?;
-    let digest = manifest.digest().map_err(ApiError::internal)?;
-    let candidates = rank_candidates(&manifest, &req.requirements, &nodes, &Default::default());
-    if candidates.is_empty() {
-        return Err(ApiError::conflict("no eligible AI devices are online"));
+    // The requester fixes the job id, not the coordinator. An id nobody can
+    // choose after the fact is what stops an escrow being re-pointed later.
+    let job_id = hocmesh_protocol::inference_job_id_from_auth(&req.auth);
+    let (manifest, digest, plan, seed_peers, requester_pk, total_cost_mcu) = {
+        let conn = state.db.lock().map_err(ApiError::internal)?;
+        authenticate_known_node(&conn, &req.auth, "submit_inference", &body_hash)?;
+        let (manifest, nodes, seed_peers) =
+            ai_context(&conn, &req.auth.node_id, &req.model_id, &req.revision)?;
+        let digest = manifest.digest().map_err(ApiError::internal)?;
+        let total_cost_mcu = check_inference_bill(&req, &manifest, &digest)?;
+        let candidates = rank_candidates(&manifest, &req.requirements, &nodes, &Default::default());
+        if candidates.is_empty() {
+            return Err(ApiError::conflict("no eligible AI devices are online"));
+        }
+        let plan = plan_parallelism(&candidates, req.layer_count, &req.requirements)
+            .map_err(|error| ApiError::conflict(error.to_string()))?;
+        let requester_pk = conn
+            .query_row(
+                "SELECT public_key_b64 FROM nodes WHERE node_id=?1",
+                params![req.auth.node_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(ApiError::internal)?;
+        (
+            manifest,
+            digest,
+            plan,
+            seed_peers,
+            requester_pk,
+            total_cost_mcu,
+        )
+    };
+    // Inference is paid for out of the same balance, priced against the same
+    // constant as CPU work. That is the whole point of the unit: a machine that
+    // counted primes overnight can spend what it earned on somebody else's GPU.
+    let bal = authoritative_balance(&state, &req.auth.node_id).await?;
+    if bal.balance_mcu < total_cost_mcu {
+        return Err(ApiError::conflict(format!(
+            "insufficient compute credit: need {:.3} CU, have {:.3} CU; contribute first",
+            total_cost_mcu as f64 / 1000.0,
+            bal.balance_mcu as f64 / 1000.0
+        )));
     }
-    let plan = plan_parallelism(&candidates, req.layer_count, &req.requirements)
-        .map_err(|error| ApiError::conflict(error.to_string()))?;
-    let job_id = format!("ai_{}", Uuid::new_v4().simple());
-    let transaction = conn.transaction().map_err(ApiError::internal)?;
-    transaction.execute(
-        "INSERT INTO ai_jobs(job_id,requester_node_id,request_json,plan_json,manifest_digest,status,created_at)
-         VALUES(?1,?2,?3,?4,?5,'pending',?6)",
-        params![job_id, req.auth.node_id, serde_json::to_string(&req).map_err(ApiError::internal)?,
-            serde_json::to_string(&plan).map_err(ApiError::internal)?, digest, now_unix()],
-    ).map_err(ApiError::internal)?;
-    for (index, batch) in plan.batches.iter().enumerate() {
-        let prompts = (batch.batch_start..batch.batch_end)
-            .map(|prompt_index| (prompt_index, req.prompts[prompt_index as usize].clone()))
-            .collect();
-        let assignment = InferenceAssignment {
-            assignment_id: format!("aiasg_{}_{}", &job_id[3..19], index),
+    // The batch plan is certified with the escrow. Which machines are online is
+    // not a fact a validator can reproduce, so who was promised what has to be
+    // part of what gets signed rather than something recomputed later.
+    let batches: Vec<PricedBatch> = plan
+        .batches
+        .iter()
+        .map(|b| PricedBatch {
+            batch_start: b.batch_start,
+            batch_end: b.batch_end,
+            node_id: b.node_id.clone(),
+        })
+        .collect();
+    let settings_digest = inference_settings_digest(&req).map_err(ApiError::internal)?;
+    // One timestamp for the escrow and for the local row. The settlement window
+    // is measured from the certified reservation, so the coordinator must not
+    // hold a different idea of when the job started.
+    let now = now_unix();
+    let ledger_tx = state.ledger.as_ref().map(|_| LedgerTransaction {
+        transaction_id: format!("reserve_{job_id}"),
+        kind: TransactionKind::InferenceReserve,
+        postings: vec![
+            Posting {
+                account_id: req.auth.node_id.clone(),
+                delta_mcu: -total_cost_mcu,
+            },
+            Posting {
+                account_id: escrow_account(&job_id),
+                delta_mcu: total_cost_mcu,
+            },
+        ],
+        evidence: TransactionEvidence::InferenceReserve(InferenceReserveEvidence {
             job_id: job_id.clone(),
-            manifest: manifest.clone(),
-            seed_peers: seed_peers.clone(),
-            prompts,
-            max_tokens: req.max_tokens,
-            temperature_milli: req.temperature_milli,
-            seed: req.seed,
-            device_id: batch.device_id.clone(),
-            lease_seconds: DEFAULT_LEASE_SECONDS,
-        };
+            requester_public_key_b64: requester_pk.clone(),
+            requester_auth: req.auth.clone(),
+            billing: req.billing.clone(),
+            settings_digest: settings_digest.clone(),
+            batches,
+        }),
+        created_at: now,
+    });
+    let ready = ledger_tx.is_none();
+    {
+        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let transaction = conn.transaction().map_err(ApiError::internal)?;
         transaction.execute(
-            "INSERT INTO ai_assignments(assignment_id,job_id,assigned_node_id,assignment_json,status)
-             VALUES(?1,?2,?3,?4,'pending')",
-            params![assignment.assignment_id, job_id, batch.node_id, serde_json::to_string(&assignment).map_err(ApiError::internal)?],
+            "INSERT INTO ai_jobs(job_id,requester_node_id,request_json,plan_json,manifest_digest,status,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![job_id, req.auth.node_id, serde_json::to_string(&req).map_err(ApiError::internal)?,
+                serde_json::to_string(&plan).map_err(ApiError::internal)?, digest,
+                if ready { "pending" } else { "funding" }, now],
         ).map_err(ApiError::internal)?;
+        if ready {
+            apply_ledger_delta(
+                &transaction,
+                &req.auth.node_id,
+                -total_cost_mcu,
+                "inference_reservation",
+                Some(&job_id),
+                None,
+            )?;
+        }
+        for (index, batch) in plan.batches.iter().enumerate() {
+            let prompts = (batch.batch_start..batch.batch_end)
+                .map(|prompt_index| (prompt_index, req.prompts[prompt_index as usize].clone()))
+                .collect();
+            let assignment = InferenceAssignment {
+                assignment_id: hocmesh_protocol::inference_assignment_id(&job_id, index as u32),
+                job_id: job_id.clone(),
+                manifest: manifest.clone(),
+                seed_peers: seed_peers.clone(),
+                prompts,
+                max_tokens: req.max_tokens,
+                temperature_milli: req.temperature_milli,
+                seed: req.seed,
+                device_id: batch.device_id.clone(),
+                lease_seconds: DEFAULT_LEASE_SECONDS,
+            };
+            transaction.execute(
+                "INSERT INTO ai_assignments(assignment_id,job_id,assigned_node_id,assignment_json,status)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![assignment.assignment_id, job_id, batch.node_id,
+                    serde_json::to_string(&assignment).map_err(ApiError::internal)?,
+                    if ready { "pending" } else { "blocked" }],
+            ).map_err(ApiError::internal)?;
+        }
+        if let Some(tx_record) = &ledger_tx {
+            crate::db::persist_ledger_intent(
+                &transaction,
+                &claim_key(tx_record),
+                "inference_reserve",
+                &job_id,
+                &serde_json::to_string(tx_record).map_err(ApiError::internal)?,
+            )
+            .map_err(ApiError::internal)?;
+        }
+        transaction.commit().map_err(ApiError::internal)?;
     }
-    transaction.commit().map_err(ApiError::internal)?;
+    if let (Some(ledger), Some(tx_record)) = (&state.ledger, ledger_tx) {
+        let ck = claim_key(&tx_record);
+        let cert = ledger.transact(tx_record).await.map_err(|e| {
+            ApiError::conflict(format!(
+                "inference funding pending recovery after ledger error: {e}"
+            ))
+        })?;
+        finalize_inference_reservation(&state, &job_id, &ck, &cert.entry.entry_hash)?;
+    }
     Ok(Json(SubmitInferenceResponse {
         job_id,
         manifest_digest: digest,
         assignments: plan.batches.len() as u32,
         plan,
     }))
+}
+
+/// Check the bill a requester signed against the request it arrived with.
+///
+/// A signature over a cheap bill is worthless if the prompts sent alongside it
+/// are expensive ones, so every term the price depends on is compared with what
+/// actually turned up. The coordinator is not trusted to price the job - it is
+/// only checking that the requester priced the job it really sent.
+fn check_inference_bill(
+    req: &SubmitInferenceRequest,
+    manifest: &ModelManifest,
+    digest: &str,
+) -> Result<i64, ApiError> {
+    let billing = &req.billing;
+    if billing.manifest_digest != digest {
+        return Err(ApiError::bad_request(
+            "the bill was written for a different model revision",
+        ));
+    }
+    let Some(parameter_count) = manifest.parameter_count else {
+        return Err(ApiError::bad_request(
+            "a model that does not declare its parameter count cannot be priced",
+        ));
+    };
+    if billing.parameter_count != parameter_count
+        || billing.total_size_bytes != manifest.total_size_bytes
+    {
+        return Err(ApiError::bad_request(
+            "the bill does not match the model it names",
+        ));
+    }
+    // A publisher that overstates a model size could overcharge every requester
+    // and pay itself as the provider. Four-bit weights are the densest thing
+    // anyone ships, so twice the file size is a hard ceiling on the parameters.
+    if !hocmesh_protocol::parameter_count_is_plausible(
+        billing.parameter_count,
+        billing.total_size_bytes,
+    ) {
+        return Err(ApiError::bad_request(
+            "declared parameter count does not fit the bytes of the model",
+        ));
+    }
+    if billing.max_tokens != req.max_tokens
+        || billing.prompt_bytes != hocmesh_ai::prompt_bytes(&req.prompts)
+        || billing.prompts_digest
+            != hocmesh_ai::prompts_digest(&req.prompts).map_err(ApiError::internal)?
+    {
+        return Err(ApiError::bad_request(
+            "the bill was written for different prompts",
+        ));
+    }
+    let cost = hocmesh_core::compute::inference_cost_mcu(
+        &billing.prompt_bytes,
+        billing.max_tokens,
+        billing.parameter_count,
+    );
+    if cost > billing.max_cost_mcu {
+        return Err(ApiError::bad_request(
+            "inference costs more than the requester authorised",
+        ));
+    }
+    Ok(cost)
+}
+
+/// Unblock an inference job once its escrow is certified.
+fn finalize_inference_reservation(
+    state: &AppState,
+    job_id: &str,
+    claim: &str,
+    entry_hash: &str,
+) -> Result<(), ApiError> {
+    let mut conn = state.db.lock().map_err(ApiError::internal)?;
+    let tx = conn.transaction().map_err(ApiError::internal)?;
+    crate::db::certify_ledger_intent(&tx, claim, entry_hash).map_err(ApiError::internal)?;
+    tx.execute(
+        "UPDATE ai_jobs SET status=?2 WHERE job_id=?1 AND status=?3",
+        params![job_id, "pending", "funding"],
+    )
+    .map_err(ApiError::internal)?;
+    tx.execute(
+        "UPDATE ai_assignments SET status=?2 WHERE job_id=?1 AND status=?3",
+        params![job_id, "pending", "blocked"],
+    )
+    .map_err(ApiError::internal)?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(())
 }
 
 async fn poll_inference(
@@ -346,58 +543,289 @@ async fn report_inference(
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
     }
     let body_hash = report_inference_body_hash(&req).map_err(ApiError::internal)?;
-    let mut conn = state.db.lock().map_err(ApiError::internal)?;
-    authenticate_known_node(&conn, &req.auth, "report_inference", &body_hash)?;
-    let row: Option<(String, String, String)> = conn.query_row(
-        "SELECT job_id,assignment_json,status FROM ai_assignments WHERE assignment_id=?1 AND assigned_node_id=?2",
-        params![req.assignment_id, req.auth.node_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    ).optional().map_err(ApiError::internal)?;
-    let Some((job_id, assignment_json, status)) = row else {
-        return Err(ApiError::not_found("AI assignment not found"));
-    };
-    if status != "leased" {
-        return Err(ApiError::conflict(
-            "AI assignment is not leased to this node",
-        ));
-    }
-    let assignment: InferenceAssignment =
-        serde_json::from_str(&assignment_json).map_err(ApiError::internal)?;
-    let expected: std::collections::BTreeSet<_> =
-        assignment.prompts.iter().map(|(index, _)| *index).collect();
-    let actual: std::collections::BTreeSet<_> = req
-        .outputs
-        .iter()
-        .map(|output| output.prompt_index)
-        .collect();
-    if actual != expected || actual.len() != req.outputs.len() {
-        return Err(ApiError::conflict(
-            "output indexes do not match the assignment",
-        ));
-    }
-    let transaction = conn.transaction().map_err(ApiError::internal)?;
-    transaction.execute(
-        "UPDATE ai_assignments SET status='completed',outputs_json=?2,lease_until=NULL,completed_at=?3 WHERE assignment_id=?1",
-        params![req.assignment_id, serde_json::to_string(&req.outputs).map_err(ApiError::internal)?, now_unix()],
-    ).map_err(ApiError::internal)?;
-    let remaining: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM ai_assignments WHERE job_id=?1 AND status!='completed'",
-            params![job_id],
-            |row| row.get(0),
-        )
-        .map_err(ApiError::internal)?;
-    if remaining == 0 {
-        transaction
-            .execute(
-                "UPDATE ai_jobs SET status='completed',completed_at=?2 WHERE job_id=?1",
-                params![job_id, now_unix()],
+    let (job_id, provider_pk) = {
+        let conn = state.db.lock().map_err(ApiError::internal)?;
+        authenticate_known_node(&conn, &req.auth, "report_inference", &body_hash)?;
+        let row: Option<(String, String, String)> = conn.query_row(
+            "SELECT job_id,assignment_json,status FROM ai_assignments WHERE assignment_id=?1 AND assigned_node_id=?2",
+            params![req.assignment_id, req.auth.node_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(ApiError::internal)?;
+        let Some((job_id, assignment_json, status)) = row else {
+            return Err(ApiError::not_found("AI assignment not found"));
+        };
+        if status != "leased" {
+            return Err(ApiError::conflict(
+                "AI assignment is not leased to this node",
+            ));
+        }
+        let assignment: InferenceAssignment =
+            serde_json::from_str(&assignment_json).map_err(ApiError::internal)?;
+        let expected: std::collections::BTreeSet<_> =
+            assignment.prompts.iter().map(|(index, _)| *index).collect();
+        let actual: std::collections::BTreeSet<_> = req
+            .outputs
+            .iter()
+            .map(|output| output.prompt_index)
+            .collect();
+        if actual != expected || actual.len() != req.outputs.len() {
+            return Err(ApiError::conflict(
+                "output indexes do not match the assignment",
+            ));
+        }
+        // The claim a provider signed has to be the claim its own assignment
+        // implies: it cannot ask for more than the batch prices at, and it
+        // cannot move the claim onto a batch it was never given.
+        let Some((batch_start, batch_end, reward_mcu)) = hocmesh_ai::assignment_claim(&assignment)
+        else {
+            return Err(ApiError::conflict(
+                "this assignment carries no priceable batch",
+            ));
+        };
+        if req.job_id != job_id
+            || req.batch_start != batch_start
+            || req.batch_end != batch_end
+            || req.reward_mcu != reward_mcu
+        {
+            return Err(ApiError::conflict(
+                "the signed claim does not match the assignment it names",
+            ));
+        }
+        let requester: String = conn
+            .query_row(
+                "SELECT requester_node_id FROM ai_jobs WHERE job_id=?1",
+                params![job_id],
+                |row| row.get(0),
             )
             .map_err(ApiError::internal)?;
+        if requester == req.auth.node_id {
+            return Err(ApiError::conflict(
+                "requester cannot receive a reward from its own paid job",
+            ));
+        }
+        let provider_pk: String = conn
+            .query_row(
+                "SELECT public_key_b64 FROM nodes WHERE node_id=?1",
+                params![req.auth.node_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(ApiError::internal)?;
+        (job_id, provider_pk)
+    };
+    // Only a digest of the answer reaches the ledger. Whether the answer was
+    // any good is the requester judgement, and the requester is the party out
+    // of pocket if it was not - but what the provider returned is still bound
+    // to what it was paid for.
+    let outputs_digest = hocmesh_protocol::hash_json(&req.outputs).map_err(ApiError::internal)?;
+    let ledger_tx = state.ledger.as_ref().map(|_| LedgerTransaction {
+        transaction_id: format!("reward_{}", req.assignment_id),
+        kind: TransactionKind::InferenceReward,
+        postings: vec![
+            Posting {
+                account_id: escrow_account(&job_id),
+                delta_mcu: -req.reward_mcu,
+            },
+            Posting {
+                account_id: req.auth.node_id.clone(),
+                delta_mcu: req.reward_mcu,
+            },
+        ],
+        evidence: TransactionEvidence::InferenceReward(InferenceRewardEvidence {
+            job_id: job_id.clone(),
+            assignment_id: req.assignment_id.clone(),
+            batch_start: req.batch_start,
+            batch_end: req.batch_end,
+            reward_mcu: req.reward_mcu,
+            outputs_digest,
+            provider_public_key_b64: provider_pk,
+            provider_auth: req.auth.clone(),
+        }),
+        created_at: now_unix(),
+    });
+    // The ledger decides before the coordinator writes anything down. A local
+    // row marked completed and then refused certification would strand a batch
+    // nobody can claim or reclaim.
+    if let (Some(ledger), Some(tx_record)) = (&state.ledger, ledger_tx) {
+        ledger.transact(tx_record).await.map_err(|e| {
+            ApiError::conflict(format!("inference reward rejected by the ledger: {e}"))
+        })?;
     }
-    transaction.commit().map_err(ApiError::internal)?;
+    let job_completed = {
+        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let transaction = conn.transaction().map_err(ApiError::internal)?;
+        transaction.execute(
+        "UPDATE ai_assignments SET status=?4,outputs_json=?2,lease_until=NULL,completed_at=?3 WHERE assignment_id=?1",
+        params![req.assignment_id, serde_json::to_string(&req.outputs).map_err(ApiError::internal)?, now_unix(), "completed"],
+    ).map_err(ApiError::internal)?;
+        if state.ledger.is_none() {
+            apply_ledger_delta(
+                &transaction,
+                &req.auth.node_id,
+                req.reward_mcu,
+                "inference_reward",
+                Some(&job_id),
+                Some(&req.assignment_id),
+            )?;
+        }
+        let remaining: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM ai_assignments WHERE job_id=?1 AND status!=?2",
+                params![job_id, "completed"],
+                |row| row.get(0),
+            )
+            .map_err(ApiError::internal)?;
+        if remaining == 0 {
+            transaction
+                .execute(
+                    "UPDATE ai_jobs SET status=?3,completed_at=?2 WHERE job_id=?1",
+                    params![job_id, now_unix(), "completed"],
+                )
+                .map_err(ApiError::internal)?;
+        }
+        transaction.commit().map_err(ApiError::internal)?;
+        remaining == 0
+    };
+    let balance = authoritative_balance(&state, &req.auth.node_id).await?;
+    cache_balance(&state, &req.auth.node_id, balance.balance_mcu)?;
     Ok(Json(ReportInferenceResponse {
         accepted: true,
-        job_completed: remaining == 0,
+        reward_mcu: req.reward_mcu,
+        balance_mcu: balance.balance_mcu,
+        job_completed,
+    }))
+}
+
+/// Take back the escrow on a batch nobody delivered.
+///
+/// Without this an escrow is a one-way valve: a provider that crashes or never
+/// answers takes the CU that funded it with it. The refund shares a claim key
+/// with the reward, so a batch settles exactly once and in one direction.
+async fn refund_inference(
+    State(state): State<AppState>,
+    Json(req): Json<RefundInferenceRequest>,
+) -> Result<Json<RefundInferenceResponse>, ApiError> {
+    let body_hash = refund_inference_body_hash(&req).map_err(ApiError::internal)?;
+    let (requester_pk, reserved_at) = {
+        let conn = state.db.lock().map_err(ApiError::internal)?;
+        authenticate_known_node(&conn, &req.auth, "refund_inference", &body_hash)?;
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT requester_node_id,created_at FROM ai_jobs WHERE job_id=?1",
+                params![req.job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(ApiError::internal)?;
+        let Some((requester, reserved_at)) = row else {
+            return Err(ApiError::not_found("AI job not found"));
+        };
+        // The escrow returns where it came from, never to whoever asks.
+        if requester != req.auth.node_id {
+            return Err(ApiError::unauthorized(
+                "only the requester who reserved a job can reclaim its escrow",
+            ));
+        }
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT assignment_json,status FROM ai_assignments WHERE assignment_id=?1 AND job_id=?2",
+                params![req.assignment_id, req.job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(ApiError::internal)?;
+        let Some((assignment_json, status)) = row else {
+            return Err(ApiError::not_found("AI assignment not found"));
+        };
+        if status == "completed" || status == "refunded" {
+            return Err(ApiError::conflict("this batch has already settled"));
+        }
+        let assignment: InferenceAssignment =
+            serde_json::from_str(&assignment_json).map_err(ApiError::internal)?;
+        let Some((batch_start, batch_end, amount)) = hocmesh_ai::assignment_claim(&assignment)
+        else {
+            return Err(ApiError::conflict(
+                "this assignment carries no priceable batch",
+            ));
+        };
+        // A refund is priced exactly like the reward it replaces, so the escrow
+        // drains to zero either way and nothing is stranded or conjured.
+        if req.batch_start != batch_start || req.batch_end != batch_end || req.refund_mcu != amount
+        {
+            return Err(ApiError::conflict(
+                "the signed refund does not match the batch it names",
+            ));
+        }
+        let requester_pk: String = conn
+            .query_row(
+                "SELECT public_key_b64 FROM nodes WHERE node_id=?1",
+                params![req.auth.node_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(ApiError::internal)?;
+        (requester_pk, reserved_at)
+    };
+    // Reward and refund windows are disjoint, so a provider and a requester can
+    // never race for the same escrow.
+    let now = now_unix();
+    if now <= reserved_at + SETTLEMENT_WINDOW_SECS {
+        return Err(ApiError::conflict(
+            "this batch is still inside its settlement window",
+        ));
+    }
+    let ledger_tx = state.ledger.as_ref().map(|_| LedgerTransaction {
+        transaction_id: format!("refund_{}", req.assignment_id),
+        kind: TransactionKind::InferenceRefund,
+        postings: vec![
+            Posting {
+                account_id: escrow_account(&req.job_id),
+                delta_mcu: -req.refund_mcu,
+            },
+            Posting {
+                account_id: req.auth.node_id.clone(),
+                delta_mcu: req.refund_mcu,
+            },
+        ],
+        evidence: TransactionEvidence::InferenceRefund(InferenceRefundEvidence {
+            job_id: req.job_id.clone(),
+            assignment_id: req.assignment_id.clone(),
+            batch_start: req.batch_start,
+            batch_end: req.batch_end,
+            refund_mcu: req.refund_mcu,
+            requester_public_key_b64: requester_pk,
+            requester_auth: req.auth.clone(),
+        }),
+        created_at: now,
+    });
+    if let (Some(ledger), Some(tx_record)) = (&state.ledger, ledger_tx) {
+        ledger.transact(tx_record).await.map_err(|e| {
+            ApiError::conflict(format!("inference refund rejected by the ledger: {e}"))
+        })?;
+    }
+    {
+        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let transaction = conn.transaction().map_err(ApiError::internal)?;
+        transaction
+            .execute(
+                "UPDATE ai_assignments SET status=?2,lease_until=NULL WHERE assignment_id=?1",
+                params![req.assignment_id, "refunded"],
+            )
+            .map_err(ApiError::internal)?;
+        if state.ledger.is_none() {
+            apply_ledger_delta(
+                &transaction,
+                &req.auth.node_id,
+                req.refund_mcu,
+                "inference_refund",
+                Some(&req.job_id),
+                Some(&req.assignment_id),
+            )?;
+        }
+        transaction.commit().map_err(ApiError::internal)?;
+    }
+    let balance = authoritative_balance(&state, &req.auth.node_id).await?;
+    cache_balance(&state, &req.auth.node_id, balance.balance_mcu)?;
+    Ok(Json(RefundInferenceResponse {
+        refunded_mcu: req.refund_mcu,
+        balance_mcu: balance.balance_mcu,
     }))
 }
 
@@ -490,13 +918,66 @@ async fn inference_status(
         );
     }
     outputs.sort_by_key(|output| output.prompt_index);
+    let refundable = refundable_batches(&conn, &job_id)?;
     Ok(Json(InferenceJobStatus {
         job_id,
         status,
         total_assignments: total as u32,
         completed_assignments: completed as u32,
         outputs,
+        refundable,
     }))
+}
+
+/// Batches whose settlement window has closed with nothing delivered.
+///
+/// Listed, not settled: the coordinator is telling the requester what it can
+/// go and claim, and every number here is re-derived by the ledger from the
+/// certified billing before any CU moves. A batch already paid or already
+/// reclaimed never appears, because its claim key is spent.
+fn refundable_batches(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<Vec<hocmesh_ai::RefundableBatch>, ApiError> {
+    let reserved_at: Option<i64> = conn
+        .query_row(
+            "SELECT created_at FROM ai_jobs WHERE job_id=?1 AND status<>'funding'",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    let Some(reserved_at) = reserved_at else {
+        return Ok(Vec::new());
+    };
+    if now_unix() <= reserved_at + SETTLEMENT_WINDOW_SECS {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT assignment_json FROM ai_assignments WHERE job_id=?1 AND status NOT IN ('completed','refunded','blocked')",
+        )
+        .map_err(ApiError::internal)?;
+    let rows = statement
+        .query_map(params![job_id], |row| row.get::<_, String>(0))
+        .map_err(ApiError::internal)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let assignment: InferenceAssignment =
+            serde_json::from_str(&row.map_err(ApiError::internal)?).map_err(ApiError::internal)?;
+        if let Some((batch_start, batch_end, refund_mcu)) =
+            hocmesh_ai::assignment_claim(&assignment)
+        {
+            out.push(hocmesh_ai::RefundableBatch {
+                assignment_id: assignment.assignment_id,
+                batch_start,
+                batch_end,
+                refund_mcu,
+            });
+        }
+    }
+    out.sort_by_key(|batch| batch.batch_start);
+    Ok(out)
 }
 
 fn ai_context(
@@ -1690,6 +2171,15 @@ mod ai_api_tests {
         register_test_node(&base, &requester, test_capabilities(false, 0)).await;
         register_test_node(&base, &worker_a, test_capabilities(true, 1_000)).await;
         register_test_node(&base, &worker_b, test_capabilities(true, 2_000)).await;
+        // Inference is bought, not free: the requester has to be holding CU
+        // before it can reserve a job, exactly like any other workload.
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE balances SET balance_mcu=?2 WHERE node_id=?1",
+                params![requester.node_id(), 1_000_000i64],
+            )
+            .unwrap();
 
         let manifest = ModelManifest {
             schema_version: 1,
@@ -1733,6 +2223,14 @@ mod ai_api_tests {
                 tensor_parallelism: 1,
             },
             layer_count: 2,
+            billing: hocmesh_ai::bill_for_prompts(
+                &manifest.digest().unwrap(),
+                1,
+                1,
+                &["hello".into()],
+                4,
+            )
+            .unwrap(),
         };
         submit.auth = requester.auth(
             "submit_inference",
@@ -1772,9 +2270,15 @@ mod ai_api_tests {
             output_sha256: hocmesh_protocol::hash_bytes(b"world"),
             duration_ms: 1,
         };
+        let (batch_start, batch_end, reward_mcu) =
+            hocmesh_ai::assignment_claim(&assignment).unwrap();
         let mut report = ReportInferenceRequest {
             auth: worker_b.auth("unused", &empty_body_hash()),
             assignment_id: assignment.assignment_id,
+            job_id: submitted.job_id.clone(),
+            batch_start,
+            batch_end,
+            reward_mcu,
             outputs: vec![output.clone()],
         };
         report.auth = worker_b.auth(
@@ -1873,6 +2377,403 @@ mod ai_api_tests {
 
     /// Refusals are half of what a refund endpoint promises, so this reads
     /// the status and the reason rather than unwrapping its way past them.
+    /// Contributing a GPU has to earn what using one costs.
+    ///
+    /// Inference used to run entirely outside the ledger: a provider burned
+    /// real electricity and earned nothing, a requester consumed somebody
+    /// else's hardware and paid nothing. That made the whole point of the
+    /// network - trade my idle GPU for your idle GPU - unenforceable. This
+    /// test walks one job end to end and checks the CU actually moved, in the
+    /// right amounts, and that nobody can move more than the request priced.
+    #[tokio::test]
+    async fn an_inference_job_is_bought_and_paid_for() {
+        let root = std::env::temp_dir().join(format!("hocmesh-ai-econ-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("coordinator.db");
+        let state = AppState {
+            db: Arc::new(Mutex::new(
+                crate::db::open(db_path.to_str().unwrap()).unwrap(),
+            )),
+            ledger: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let base = format!("http://{address}");
+        let requester = NodeIdentity::load_or_create(&root.join("requester")).unwrap();
+        let provider = NodeIdentity::load_or_create(&root.join("provider")).unwrap();
+        register_test_node(&base, &requester, test_capabilities(false, 0)).await;
+        register_test_node(&base, &provider, test_capabilities(true, 1_000)).await;
+
+        // A 7B model is not cheap: one prompt runs into six figures of CU.
+        let opening_mcu = 1_000_000_000i64;
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE balances SET balance_mcu=?2 WHERE node_id=?1",
+                params![requester.node_id(), opening_mcu],
+            )
+            .unwrap();
+
+        let manifest = ModelManifest {
+            schema_version: 1,
+            model_id: "priced".into(),
+            revision: "v1".into(),
+            format: ModelFormat::Gguf,
+            architecture: "llama".into(),
+            parameter_count: Some(7_000_000_000),
+            tensor_dtype: Some("q4".into()),
+            total_size_bytes: 4_000_000_000,
+            chunks: vec![ChunkRef {
+                index: 0,
+                sha256: sha256(b"weights"),
+                size_bytes: 4_000_000_000,
+            }],
+            metadata: Default::default(),
+        };
+        let hash = register_model_body_hash(&manifest).unwrap();
+        let publish = RegisterModelRequest {
+            auth: requester.auth("register_model", &hash),
+            manifest: manifest.clone(),
+        };
+        let _: RegisterModelResponse = post(&base, "/v1/ai/models/register", &publish).await;
+
+        // The requester prices its own job from the published manifest.
+        let digest = manifest.digest().unwrap();
+        let prompts = vec!["explain compute units".to_string()];
+        let billing = hocmesh_ai::bill_for_prompts(
+            &digest,
+            manifest.parameter_count.unwrap(),
+            manifest.total_size_bytes,
+            &prompts,
+            64,
+        )
+        .unwrap();
+        let price = billing.max_cost_mcu;
+        assert!(price > 0, "a real model must cost real CU");
+
+        let mut submit = SubmitInferenceRequest {
+            auth: requester.auth("unused", &empty_body_hash()),
+            model_id: "priced".into(),
+            revision: "v1".into(),
+            prompts: prompts.clone(),
+            max_tokens: 64,
+            temperature_milli: 0,
+            seed: 7,
+            requirements: InferenceRequirements {
+                required_backends: [BackendKind::Cuda].into_iter().collect(),
+                minimum_memory_bytes: 1,
+                needs_fp16: true,
+                needs_bf16: false,
+                needs_int8: false,
+                batch_size: 1,
+                pipeline_stages: 1,
+                tensor_parallelism: 1,
+            },
+            layer_count: 2,
+            billing: billing.clone(),
+        };
+        submit.auth = requester.auth(
+            "submit_inference",
+            &submit_inference_body_hash(&submit).unwrap(),
+        );
+        let submitted: SubmitInferenceResponse = post(&base, "/v1/ai/jobs/submit", &submit).await;
+
+        // Escrow is funded out of the requester, to the exact number it signed.
+        let after_submit = read_balance(&db_path, &requester.node_id());
+        assert_eq!(after_submit, opening_mcu - price);
+
+        let poll = PollInferenceRequest {
+            auth: provider.auth("poll_inference", &empty_body_hash()),
+        };
+        let leased: PollInferenceResponse = post(&base, "/v1/ai/work/poll", &poll).await;
+        let assignment = leased.assignment.unwrap();
+        let (batch_start, batch_end, reward_mcu) =
+            hocmesh_ai::assignment_claim(&assignment).unwrap();
+
+        // One batch covers the whole job here, so it is worth the whole price:
+        // batch prices tile the job exactly, with nothing stranded in escrow.
+        assert_eq!(reward_mcu, price);
+
+        let output = PromptOutput {
+            prompt_index: 0,
+            text: "a unit of machine work".into(),
+            output_sha256: hocmesh_protocol::hash_bytes(b"a unit of machine work"),
+            duration_ms: 1,
+        };
+
+        // A provider that signs for more than its batch is worth is refused.
+        // The price is closed form from the request, so the coordinator does
+        // not have to take the claim on faith.
+        let mut greedy = ReportInferenceRequest {
+            auth: provider.auth("unused", &empty_body_hash()),
+            assignment_id: assignment.assignment_id.clone(),
+            job_id: submitted.job_id.clone(),
+            batch_start,
+            batch_end,
+            reward_mcu: reward_mcu * 10,
+            outputs: vec![output.clone()],
+        };
+        greedy.auth = provider.auth(
+            "report_inference",
+            &report_inference_body_hash(&greedy).unwrap(),
+        );
+        let (status, body) = post_raw(&base, "/v1/ai/work/result", &greedy).await;
+        assert_eq!(status, 409, "inflated reward accepted: {body}");
+
+        // The honest claim settles.
+        let mut report = ReportInferenceRequest {
+            auth: provider.auth("unused", &empty_body_hash()),
+            assignment_id: assignment.assignment_id.clone(),
+            job_id: submitted.job_id.clone(),
+            batch_start,
+            batch_end,
+            reward_mcu,
+            outputs: vec![output.clone()],
+        };
+        report.auth = provider.auth(
+            "report_inference",
+            &report_inference_body_hash(&report).unwrap(),
+        );
+        let paid: ReportInferenceResponse = post(&base, "/v1/ai/work/result", &report).await;
+        assert_eq!(paid.reward_mcu, price);
+
+        // The GPU earned exactly what the requester spent. Nothing was minted
+        // and nothing evaporated: this is the trade the whole network is for.
+        let provider_balance = read_balance(&db_path, &provider.node_id());
+        let requester_balance = read_balance(&db_path, &requester.node_id());
+        assert_eq!(provider_balance, price);
+        assert_eq!(requester_balance, opening_mcu - price);
+        assert_eq!(
+            (requester_balance - opening_mcu) + provider_balance,
+            0,
+            "CU was created or destroyed by an inference job"
+        );
+
+        // Paid once, paid never again. Re-signed with a fresh nonce so the
+        // replay guard cannot answer for the settlement rule: what refuses the
+        // second payment is the batch itself already being settled.
+        report.auth = provider.auth(
+            "report_inference",
+            &report_inference_body_hash(&report).unwrap(),
+        );
+        let (status, body) = post_raw(&base, "/v1/ai/work/result", &report).await;
+        assert_eq!(status, 409, "batch paid twice: {body}");
+        assert_eq!(read_balance(&db_path, &provider.node_id()), price);
+
+        server.abort();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Escrow that can only pay out is a one-way valve.
+    ///
+    /// A GPU that takes a batch and never answers would otherwise keep the CU
+    /// that funded it locked away forever, and a requester would learn to
+    /// never submit a second job. The refund is the other direction, and it
+    /// shares a claim key with the reward so a batch settles exactly once.
+    #[tokio::test]
+    async fn an_undelivered_batch_returns_its_escrow() {
+        let root = std::env::temp_dir().join(format!("hocmesh-ai-refund-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("coordinator.db");
+        let state = AppState {
+            db: Arc::new(Mutex::new(
+                crate::db::open(db_path.to_str().unwrap()).unwrap(),
+            )),
+            ledger: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let base = format!("http://{address}");
+        let requester = NodeIdentity::load_or_create(&root.join("requester")).unwrap();
+        let provider = NodeIdentity::load_or_create(&root.join("provider")).unwrap();
+        register_test_node(&base, &requester, test_capabilities(false, 0)).await;
+        register_test_node(&base, &provider, test_capabilities(true, 1_000)).await;
+
+        let opening_mcu = 1_000_000_000i64;
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE balances SET balance_mcu=?2 WHERE node_id=?1",
+                params![requester.node_id(), opening_mcu],
+            )
+            .unwrap();
+
+        let manifest = ModelManifest {
+            schema_version: 1,
+            model_id: "priced".into(),
+            revision: "v1".into(),
+            format: ModelFormat::Gguf,
+            architecture: "llama".into(),
+            parameter_count: Some(7_000_000_000),
+            tensor_dtype: Some("q4".into()),
+            total_size_bytes: 4_000_000_000,
+            chunks: vec![ChunkRef {
+                index: 0,
+                sha256: sha256(b"weights"),
+                size_bytes: 4_000_000_000,
+            }],
+            metadata: Default::default(),
+        };
+        let hash = register_model_body_hash(&manifest).unwrap();
+        let publish = RegisterModelRequest {
+            auth: requester.auth("register_model", &hash),
+            manifest: manifest.clone(),
+        };
+        let _: RegisterModelResponse = post(&base, "/v1/ai/models/register", &publish).await;
+
+        let prompts = vec!["never answered".to_string()];
+        let billing = hocmesh_ai::bill_for_prompts(
+            &manifest.digest().unwrap(),
+            manifest.parameter_count.unwrap(),
+            manifest.total_size_bytes,
+            &prompts,
+            64,
+        )
+        .unwrap();
+        let price = billing.max_cost_mcu;
+
+        let mut submit = SubmitInferenceRequest {
+            auth: requester.auth("unused", &empty_body_hash()),
+            model_id: "priced".into(),
+            revision: "v1".into(),
+            prompts: prompts.clone(),
+            max_tokens: 64,
+            temperature_milli: 0,
+            seed: 7,
+            requirements: InferenceRequirements {
+                required_backends: [BackendKind::Cuda].into_iter().collect(),
+                minimum_memory_bytes: 1,
+                needs_fp16: true,
+                needs_bf16: false,
+                needs_int8: false,
+                batch_size: 1,
+                pipeline_stages: 1,
+                tensor_parallelism: 1,
+            },
+            layer_count: 2,
+            billing: billing.clone(),
+        };
+        submit.auth = requester.auth(
+            "submit_inference",
+            &submit_inference_body_hash(&submit).unwrap(),
+        );
+        let submitted: SubmitInferenceResponse = post(&base, "/v1/ai/jobs/submit", &submit).await;
+        assert_eq!(
+            read_balance(&db_path, &requester.node_id()),
+            opening_mcu - price
+        );
+
+        // The provider takes the batch and is never heard from again.
+        let poll = PollInferenceRequest {
+            auth: provider.auth("poll_inference", &empty_body_hash()),
+        };
+        let leased: PollInferenceResponse = post(&base, "/v1/ai/work/poll", &poll).await;
+        // The lease is taken; what happens next is nothing at all.
+        assert!(leased.assignment.is_some());
+
+        // Inside the window the escrow is the provider's to earn, so there is
+        // nothing to reclaim and the coordinator says so.
+        let fresh: hocmesh_ai::InferenceJobStatus =
+            reqwest::get(format!("{base}/v1/ai/jobs/{}", submitted.job_id))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert!(fresh.refundable.is_empty());
+
+        // Wind the reservation back past its settlement window.
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE ai_jobs SET created_at=?1 WHERE job_id=?2",
+                params![now_unix() - SETTLEMENT_WINDOW_SECS - 1, submitted.job_id],
+            )
+            .unwrap();
+
+        let stale: hocmesh_ai::InferenceJobStatus =
+            reqwest::get(format!("{base}/v1/ai/jobs/{}", submitted.job_id))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(stale.refundable.len(), 1);
+        let batch = stale.refundable[0].clone();
+        assert_eq!(batch.refund_mcu, price);
+
+        let mut refund = RefundInferenceRequest {
+            auth: requester.auth("unused", &empty_body_hash()),
+            job_id: submitted.job_id.clone(),
+            assignment_id: batch.assignment_id.clone(),
+            batch_start: batch.batch_start,
+            batch_end: batch.batch_end,
+            refund_mcu: batch.refund_mcu,
+        };
+
+        // A bystander cannot reclaim somebody else's escrow, even with the
+        // right numbers: the CU goes back where it came from or nowhere.
+        let mut thief = refund.clone();
+        thief.auth = provider.auth(
+            "refund_inference",
+            &refund_inference_body_hash(&thief).unwrap(),
+        );
+        let (status, body) = post_raw(&base, "/v1/ai/jobs/refund", &thief).await;
+        assert_eq!(status, 401, "escrow refunded to a stranger: {body}");
+
+        refund.auth = requester.auth(
+            "refund_inference",
+            &refund_inference_body_hash(&refund).unwrap(),
+        );
+        let returned: RefundInferenceResponse = post(&base, "/v1/ai/jobs/refund", &refund).await;
+        assert_eq!(returned.refunded_mcu, price);
+        assert_eq!(read_balance(&db_path, &requester.node_id()), opening_mcu);
+
+        // Reward and refund share a claim key, so the late provider cannot
+        // race the requester for escrow that has already gone home.
+        let output = PromptOutput {
+            prompt_index: 0,
+            text: "too late".into(),
+            output_sha256: hocmesh_protocol::hash_bytes(b"too late"),
+            duration_ms: 1,
+        };
+        let mut late = ReportInferenceRequest {
+            auth: provider.auth("unused", &empty_body_hash()),
+            assignment_id: batch.assignment_id.clone(),
+            job_id: submitted.job_id.clone(),
+            batch_start: batch.batch_start,
+            batch_end: batch.batch_end,
+            reward_mcu: batch.refund_mcu,
+            outputs: vec![output],
+        };
+        late.auth = provider.auth(
+            "report_inference",
+            &report_inference_body_hash(&late).unwrap(),
+        );
+        let (status, body) = post_raw(&base, "/v1/ai/work/result", &late).await;
+        assert_eq!(status, 409, "refunded batch paid out anyway: {body}");
+        assert_eq!(read_balance(&db_path, &requester.node_id()), opening_mcu);
+        assert_eq!(read_balance(&db_path, &provider.node_id()), 0);
+
+        server.abort();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn read_balance(db_path: &std::path::Path, node_id: &str) -> i64 {
+        Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT balance_mcu FROM balances WHERE node_id=?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     async fn post_raw<T: Serialize + ?Sized>(base: &str, path: &str, body: &T) -> (u16, String) {
         let response = reqwest::Client::new()
             .post(format!("{base}{path}"))

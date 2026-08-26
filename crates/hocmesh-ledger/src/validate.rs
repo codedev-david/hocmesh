@@ -5,7 +5,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hocmesh_core::compute::{split_work, work_cost_mcu};
 use hocmesh_core::verify::{self, AuditNonce};
 use hocmesh_protocol::{
-    hash_json, refund_body_hash, result_body_hash, submit_body_hash, verify_auth_signature,
+    PricedBatch, hash_json, refund_body_hash, result_body_hash, submit_body_hash,
+    verify_auth_signature,
 };
 
 pub fn validate_validator_set(set: &ValidatorSet) -> Result<()> {
@@ -72,6 +73,9 @@ pub fn claim_key(tx: &LedgerTransaction) -> String {
         TransactionEvidence::CommunityReserve { job_id, .. } => format!("reserve:{}", job_id),
         TransactionEvidence::ProviderReward(e) => format!("reward:{}", e.assignment_id),
         TransactionEvidence::JobRefund(e) => format!("reward:{}", e.assignment_id),
+        TransactionEvidence::InferenceReserve(e) => format!("reserve:{}", e.job_id),
+        TransactionEvidence::InferenceReward(e) => format!("reward:{}", e.assignment_id),
+        TransactionEvidence::InferenceRefund(e) => format!("reward:{}", e.assignment_id),
     }
 }
 
@@ -128,6 +132,15 @@ pub fn validate_transaction(
             validate_reward(tx, e, previous_hash)?
         }
         (TransactionKind::JobRefund, TransactionEvidence::JobRefund(e)) => validate_refund(tx, e)?,
+        (TransactionKind::InferenceReserve, TransactionEvidence::InferenceReserve(e)) => {
+            validate_inference_reserve(tx, e)?
+        }
+        (TransactionKind::InferenceReward, TransactionEvidence::InferenceReward(e)) => {
+            validate_inference_reward(tx, e)?
+        }
+        (TransactionKind::InferenceRefund, TransactionEvidence::InferenceRefund(e)) => {
+            validate_inference_refund(tx, e)?
+        }
         _ => bail!("transaction kind/evidence mismatch"),
     }
     Ok(())
@@ -164,6 +177,156 @@ fn validate_reserve(tx: &LedgerTransaction, e: &JobReserveEvidence) -> Result<()
             .any(|p| p.account_id == escrow && p.delta_mcu == cost)
     {
         bail!("job reserve postings do not match authorized workload cost")
+    }
+    Ok(())
+}
+
+/// An inference job's escrow is only as sound as the bill behind it.
+///
+/// Three things have to hold before CU moves: the requester signed this exact
+/// bill, the bill prices out to what is being escrowed, and the batches cover
+/// the prompts once each. The last one is what makes the escrow drain to zero.
+fn validate_inference_reserve(tx: &LedgerTransaction, e: &InferenceReserveEvidence) -> Result<()> {
+    if e.job_id != hocmesh_protocol::inference_job_id_from_auth(&e.requester_auth) {
+        bail!("inference job id is not bound to requester nonce")
+    }
+    if !hocmesh_protocol::parameter_count_is_plausible(
+        e.billing.parameter_count,
+        e.billing.total_size_bytes,
+    ) {
+        bail!("declared parameter count does not fit the model's own bytes")
+    }
+    let billing_hash = hocmesh_protocol::inference_billing_hash(&e.billing)?;
+    let bh = hocmesh_protocol::inference_submit_body_hash(&billing_hash, &e.settings_digest)?;
+    verify_auth_signature(
+        &e.requester_public_key_b64,
+        &e.requester_auth,
+        "submit_inference",
+        &bh,
+    )
+    .map_err(anyhow::Error::msg)?;
+    batches_partition_prompts(&e.batches, e.billing.prompt_bytes.len())?;
+    let cost = hocmesh_core::compute::inference_cost_mcu(
+        &e.billing.prompt_bytes,
+        e.billing.max_tokens,
+        e.billing.parameter_count,
+    );
+    if cost > e.billing.max_cost_mcu {
+        bail!("inference costs more than the requester authorised")
+    }
+    let escrow = escrow_account(&e.job_id);
+    if tx.postings.len() != 2
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == e.requester_auth.node_id && p.delta_mcu == -cost)
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == escrow && p.delta_mcu == cost)
+    {
+        bail!("inference reserve postings do not match the authorised bill")
+    }
+    Ok(())
+}
+
+/// Batches must cover every prompt exactly once, in order, with no gaps.
+///
+/// Gaps strand CU in an escrow nobody can claim; overlaps let two providers
+/// both get paid for the same prompt. Either one breaks the promise that a
+/// job's escrow is exactly the sum of its batches.
+fn batches_partition_prompts(batches: &[PricedBatch], prompts: usize) -> Result<()> {
+    if batches.is_empty() {
+        bail!("an inference job with no batches escrows CU nobody can claim")
+    }
+    let mut cursor = 0_u32;
+    for batch in batches {
+        if batch.batch_start != cursor || batch.batch_end <= batch.batch_start {
+            bail!("inference batches do not tile the prompt list in order")
+        }
+        cursor = batch.batch_end;
+    }
+    if cursor as usize != prompts {
+        bail!("inference batches cover {cursor} prompts but the job has {prompts}")
+    }
+    Ok(())
+}
+
+/// A provider claiming one batch of an inference job.
+///
+/// Inference cannot be re-run by a validator - that is the whole reason it is
+/// worth paying for - so what the ledger checks here is the bill and the
+/// binding, not the answer. Whether the answer was any good is the requester's
+/// judgement, and the requester is the party out of pocket if it was not.
+fn validate_inference_reward(tx: &LedgerTransaction, e: &InferenceRewardEvidence) -> Result<()> {
+    let bh = hocmesh_protocol::inference_reward_body_hash(
+        &e.assignment_id,
+        &e.job_id,
+        e.batch_start,
+        e.batch_end,
+        e.reward_mcu,
+        &e.outputs_digest,
+    )?;
+    verify_auth_signature(
+        &e.provider_public_key_b64,
+        &e.provider_auth,
+        "report_inference",
+        &bh,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if e.reward_mcu <= 0 {
+        bail!("an inference reward must move CU")
+    }
+    let escrow = escrow_account(&e.job_id);
+    if tx.postings.len() != 2
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == escrow && p.delta_mcu == -e.reward_mcu)
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == e.provider_auth.node_id && p.delta_mcu == e.reward_mcu)
+    {
+        bail!("inference reward postings do not match the claimed batch")
+    }
+    Ok(())
+}
+
+/// A requester taking back the escrow on a batch nobody delivered.
+///
+/// The mirror of the reward, down to the claim key, so the two race for one
+/// settlement and exactly one of them wins.
+fn validate_inference_refund(tx: &LedgerTransaction, e: &InferenceRefundEvidence) -> Result<()> {
+    let bh = hocmesh_protocol::inference_refund_body_hash(
+        &e.assignment_id,
+        &e.job_id,
+        e.batch_start,
+        e.batch_end,
+        e.refund_mcu,
+    )?;
+    verify_auth_signature(
+        &e.requester_public_key_b64,
+        &e.requester_auth,
+        "refund_inference",
+        &bh,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if e.refund_mcu <= 0 {
+        bail!("an inference refund must move CU")
+    }
+    let escrow = escrow_account(&e.job_id);
+    if tx.postings.len() != 2
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == escrow && p.delta_mcu == -e.refund_mcu)
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == e.requester_auth.node_id && p.delta_mcu == e.refund_mcu)
+    {
+        bail!("inference refund postings do not match the reclaimed batch")
     }
     Ok(())
 }
@@ -374,6 +537,120 @@ pub fn validate_historical_transaction(
                 bail!("historical refund postings invalid")
             }
         }
+        (TransactionKind::InferenceReserve, TransactionEvidence::InferenceReserve(e)) => {
+            // What an old inference reservation can be checked against, years
+            // later, with nothing but this entry: the job id is the requester's
+            // own nonce, the price is the closed form of the billing it signed,
+            // and the batch plan tiles the prompts it paid for.
+            if e.job_id != hocmesh_protocol::inference_job_id_from_auth(&e.requester_auth) {
+                bail!("historical inference job id is not bound to its requester")
+            }
+            if !hocmesh_protocol::parameter_count_is_plausible(
+                e.billing.parameter_count,
+                e.billing.total_size_bytes,
+            ) {
+                bail!("historical inference billing declares an impossible model")
+            }
+            let cost = hocmesh_core::compute::inference_cost_mcu(
+                &e.billing.prompt_bytes,
+                e.billing.max_tokens,
+                e.billing.parameter_count,
+            );
+            if cost > e.billing.max_cost_mcu {
+                bail!("historical inference reservation exceeded its own ceiling")
+            }
+            batches_partition_prompts(&e.batches, e.billing.prompt_bytes.len())?;
+            let escrow = escrow_account(&e.job_id);
+            if tx.postings.len() != 2
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == e.requester_auth.node_id && p.delta_mcu == -cost)
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == escrow && p.delta_mcu == cost)
+            {
+                bail!("historical inference reserve postings invalid")
+            }
+        }
+        (TransactionKind::InferenceReward, TransactionEvidence::InferenceReward(e)) => {
+            // A batch price needs the prompt sizes, which live in the
+            // reservation, not here - so the cross-binding is the replay's job.
+            // What this entry proves on its own is that the provider signed for
+            // this exact batch of this exact job, and that the CU moved from
+            // that escrow to that provider and nowhere else.
+            if e.job_id == e.provider_auth.node_id {
+                bail!("historical inference reward pays a job id, not a node")
+            }
+            if e.batch_end <= e.batch_start {
+                bail!("historical inference reward claims an empty batch")
+            }
+            if e.reward_mcu <= 0 {
+                bail!("historical inference reward claims a non-positive amount")
+            }
+            let bh = hocmesh_protocol::inference_reward_body_hash(
+                &e.assignment_id,
+                &e.job_id,
+                e.batch_start,
+                e.batch_end,
+                e.reward_mcu,
+                &e.outputs_digest,
+            )?;
+            verify_auth_signature(
+                &e.provider_public_key_b64,
+                &e.provider_auth,
+                "report_inference",
+                &bh,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let source = escrow_account(&e.job_id);
+            if tx.postings.len() != 2
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == source && p.delta_mcu == -e.reward_mcu)
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == e.provider_auth.node_id && p.delta_mcu == e.reward_mcu)
+            {
+                bail!("historical inference reward postings invalid")
+            }
+        }
+        (TransactionKind::InferenceRefund, TransactionEvidence::InferenceRefund(e)) => {
+            // The mirror image, and the reason escrow is not a one-way valve.
+            // The CU goes back to the node that signed for it or nowhere.
+            if e.batch_end <= e.batch_start || e.refund_mcu <= 0 {
+                bail!("historical inference refund claims an empty or empty-valued batch")
+            }
+            let bh = hocmesh_protocol::inference_refund_body_hash(
+                &e.assignment_id,
+                &e.job_id,
+                e.batch_start,
+                e.batch_end,
+                e.refund_mcu,
+            )?;
+            verify_auth_signature(
+                &e.requester_public_key_b64,
+                &e.requester_auth,
+                "refund_inference",
+                &bh,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let source = escrow_account(&e.job_id);
+            if tx.postings.len() != 2
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == source && p.delta_mcu == -e.refund_mcu)
+                || !tx.postings.iter().any(|p| {
+                    p.account_id == e.requester_auth.node_id && p.delta_mcu == e.refund_mcu
+                })
+            {
+                bail!("historical inference refund postings invalid")
+            }
+        }
         _ => bail!("historical transaction kind/evidence mismatch"),
     }
     Ok(())
@@ -566,6 +843,52 @@ pub fn verify_historical_evidence(
         TransactionEvidence::JobRefund(e) => {
             e.work.validate().map_err(anyhow::Error::msg)?;
             refund_payee(e)?;
+        }
+        TransactionEvidence::InferenceReserve(e) => {
+            let billing_hash = hocmesh_protocol::inference_billing_hash(&e.billing)?;
+            let bh =
+                hocmesh_protocol::inference_submit_body_hash(&billing_hash, &e.settings_digest)?;
+            verify_auth_signature(
+                &e.requester_public_key_b64,
+                &e.requester_auth,
+                "submit_inference",
+                &bh,
+            )
+            .map_err(anyhow::Error::msg)?;
+            batches_partition_prompts(&e.batches, e.billing.prompt_bytes.len())?;
+        }
+        TransactionEvidence::InferenceReward(e) => {
+            let bh = hocmesh_protocol::inference_reward_body_hash(
+                &e.assignment_id,
+                &e.job_id,
+                e.batch_start,
+                e.batch_end,
+                e.reward_mcu,
+                &e.outputs_digest,
+            )?;
+            verify_auth_signature(
+                &e.provider_public_key_b64,
+                &e.provider_auth,
+                "report_inference",
+                &bh,
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        TransactionEvidence::InferenceRefund(e) => {
+            let bh = hocmesh_protocol::inference_refund_body_hash(
+                &e.assignment_id,
+                &e.job_id,
+                e.batch_start,
+                e.batch_end,
+                e.refund_mcu,
+            )?;
+            verify_auth_signature(
+                &e.requester_public_key_b64,
+                &e.requester_auth,
+                "refund_inference",
+                &bh,
+            )
+            .map_err(anyhow::Error::msg)?;
         }
     };
     Ok(())

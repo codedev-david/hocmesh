@@ -1,4 +1,4 @@
-use hocmesh_protocol::{AuthProof, WorkResult, WorkSpec};
+use hocmesh_protocol::{AuthProof, InferenceBilling, PricedBatch, WorkResult, WorkSpec};
 use serde::{Deserialize, Serialize};
 
 pub const COMMUNITY_ISSUANCE_ACCOUNT: &str = "hocmesh:community:issuance";
@@ -18,6 +18,9 @@ pub enum TransactionKind {
     CommunityReserve,
     ProviderReward,
     JobRefund,
+    InferenceReserve,
+    InferenceReward,
+    InferenceRefund,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobReserveEvidence {
@@ -58,6 +61,9 @@ pub enum TransactionEvidence {
     },
     ProviderReward(ProviderRewardEvidence),
     JobRefund(JobRefundEvidence),
+    InferenceReserve(InferenceReserveEvidence),
+    InferenceReward(InferenceRewardEvidence),
+    InferenceRefund(InferenceRefundEvidence),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRefundEvidence {
@@ -168,4 +174,52 @@ pub struct CommitResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntriesResponse {
     pub certificates: Vec<QuorumCertificate>,
+}
+
+/// An inference job's escrow, and the batch partition it was certified against.
+///
+/// The plan is fixed here rather than recomputed later: which machines are
+/// online is not a fact a validator can reproduce, so the partition has to be
+/// part of what gets certified. Everything about the *price*, though, is
+/// derivable from the billing alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceReserveEvidence {
+    pub job_id: String,
+    pub requester_public_key_b64: String,
+    pub requester_auth: AuthProof,
+    pub billing: InferenceBilling,
+    pub settings_digest: String,
+    pub batches: Vec<PricedBatch>,
+}
+
+/// One provider's claim on one batch of an inference job.
+///
+/// Only a digest of the outputs is recorded. The ledger is not the place to
+/// publish somebody's generated text, and the digest is enough to bind the
+/// provider to what it actually returned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceRewardEvidence {
+    pub job_id: String,
+    pub assignment_id: String,
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub reward_mcu: i64,
+    pub outputs_digest: String,
+    pub provider_public_key_b64: String,
+    pub provider_auth: AuthProof,
+}
+
+/// A requester taking back the escrow on a batch nobody delivered.
+///
+/// Shares a claim key with the reward for the same batch, so a batch settles
+/// once and in one direction, exactly as a prime shard does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceRefundEvidence {
+    pub job_id: String,
+    pub assignment_id: String,
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub refund_mcu: i64,
+    pub requester_public_key_b64: String,
+    pub requester_auth: AuthProof,
 }

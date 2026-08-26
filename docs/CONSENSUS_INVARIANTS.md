@@ -53,6 +53,78 @@ The model is integer-only on purpose. A price has to be reproduced exactly by
 every validator, and floating point makes no such promise across machines.
 
 
+## Inference
+
+AI is the reason to want this network, and for a long time it was the one
+workload that never touched the ledger: contributing a GPU earned nothing and
+using one cost nothing. These are the rules that made it an economy.
+
+**Priced from the request, against the same constant as everything else.** A
+forward pass costs about two operations per parameter per token, so
+`ops = 2 * parameter_count * tokens`, where
+`tokens = sum over prompts of (bytes / 4 rounded up + max_tokens)`. Divided by
+`REFERENCE_OPS_PER_MCU`, exactly like a prime shard. Four bytes per token is a
+rule of thumb, and it is used deliberately: a real tokeniser lives inside the
+model, so no coordinator and no validator could run one.
+
+Every term is in the signed request, so the price never depends on which
+machine answered, how long it took, or what the model actually emitted. That
+is what lets CU earned counting primes on a CPU pay for tokens generated on
+somebody else's GPU.
+
+**Both sides price their own half.** The requester fetches the published
+manifest, computes the bill itself, and signs it; `max_cost_mcu` is the ceiling
+it consents to. The provider derives `(batch_start, batch_end, reward_mcu)`
+from its own assignment and signs that. Because the formula is closed form,
+both arrive at the number the ledger recomputes. The coordinator relays and
+checks; it is never the authority on what anything costs.
+
+**A model has to be plausible before it can be expensive.** Price scales with
+declared `parameter_count`, so a publisher who inflates it and then serves its
+own job would be self-dealing. `parameter_count <= total_size_bytes * 2` bounds
+the claim by the densest quantisation anyone actually ships (4-bit), and the
+manifest digest is signed into the bill, so the numbers cannot be swapped after
+publication.
+
+**Prompts stay out of the ledger.** The reservation records
+`prompts_digest` and the per-prompt byte counts - sizes, never text. Sizes are
+all the price needs. The submit body hash therefore splits into
+`inference_submit_body_hash(billing_hash, settings_digest)`, so a validator
+holding only the billing and a settings digest can still recompute the
+signature it is checking. The reward records only a digest of the outputs: the
+ledger is not the place to publish somebody's generated text.
+
+**The batch plan is certified, because it is not reproducible.** Which nodes
+were online when a job was scheduled is not something a validator can replay,
+so the partition is written into the reserve evidence and checked there:
+batches must tile `[0, prompts)` with no gap and no overlap. Batch prices then
+sum to the job price exactly, and an escrow drains to zero with nothing
+stranded and nothing conjured.
+
+**A settlement is bound to the batch the coordinator certified.** A reward
+names an `assignment_id`; replay finds the index `i` for which
+`inference_assignment_id(job_id, i)` equals it, and then requires that batch's
+bounds and assigned node to match the claim. A batch invented after the escrow
+was funded has no such index.
+
+**Inference is never community-funded.** Community CU is minted for work a
+validator can audit from the ledger entry alone. Nobody can re-run an LLM and
+get the same tokens back, so minting against inference would be minting against
+an unverifiable claim. Inference is bought with CU that already existed.
+
+**Same exactly-once machinery as CPU work.** A reservation claims
+`reserve:<job_id>`. A reward and a refund both claim `reward:<assignment_id>`,
+so a batch settles once and in one direction. The windows are disjoint: a
+reward is valid at or before `reserved_at + SETTLEMENT_WINDOW_SECS`, a refund
+only strictly after. Requester and provider can never race for the same escrow.
+
+**What a validator cannot check, and why that is survivable.** It cannot
+re-run the model, so it never rules on whether an answer was any good. It rules
+on everything around the answer: that the requester signed this bill, that the
+provider signed this batch, that the amount is the closed form of the request,
+that the batch was certified, that the escrow had the CU, and that the
+settlement landed inside its window.
+
 ## Exactly-once claims
 
 - Both user and community reservations claim `reserve:<job_id>`.
@@ -135,7 +207,9 @@ A participant full-ledger audit must independently replay:
 - requester/provider signatures,
 - deterministic workload results,
 - reward-to-reservation binding,
-- requester self-reward prohibition.
+- requester self-reward prohibition,
+- inference batch prices, recomputed from the certified billing,
+- inference settlements bound to the batch partition that was certified.
 
 A coordinator UI balance is never the source of truth in quorum mode.
 
