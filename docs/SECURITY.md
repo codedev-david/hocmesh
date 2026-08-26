@@ -139,10 +139,11 @@ than whoever holds them today.
 
 ## Double-vote protection
 
-Validators persist a vote lock before signing a ledger entry.
+Validators persist a ballot lock before signing a ledger entry, and it survives restart.
 
-An honest validator refuses to sign a conflicting entry at the same sequence even after restart.
+A validator will not sign for a ballot older than the one it is holding, and it hands any entry it has already accepted back to the next proposer, which is then obliged to finish that entry rather than propose a different one. So a height carries at most one entry even when several clients reach for it at once.
 
+The earlier design locked a validator to the first entry hash it saw at a height, with no way to release it. That is safe but not live: two proposers could split the set, neither reach threshold, and the height then be unfillable forever. Ordering the attempts is what makes the lock releasable without making it forgeable.
 ## Credit forgery defenses
 
 - requester reservation signature,

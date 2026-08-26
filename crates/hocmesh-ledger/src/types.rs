@@ -167,11 +167,69 @@ pub struct ClaimProof {
     pub validator_id: String,
     pub signature_b64: String,
 }
+/// One proposer's claim on one height.
+///
+/// Two clients can reach for the same sequence at the same moment, and a
+/// validator will only ever sign one entry there. Ordering the attempts is
+/// what lets the later one take the height back instead of both halves of the
+/// set sitting on votes that will never add up to a certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ballot {
+    pub number: u64,
+    /// Breaks ties between proposers that picked the same number.
+    pub proposer: String,
+}
+impl Ballot {
+    /// Total order over attempts. Equal numbers fall back to the proposer's
+    /// name so no two live ballots ever compare equal.
+    pub fn outranks(&self, other: &Ballot) -> bool {
+        (self.number, &self.proposer) > (other.number, &other.proposer)
+    }
+}
+impl std::fmt::Display for Ballot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.number, self.proposer)
+    }
+}
+/// A proposer asking the set to reserve a height for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareRequest {
+    pub sequence: u64,
+    pub ballot: Ballot,
+}
+/// A validator's answer to a prepare.
+///
+/// `accepted` is the load-bearing half: a validator that has already signed
+/// something at this height hands it back, and the new proposer is obliged to
+/// finish that entry rather than its own. That is what stops a superseded
+/// round from turning into a fork.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareVote {
+    pub promised: bool,
+    pub validator_id: String,
+    pub sequence: u64,
+    pub accepted: Option<AcceptedProposal>,
+    /// Whatever ballot this validator is currently holding the height for,
+    /// so a proposer that lost knows exactly how high it has to climb.
+    pub promised_ballot: Option<Ballot>,
+    pub error: Option<String>,
+}
+/// An entry a validator has already put its signature behind at some height.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcceptedProposal {
+    pub ballot: Ballot,
+    pub entry_hash: String,
+    pub transactions: Vec<LedgerTransaction>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalRequest {
     /// Every transaction the proposer wants settled in this one entry.
     pub transactions: Vec<LedgerTransaction>,
+    /// The height this batch is for, and the attempt it belongs to.
+    pub sequence: u64,
+    pub ballot: Ballot,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalVote {
     pub accepted: bool,
@@ -180,6 +238,10 @@ pub struct ProposalVote {
     pub previous_hash: String,
     pub entry_hash: String,
     pub signature_b64: Option<String>,
+    /// The ballot this validator is holding the height for. A vote that fell
+    /// short because somebody outbid us is a different problem from one that
+    /// fell short because the set disliked the batch.
+    pub promised_ballot: Option<Ballot>,
     pub error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

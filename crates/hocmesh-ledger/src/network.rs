@@ -20,6 +20,11 @@ pub struct LedgerNetwork {
     set_sequence: Arc<std::sync::RwLock<u64>>,
     gate: Arc<Mutex<()>>,
     queue: Arc<std::sync::Mutex<VecDeque<Pending>>>,
+    /// Identifies this client's ballots. Two proposers reaching for the same
+    /// height need to be distinguishable, and nothing else about a client is.
+    proposer: String,
+    /// Climbs past whatever ballot last took a height away from us.
+    ballot: Arc<std::sync::atomic::AtomicU64>,
 }
 /// The most transactions one entry will carry.
 ///
@@ -43,6 +48,21 @@ enum RoundError {
     /// these transactions risks applying them twice.
     Committed(String),
 }
+/// What one attempt at a height achieved.
+enum Attempt {
+    /// The batch we were asked to settle is now certified.
+    Settled(QuorumCertificate),
+    /// The height went to another proposer's entry - which we may well have
+    /// finished for them. Nothing of ours was applied, so it belongs at the
+    /// next height instead.
+    Deferred(String),
+}
+/// How many contested heights a client will walk past before giving up.
+///
+/// Contention is other people settling, so losing repeatedly is progress for
+/// somebody. Still, a caller waiting on a reply deserves an answer eventually.
+const ROUND_ATTEMPTS: u32 = 6;
+
 impl RoundError {
     fn rejected(e: anyhow::Error) -> Self {
         Self::Rejected(e.to_string())
@@ -63,6 +83,8 @@ impl LedgerNetwork {
             set_sequence: Arc::default(),
             gate: Arc::new(Mutex::new(())),
             queue: Arc::default(),
+            proposer: uuid::Uuid::new_v4().simple().to_string(),
+            ballot: Arc::default(),
         })
     }
 
@@ -459,50 +481,202 @@ impl LedgerNetwork {
         }
     }
 
-    /// One consensus round: agree on a head, gather a quorum of votes, commit.
-    async fn round(
+    /// The next ballot this client will propose under.
+    fn next_ballot(&self) -> Ballot {
+        Ballot {
+            number: self
+                .ballot
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1,
+            proposer: self.proposer.clone(),
+        }
+    }
+    /// Climb above a ballot that beat ours, so the next attempt can win.
+    fn outbid(&self, seen: &Ballot) {
+        self.ballot
+            .fetch_max(seen.number, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Wait before reaching for the next height.
+    ///
+    /// The jitter comes from this client's own name, so two proposers that
+    /// lost the same race do not come back at the same instant and lose it
+    /// again the same way.
+    async fn backoff(&self, attempt: u32) {
+        let jitter = self.proposer.bytes().map(u64::from).sum::<u64>() % 25;
+        let millis = (15 + jitter) << attempt.min(5);
+        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+    }
+    /// Phase one: take the height, and learn what is already signed there.
+    ///
+    /// A promise from a validator is a commitment not to sign for any older
+    /// ballot, so a threshold of them means no earlier proposer can still
+    /// gather a certificate. Whatever those promises report as accepted is
+    /// then the only entry this height may carry.
+    async fn claim_height(
         &self,
-        transactions: Vec<LedgerTransaction>,
-    ) -> std::result::Result<QuorumCertificate, RoundError> {
-        let head = self.head_quorum().await.map_err(RoundError::rejected)?;
-        let expected = build_entry(
-            head.sequence + 1,
-            head.entry_hash.clone(),
-            transactions.clone(),
-        )
-        .map_err(RoundError::rejected)?;
-        let req = ProposalRequest { transactions };
-        let sigs: Vec<ValidatorSignature> = join_all(self.set().members.iter().map(|m| {
-            let (http, req, expected, head) = (&self.http, &req, &expected, &head);
+        sequence: u64,
+        ballot: &Ballot,
+    ) -> std::result::Result<Option<AcceptedProposal>, String> {
+        let req = PrepareRequest {
+            sequence,
+            ballot: ballot.clone(),
+        };
+        let votes: Vec<PrepareVote> = join_all(self.set().members.iter().map(|m| {
+            let (http, req) = (&self.http, &req);
             async move {
                 let r = http
-                    .post(format!("{}/v1/ledger/propose", m.url.trim_end_matches('/')))
+                    .post(format!("{}/v1/ledger/prepare", m.url.trim_end_matches('/')))
                     .json(req)
                     .send()
                     .await
                     .ok()?;
-                let v = r.json::<ProposalVote>().await.ok()?;
-                let sig = v.signature_b64?;
-                (v.accepted
-                    && v.entry_hash == expected.entry_hash
-                    && v.sequence == expected.sequence
-                    && v.previous_hash == expected.previous_hash
-                    && verify_validator_signature(
-                        m,
-                        &ledger_entry_signing_message(&head.membership_hash, &expected.entry_hash),
-                        &sig,
-                    )
-                    .is_ok())
-                .then(|| ValidatorSignature {
-                    validator_id: m.validator_id.clone(),
-                    signature_b64: sig,
-                })
+                let v = r.json::<PrepareVote>().await.ok()?;
+                (v.validator_id == m.validator_id && v.sequence == sequence).then_some(v)
             }
         }))
         .await
         .into_iter()
         .flatten()
         .collect();
+        // Anybody who refused is holding a newer ballot; climb past the
+        // highest of them so the next attempt is not doomed the same way.
+        for v in &votes {
+            if let Some(seen) = &v.promised_ballot {
+                self.outbid(seen);
+            }
+        }
+        let promises: Vec<&PrepareVote> = votes.iter().filter(|v| v.promised).collect();
+        if promises.len() < self.set().threshold {
+            return Err(format!(
+                "height {sequence} promised to only {} of {} needed validators",
+                promises.len(),
+                self.set().threshold
+            ));
+        }
+        // Of everything the promising validators have already signed here,
+        // the newest ballot is the only one that could have been certified.
+        Ok(promises
+            .into_iter()
+            .filter_map(|v| v.accepted.clone())
+            .max_by(|a, b| {
+                if a.ballot.outranks(&b.ballot) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }))
+    }
+
+    /// Settle a batch, retrying while other proposers keep taking the height.
+    ///
+    /// Losing a height is not a failure: the batch was never applied anywhere,
+    /// and the entry that won may well be one this client finished on the
+    /// previous owner's behalf. So climb to a higher ballot and try the next
+    /// height, backing off by an amount peculiar to this client so two
+    /// proposers do not keep stepping on each other in lockstep.
+    async fn round(
+        &self,
+        transactions: Vec<LedgerTransaction>,
+    ) -> std::result::Result<QuorumCertificate, RoundError> {
+        let mut last = String::from("no round was attempted");
+        for attempt in 0..ROUND_ATTEMPTS {
+            match self.attempt(transactions.clone()).await {
+                Ok(Attempt::Settled(cert)) => return Ok(cert),
+                Ok(Attempt::Deferred(why)) => last = why,
+                Err(e) => return Err(e),
+            }
+            self.backoff(attempt).await;
+        }
+        Err(RoundError::Rejected(format!(
+            "gave up after {ROUND_ATTEMPTS} attempts at a contested height: {last}"
+        )))
+    }
+
+    /// One attempt at one height.
+    ///
+    /// Two clients can reach for the same sequence at once, and a validator
+    /// signs one entry there and no other. So claim the height first: whoever
+    /// holds the newest ballot gets to drive it, and a validator that already
+    /// signed something hands that entry back for the new proposer to finish.
+    /// A round that dies halfway is then just a round somebody else completes,
+    /// rather than a height nobody can ever fill.
+    async fn attempt(
+        &self,
+        transactions: Vec<LedgerTransaction>,
+    ) -> std::result::Result<Attempt, RoundError> {
+        let head = self.head_quorum().await.map_err(RoundError::rejected)?;
+        let sequence = head.sequence + 1;
+        let ballot = self.next_ballot();
+        let adopted = match self.claim_height(sequence, &ballot).await {
+            Ok(a) => a,
+            Err(why) => return Ok(Attempt::Deferred(why)),
+        };
+        let deferred = adopted
+            .as_ref()
+            .map(|a| format!("height {sequence} went to ballot {}", a.ballot));
+        // A validator that has already signed something here hands it back,
+        // and finishing that entry is not optional: it may already be one vote
+        // short of a certificate, and no two entries may exist at one height.
+        let transactions = match adopted {
+            Some(a) => a.transactions,
+            None => transactions,
+        };
+        let expected = build_entry(sequence, head.entry_hash.clone(), transactions.clone())
+            .map_err(RoundError::rejected)?;
+        let req = ProposalRequest {
+            transactions,
+            sequence,
+            ballot,
+        };
+        let votes: Vec<(ValidatorMember, ProposalVote)> =
+            join_all(self.set().members.iter().map(|m| {
+                let (http, req) = (&self.http, &req);
+                async move {
+                    let r = http
+                        .post(format!("{}/v1/ledger/propose", m.url.trim_end_matches('/')))
+                        .json(req)
+                        .send()
+                        .await
+                        .ok()?;
+                    Some((m.clone(), r.json::<ProposalVote>().await.ok()?))
+                }
+            }))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        // Anyone who has moved on to a newer ballot tells us so, and the next
+        // attempt starts above it rather than losing the same race again.
+        let outbid = votes
+            .iter()
+            .filter_map(|(_, v)| v.promised_ballot.as_ref())
+            .find(|b| b.outranks(&req.ballot));
+        if let Some(b) = outbid {
+            self.outbid(b);
+            return Ok(Attempt::Deferred(format!(
+                "height {sequence} was taken by ballot {b} mid-round"
+            )));
+        }
+        let sigs: Vec<ValidatorSignature> = votes
+            .into_iter()
+            .filter_map(|(m, v)| {
+                let sig = v.signature_b64?;
+                (v.accepted
+                    && v.entry_hash == expected.entry_hash
+                    && v.sequence == expected.sequence
+                    && v.previous_hash == expected.previous_hash
+                    && verify_validator_signature(
+                        &m,
+                        &ledger_entry_signing_message(&head.membership_hash, &expected.entry_hash),
+                        &sig,
+                    )
+                    .is_ok())
+                .then_some(ValidatorSignature {
+                    validator_id: m.validator_id,
+                    signature_b64: sig,
+                })
+            })
+            .collect();
         if sigs.len() < self.set().threshold {
             return Err(RoundError::Rejected(format!(
                 "ledger proposal received only {} valid votes; threshold is {}",
@@ -535,7 +709,10 @@ impl LedgerNetwork {
                 "certificate formed but committed on only {committed} validators; run validator sync/recovery"
             )));
         };
-        Ok(cert)
+        Ok(match deferred {
+            Some(why) => Attempt::Deferred(why),
+            None => Attempt::Settled(cert),
+        })
     }
     /// Fetch a run of certificates, checked against the set that governed each.
     ///

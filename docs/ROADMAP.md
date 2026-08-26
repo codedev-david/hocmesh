@@ -35,7 +35,6 @@
 
 ## Priority 1 — production ledger hardening
 
-- Consensus/view-change protocol rather than coordinator-driven proposal sequencing.
 - Snapshot/checkpoint format.
 - Efficient indexed transaction/account history.
 - Reconciliation daemon for partial coordinator/ledger failures.

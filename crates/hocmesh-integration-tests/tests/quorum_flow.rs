@@ -1455,3 +1455,197 @@ async fn validator_head(http: &Client, url: &str) -> Result<LedgerHead> {
         .await?;
     Ok(serde_json::from_value(proof["head"].clone())?)
 }
+
+/// Two proposers, one height, and no way back.
+///
+/// A validator will not sign two different entries at the same sequence, which
+/// is what keeps the chain from forking. But a lock with nothing above it is
+/// also a lock with no way out: two clients leading a round at the same height
+/// split the set between two entries, neither reaches threshold, nothing is
+/// applied anywhere - and every seat is now holding a hash that will never
+/// carry a certificate. The height has to be recoverable, or the ledger stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_proposal_does_not_wedge_the_height() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = Client::new();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let (validators_path, validator_homes, validator_dbs, set) =
+        create_validator_set(&tmp, &validator_bin, &validator_ports)?;
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    // Two mints that are each perfectly valid at the same height. Only one of
+    // them can be sequence 1, and nothing decides which.
+
+    let left = community_mint(
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        "job_split_left",
+    )?;
+    let right = community_mint(
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        "job_split_right",
+    )?;
+
+    // Hand each half of the set a different first entry. Both halves accept -
+    // each batch is valid - and neither half is big enough to certify.
+    for (index, tx, proposer) in [
+        (0usize, &left, "left"),
+        (1, &left, "left"),
+        (2, &right, "right"),
+        (3, &right, "right"),
+    ] {
+        let vote: serde_json::Value = post_json(
+            &http,
+            &set.members[index].url,
+            "/v1/ledger/propose",
+            &json!({
+                "transactions": [tx],
+                "sequence": 1,
+                "ballot": { "number": 1, "proposer": proposer },
+            }),
+        )
+        .await?;
+        assert_eq!(
+            vote.get("accepted").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "validator {index} refused a valid first entry: {vote}"
+        );
+    }
+
+    // Nobody certified anything, so the chain is still at genesis and every
+    // seat is holding a vote for an entry that will never exist. A client that
+    // arrives now must still be able to get a transaction settled.
+    let net = LedgerNetwork::new(set.clone())?;
+    assert_eq!(net.head_quorum().await?.sequence, 0);
+
+    let settled = net
+        .transact(community_mint(
+            &node_bin,
+            &validator_homes,
+            &validators_path,
+            "job_split_after",
+        )?)
+        .await
+        .context("a height split between two proposers stayed wedged")?;
+    // Height 1 was not thrown away: the arriving client adopted the entry the
+    // set had already half-signed and finished it, then settled its own batch
+    // at 2. Nothing was lost and nothing was decided twice.
+    assert_eq!(settled.entry.sequence, 2);
+
+    for mut validator in validators {
+        validator.kill();
+    }
+    Ok(())
+}
+
+/// Two clients that know nothing about each other, reaching for the same
+/// height at the same moment.
+///
+/// Neither is a leader and neither defers to the other; they simply keep
+/// climbing until each has a height of its own. Both settlements have to land,
+/// and they have to land at different heights.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_independent_proposers_both_settle() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = Client::new();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let (validators_path, validator_homes, validator_dbs, set) =
+        create_validator_set(&tmp, &validator_bin, &validator_ports)?;
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    // Separate clients, so separate ballot lines - exactly the situation a
+    // single coordinator process serialises away and a real deployment does
+    // not.
+    let first = LedgerNetwork::new(set.clone())?;
+    let second = LedgerNetwork::new(set.clone())?;
+
+    let a = community_mint(&node_bin, &validator_homes, &validators_path, "job_race_a")?;
+    let b = community_mint(&node_bin, &validator_homes, &validators_path, "job_race_b")?;
+    let (ra, rb) = tokio::join!(first.transact(a), second.transact(b));
+    let (ra, rb) = (ra?, rb?);
+    assert_ne!(
+        ra.entry.sequence, rb.entry.sequence,
+        "two proposers settled at the same height"
+    );
+    assert_eq!(first.head_quorum().await?.sequence, 2);
+
+    for mut validator in validators {
+        validator.kill();
+    }
+    Ok(())
+}
+
+/// A sponsored community mint, built the way the coordinator builds one.
+fn community_mint(
+    node_bin: &Path,
+    homes: &[PathBuf],
+    validators_path: &Path,
+    job_id: &str,
+) -> Result<LedgerTransaction> {
+    let work = WorkSpec::PrimeCount { start: 2, end: 100 };
+    let shards = 1u32;
+    let cost: i64 = split_work(&work, shards).iter().map(work_cost_mcu).sum();
+    let sponsors = community_vouches(node_bin, homes, validators_path, job_id, (2, 100, shards))?;
+    Ok(LedgerTransaction {
+        transaction_id: format!("community_reserve_{job_id}"),
+        kind: TransactionKind::CommunityReserve,
+        postings: vec![
+            Posting {
+                account_id: COMMUNITY_ISSUANCE_ACCOUNT.into(),
+                delta_mcu: -cost,
+            },
+            Posting {
+                account_id: escrow_account(job_id),
+                delta_mcu: cost,
+            },
+        ],
+        evidence: TransactionEvidence::CommunityReserve {
+            job_id: job_id.to_string(),
+            work: work.clone(),
+            shards,
+            sponsors,
+        },
+        created_at: now_unix(),
+    })
+}

@@ -119,17 +119,30 @@ The certificate is then committed to validator replicas.
 
 ## Persistent vote lock
 
-A validator stores:
+A validator stores, per height:
 
 ```text
-(sequence, entry_hash)
+(sequence, promised_ballot, accepted_ballot, accepted_entry, accepted_transactions)
 ```
 
-before returning its signature.
+before returning its signature. That lock survives process restart because it is stored in SQLite.
 
-It will return the same vote for an identical proposal, but it refuses to sign a different entry hash at the same sequence.
+A ballot is a proposer's claim on one height, ordered by `(number, proposer)` so no two live claims compare equal. A validator refuses to promise or accept anything for a ballot older than the one it is holding.
 
-That lock survives process restart because it is stored in SQLite.
+## How a contested height is resolved
+
+Nothing elects a leader. Any client may settle, so two of them can reach for the same sequence at the same instant.
+
+A round therefore runs in two phases:
+
+1. **Prepare.** The proposer asks every validator to hold the height for its ballot. A threshold of promises means no older ballot can still gather a certificate. Each promise reports whatever that validator has already accepted here.
+2. **Propose.** If any promise carried an accepted entry, the proposer must drive *that* entry — the newest accepted ballot wins — rather than its own batch. Otherwise it proposes its own.
+
+The second rule is what keeps the chain single-valued. An entry that some validators have already signed may be one vote short of a certificate that somebody else will finish, so it can never be quietly replaced — a later proposer either completes it or does nothing.
+
+The cost is that a proposer which adopts somebody else's entry has not settled its own batch. It retries at the next height, backing off by an interval derived from its own identity so two clients that lost the same race do not collide again the same way.
+
+Without this a split is terminal: half the set signs one entry and half signs another, neither reaches threshold, nothing is applied, and the height can never be filled by anything else. That failure is covered by `a_split_proposal_does_not_wedge_the_height`.
 
 ## Settlement claims
 
@@ -314,7 +327,7 @@ threshold rationale, and the operator commands.
 
 ## Consensus boundary
 
-This implementation is intentionally a practical v0.2 quorum-certified linear log. It is not yet a complete production BFT state machine with leader election, view changes, membership epochs, and automated fork resolution.
+This implementation is a quorum-certified linear log with ballot-ordered heights and on-ledger membership changes. It is not a Byzantine-fault-tolerant state machine: validators are assumed to follow the protocol, and a validator that signs two entries at one height is detectable but not prevented.
 
 Before hostile Internet-scale deployment, the recommended next step is to either:
 
@@ -329,7 +342,7 @@ Before quorum submission, the coordinator persists a `ledger_intents` record con
 
 After a restart, `hocmesh-coordinator recover` or automatic startup recovery asks validators for a signed quorum claim proof. A certified claim is finalized locally; an absent claim causes the coordinator to retry the exact same transaction. This avoids creating a second debit/reward after an ambiguous network failure.
 
-The validator proposal client also serializes proposals within one process to reduce accidental same-height races. This does not replace a full BFT leader/view-change protocol for multiple independent proposers.
+The proposal client also serialises rounds within one process, so a single coordinator batches rather than races itself. Independent processes are handled by ballots rather than by that lock; see "How a contested height is resolved".
 
 ## Requester cannot pay itself
 

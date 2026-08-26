@@ -153,6 +153,7 @@ async fn serve(listen: &str, db: &str, home: &FsPath, validators: &str) -> Resul
         .route("/v1/ledger/state", get(ledger_state))
         .route("/v1/ledger/balance/{account}", get(balance))
         .route("/v1/ledger/claim/{claim}", get(claim))
+        .route("/v1/ledger/prepare", post(prepare))
         .route("/v1/ledger/propose", post(propose))
         .route("/v1/ledger/commit", post(commit))
         .route("/v1/ledger/entries", get(entries))
@@ -255,6 +256,45 @@ async fn claim(
         signature_b64: a.id.sign_bytes_b64(msg.as_bytes()),
     }))
 }
+/// Reserve a height for a proposer, and tell it what is already signed there.
+///
+/// This is the half that makes a contested height recoverable. A validator
+/// that has already put its name behind an entry hands that entry back, and
+/// the new proposer is then obliged to finish it - so taking a height away
+/// from a stalled round can never change what the round was deciding.
+async fn prepare(State(a): State<App>, Json(r): Json<PrepareRequest>) -> Json<PrepareVote> {
+    let vote = |promised, accepted, promised_ballot, error| PrepareVote {
+        promised,
+        validator_id: a.id.node_id(),
+        sequence: r.sequence,
+        accepted,
+        promised_ballot,
+        error,
+    };
+    let s = match a.store.lock() {
+        Ok(s) => s,
+        Err(_) => return Json(vote(false, None, None, Some("ledger lock poisoned".into()))),
+    };
+    let result = (|| -> Result<Option<AcceptedProposal>> {
+        let h = s.head(&a.set())?;
+        if r.sequence != h.sequence + 1 {
+            bail!(
+                "prepare is for sequence {} but this validator is at {}",
+                r.sequence,
+                h.sequence
+            )
+        }
+        s.promise(r.sequence, &r.ballot)
+    })();
+    // Either way the proposer is told which ballot holds this height, so a
+    // client that lost knows what it has to beat rather than guessing.
+    let held = s.promised_ballot(r.sequence).ok().flatten();
+    Json(match result {
+        Ok(accepted) => vote(true, accepted, held, None),
+        Err(e) => vote(false, None, held, Some(e.to_string())),
+    })
+}
+
 async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<ProposalVote> {
     let result = (|| -> Result<ProposalVote> {
         let s = a
@@ -262,6 +302,13 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
             .lock()
             .map_err(|_| anyhow::anyhow!("ledger lock poisoned"))?;
         let h = s.head(&a.set())?;
+        if r.sequence != h.sequence + 1 {
+            bail!(
+                "proposal is for sequence {} but this validator is at {}",
+                r.sequence,
+                h.sequence
+            )
+        }
         let mut settled = std::collections::HashSet::new();
         for t in &r.transactions {
             let ck = claim_key(t);
@@ -278,7 +325,7 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
             &a.set(),
         )?;
         let e = build_entry(h.sequence + 1, h.entry_hash.clone(), r.transactions)?;
-        s.lock_vote(e.sequence, &e.entry_hash)?;
+        s.accept_ballot(e.sequence, &r.ballot, &e.entry_hash, &e.transactions)?;
         let mh = membership_hash(&a.set())?;
         let sig =
             a.id.sign_bytes_b64(ledger_entry_signing_message(&mh, &e.entry_hash).as_bytes());
@@ -289,17 +336,27 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
             previous_hash: e.previous_hash,
             entry_hash: e.entry_hash,
             signature_b64: Some(sig),
+            promised_ballot: s.promised_ballot(r.sequence).ok().flatten(),
             error: None,
         })
     })();
-    Json(result.unwrap_or_else(|e| ProposalVote {
-        accepted: false,
-        validator_id: a.id.node_id(),
-        sequence: 0,
-        previous_hash: String::new(),
-        entry_hash: String::new(),
-        signature_b64: None,
-        error: Some(e.to_string()),
+    Json(result.unwrap_or_else(|e| {
+        ProposalVote {
+            accepted: false,
+            validator_id: a.id.node_id(),
+            sequence: 0,
+            previous_hash: String::new(),
+            entry_hash: String::new(),
+            signature_b64: None,
+            // Refusals are where a proposer learns it has been outbid, so this is
+            // the one that matters most.
+            promised_ballot: a
+                .store
+                .lock()
+                .ok()
+                .and_then(|s| s.promised_ballot(r.sequence).ok().flatten()),
+            error: Some(e.to_string()),
+        }
     }))
 }
 async fn commit(

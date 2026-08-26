@@ -215,4 +215,4 @@ A coordinator UI balance is never the source of truth in quorum mode.
 
 ## Current consensus limitation
 
-This v0.2 implementation is a quorum-certified replicated log with persistent vote locks. It is not a complete BFT consensus protocol with leader election, view changes, membership epochs, or formally proven liveness under competing proposers. Do not market or deploy it as Byzantine-fault-tolerant production consensus until that milestone is completed and reviewed.
+This implementation is a quorum-certified replicated log with ballot-ordered heights, so competing proposers resolve rather than deadlock and no height carries two entries. It is still not Byzantine-fault-tolerant: validators are assumed to follow the protocol, and liveness under competing proposers rests on backoff rather than a proof. Do not market or deploy it as Byzantine-fault-tolerant production consensus until that milestone is completed and reviewed.

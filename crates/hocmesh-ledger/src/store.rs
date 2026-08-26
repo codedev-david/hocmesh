@@ -100,6 +100,11 @@ impl LedgerStore {
                 sequence INTEGER PRIMARY KEY,
                 entry_hash TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS ballots(
+                sequence INTEGER PRIMARY KEY,
+                promised_json TEXT NOT NULL,
+                accepted_json TEXT
+            );
             CREATE TABLE IF NOT EXISTS account_activity(
                 account_id TEXT NOT NULL,
                 sequence INTEGER NOT NULL,
@@ -168,9 +173,82 @@ impl LedgerStore {
             membership_hash: membership_hash(set)?,
         })
     }
-    pub fn lock_vote(&self, sequence: u64, entry_hash: &str) -> Result<()> {
+    /// Reserve a height for one proposer and report what is already signed there.
+    ///
+    /// Handing back the accepted entry is the whole point: whoever takes the
+    /// height next has to finish that entry rather than its own, so a round
+    /// that was interrupted halfway can never be replaced by a different one.
+    pub fn promise(&self, sequence: u64, ballot: &Ballot) -> Result<Option<AcceptedProposal>> {
         let sqlite_sequence = sqlite_sequence(sequence)?;
-        let existing: Option<String> = self
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT promised_json,accepted_json FROM ballots WHERE sequence=?1",
+                params![sqlite_sequence],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let accepted = match &row {
+            Some((promised_json, accepted_json)) => {
+                let promised: Ballot = serde_json::from_str(promised_json)?;
+                if promised.outranks(ballot) {
+                    bail!("sequence {sequence} is promised to ballot {promised}")
+                }
+                accepted_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()?
+            }
+            None => None,
+        };
+        self.conn.execute(
+            "INSERT INTO ballots(sequence,promised_json) VALUES(?1,?2)
+             ON CONFLICT(sequence) DO UPDATE SET promised_json=excluded.promised_json",
+            params![sqlite_sequence, serde_json::to_string(ballot)?],
+        )?;
+        Ok(accepted)
+    }
+    /// The ballot currently holding a height, if any.
+    pub fn promised_ballot(&self, sequence: u64) -> Result<Option<Ballot>> {
+        let promised: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT promised_json FROM ballots WHERE sequence=?1",
+                params![sqlite_sequence(sequence)?],
+                |r| r.get(0),
+            )
+            .optional()?;
+        promised.map(|p| Ok(serde_json::from_str(&p)?)).transpose()
+    }
+    /// Put this validator's name behind one batch at one height.
+    ///
+    /// Refused once a later proposer has taken the height, so the entry the
+    /// set signs is always the one the newest ballot drove.
+    pub fn accept_ballot(
+        &self,
+        sequence: u64,
+        ballot: &Ballot,
+        entry_hash: &str,
+        transactions: &[LedgerTransaction],
+    ) -> Result<()> {
+        let sqlite_sequence = sqlite_sequence(sequence)?;
+        let promised: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT promised_json FROM ballots WHERE sequence=?1",
+                params![sqlite_sequence],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(promised) = promised {
+            let promised: Ballot = serde_json::from_str(&promised)?;
+            if promised.outranks(ballot) {
+                bail!("sequence {sequence} has moved on to ballot {promised}")
+            }
+        }
+        // A height that already carries a committed entry is settled; nothing
+        // any proposer says can move it.
+        let committed: Option<String> = self
             .conn
             .query_row(
                 "SELECT entry_hash FROM votes WHERE sequence=?1",
@@ -178,19 +256,26 @@ impl LedgerStore {
                 |r| r.get(0),
             )
             .optional()?;
-        match existing {
-            Some(h) if h != entry_hash => {
-                bail!("validator already voted for a conflicting entry at sequence {sequence}")
-            }
-            Some(_) => Ok(()),
-            None => {
-                self.conn.execute(
-                    "INSERT INTO votes(sequence,entry_hash) VALUES(?1,?2)",
-                    params![sqlite_sequence, entry_hash],
-                )?;
-                Ok(())
-            }
+        if committed.is_some_and(|h| h != entry_hash) {
+            bail!("sequence {sequence} already carries a different committed entry")
         }
+        let accepted = AcceptedProposal {
+            ballot: ballot.clone(),
+            entry_hash: entry_hash.to_string(),
+            transactions: transactions.to_vec(),
+        };
+        self.conn.execute(
+            "INSERT INTO ballots(sequence,promised_json,accepted_json) VALUES(?1,?2,?3)
+             ON CONFLICT(sequence) DO UPDATE SET
+                 promised_json=excluded.promised_json,
+                 accepted_json=excluded.accepted_json",
+            params![
+                sqlite_sequence,
+                serde_json::to_string(ballot)?,
+                serde_json::to_string(&accepted)?
+            ],
+        )?;
+        Ok(())
     }
     pub fn claim_detail(&self, key: &str) -> Result<Option<(u64, String)>> {
         self.conn
@@ -366,6 +451,12 @@ impl LedgerStore {
         tx.execute(
             "INSERT OR IGNORE INTO votes(sequence,entry_hash) VALUES(?1,?2)",
             params![sqlite_sequence(cert.entry.sequence)?, cert.entry.entry_hash],
+        )?;
+        // The height is decided, so the attempts that fought over it are only
+        // history now - and the batches they carried are not small.
+        tx.execute(
+            "DELETE FROM ballots WHERE sequence<=?1",
+            params![sqlite_sequence(cert.entry.sequence)?],
         )?;
         index_certificate(&tx, cert)?;
         if let Some(next) = &next_set {
@@ -1043,12 +1134,35 @@ mod tests {
     };
     use hocmesh_core::identity::NodeIdentity;
 
+    fn ballot(number: u64, proposer: &str) -> Ballot {
+        Ballot {
+            number,
+            proposer: proposer.into(),
+        }
+    }
+
+    /// A height belongs to the newest attempt, not the first one.
     #[test]
-    fn validator_cannot_double_vote_at_same_height() {
+    fn a_later_ballot_takes_a_height_from_an_earlier_one() {
         let store = LedgerStore::open(":memory:").unwrap();
-        store.lock_vote(1, "aaa").unwrap();
-        store.lock_vote(1, "aaa").unwrap();
-        assert!(store.lock_vote(1, "bbb").is_err());
+        assert!(store.promise(1, &ballot(1, "a")).unwrap().is_none());
+        store.accept_ballot(1, &ballot(1, "a"), "aaa", &[]).unwrap();
+        // The next proposer is told what is already signed here, and is
+        // expected to carry that same entry rather than one of its own.
+        let seen = store.promise(1, &ballot(2, "b")).unwrap().unwrap();
+        assert_eq!(seen.entry_hash, "aaa");
+        store.accept_ballot(1, &ballot(2, "b"), "aaa", &[]).unwrap();
+    }
+
+    /// Once the set has moved on, a stale proposer cannot sneak its entry in
+    /// behind the one that took the height.
+    #[test]
+    fn a_superseded_proposer_cannot_still_be_signed_for() {
+        let store = LedgerStore::open(":memory:").unwrap();
+        store.promise(1, &ballot(1, "a")).unwrap();
+        store.promise(1, &ballot(2, "b")).unwrap();
+        assert!(store.promise(1, &ballot(1, "a")).is_err());
+        assert!(store.accept_ballot(1, &ballot(1, "a"), "aaa", &[]).is_err());
     }
 
     fn store_dir(name: &str) -> std::path::PathBuf {
