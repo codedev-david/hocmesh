@@ -4,7 +4,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hocmesh_core::compute::{split_work, work_cost_mcu};
 use hocmesh_core::verify::{self, AuditNonce};
-use hocmesh_protocol::{hash_json, result_body_hash, submit_body_hash, verify_auth_signature};
+use hocmesh_protocol::{
+    hash_json, refund_body_hash, result_body_hash, submit_body_hash, verify_auth_signature,
+};
 
 pub fn validate_validator_set(set: &ValidatorSet) -> Result<()> {
     let n = set.members.len();
@@ -69,6 +71,7 @@ pub fn claim_key(tx: &LedgerTransaction) -> String {
         TransactionEvidence::JobReserve(e) => format!("reserve:{}", e.job_id),
         TransactionEvidence::CommunityReserve { job_id, .. } => format!("reserve:{}", job_id),
         TransactionEvidence::ProviderReward(e) => format!("reward:{}", e.assignment_id),
+        TransactionEvidence::JobRefund(e) => format!("reward:{}", e.assignment_id),
     }
 }
 
@@ -124,6 +127,7 @@ pub fn validate_transaction(
         (TransactionKind::ProviderReward, TransactionEvidence::ProviderReward(e)) => {
             validate_reward(tx, e, previous_hash)?
         }
+        (TransactionKind::JobRefund, TransactionEvidence::JobRefund(e)) => validate_refund(tx, e)?,
         _ => bail!("transaction kind/evidence mismatch"),
     }
     Ok(())
@@ -346,6 +350,30 @@ pub fn validate_historical_transaction(
                 bail!("historical reward postings invalid")
             }
         }
+        (TransactionKind::JobRefund, TransactionEvidence::JobRefund(e)) => {
+            let refund = work_cost_mcu(&e.work);
+            if e.refund_mcu != refund
+                || e.assignment_id != hocmesh_protocol::assignment_id(&e.job_id, e.shard_index)
+            {
+                bail!("historical refund metadata invalid")
+            };
+            // Who the escrow returns to is decided by how it was funded, not
+            // by whichever account the postings happen to name.
+            let payee = refund_payee(e)?;
+            let source = escrow_account(&e.job_id);
+            if tx.postings.len() != 2
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == source && p.delta_mcu == -refund)
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == payee && p.delta_mcu == refund)
+            {
+                bail!("historical refund postings invalid")
+            }
+        }
         _ => bail!("historical transaction kind/evidence mismatch"),
     }
     Ok(())
@@ -410,6 +438,82 @@ pub fn verify_certificate(cert: &QuorumCertificate, set: &ValidatorSet) -> Resul
     Ok(())
 }
 
+/// A shard's CU has exactly two ways out of escrow: a reward, or this.
+///
+/// Without this an escrow is a one-way valve. A provider that cheats, or that
+/// simply never answers, leaves the requester's CU locked in the job's escrow
+/// forever. That punishes the requester for someone else's failure and takes
+/// the CU out of circulation for good. Catching a cheat is not a settlement
+/// rule until the funds can move afterwards.
+///
+/// Two things keep the release safe. A refund carries the same claim key as
+/// the reward it replaces, so the claims table - not a new rule - makes a
+/// shard settle exactly once, as one or the other. And minted CU never
+/// refunds to a node: it goes back to the issuance account it was minted
+/// against, or "reserve community work, let it fail, keep the CU" would be
+/// free minting.
+///
+/// Whether the window has passed, and whether this really is the job's shard,
+/// need the reserve entry. Those live with the history, in `Store::audit` and
+/// in the validator's propose path.
+fn validate_refund(tx: &LedgerTransaction, e: &JobRefundEvidence) -> Result<()> {
+    e.work.validate().map_err(anyhow::Error::msg)?;
+    if e.assignment_id != hocmesh_protocol::assignment_id(&e.job_id, e.shard_index) {
+        bail!("assignment id is not deterministic for job/shard")
+    }
+    let refund = work_cost_mcu(&e.work);
+    if e.refund_mcu != refund {
+        bail!("declared refund does not equal deterministic work cost")
+    }
+    let payee = refund_payee(e)?;
+    let escrow = escrow_account(&e.job_id);
+    if tx.postings.len() != 2
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == escrow && p.delta_mcu == -refund)
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == payee && p.delta_mcu == refund)
+    {
+        bail!("job refund postings do not return the shard's escrow to its funder")
+    }
+    Ok(())
+}
+
+/// Who a refund pays, and the proof they are entitled to ask.
+///
+/// The authorisation is present exactly when there is somebody to pay. A
+/// half-filled pair is refused rather than interpreted, so neither branch can
+/// be reached with the other one's data.
+fn refund_payee(e: &JobRefundEvidence) -> Result<String> {
+    match (&e.requester_public_key_b64, &e.requester_auth) {
+        (Some(pk), Some(auth)) => {
+            if e.system_funded {
+                bail!("a community-funded shard has no requester to refund")
+            }
+            let bh = refund_body_hash(
+                &e.assignment_id,
+                &e.job_id,
+                e.shard_index,
+                &e.work,
+                e.refund_mcu,
+                e.system_funded,
+            )?;
+            verify_auth_signature(pk, auth, "refund", &bh).map_err(anyhow::Error::msg)?;
+            Ok(auth.node_id.clone())
+        }
+        (None, None) => {
+            if !e.system_funded {
+                bail!("a requester-funded refund needs the requester's authorisation")
+            }
+            Ok(COMMUNITY_ISSUANCE_ACCOUNT.to_string())
+        }
+        _ => bail!("refund carries half a requester authorisation"),
+    }
+}
+
 /// Audit-time evidence signature validation without rejecting old timestamps.
 pub fn verify_historical_evidence(
     tx: &LedgerTransaction,
@@ -458,6 +562,10 @@ pub fn verify_historical_evidence(
             ) {
                 bail!("historical work result invalid")
             }
+        }
+        TransactionEvidence::JobRefund(e) => {
+            e.work.validate().map_err(anyhow::Error::msg)?;
+            refund_payee(e)?;
         }
     };
     Ok(())
@@ -828,6 +936,16 @@ mod tests {
             },
             created_at: 1,
         };
+        certify(validators, tx, sequence, previous_hash)
+    }
+    /// Wraps any transaction in a quorum certificate. Every stateful test needs
+    /// this, so it lives apart from the reservation helper that first grew it.
+    fn certify(
+        validators: &TestValidatorSet,
+        tx: LedgerTransaction,
+        sequence: u64,
+        previous_hash: &str,
+    ) -> QuorumCertificate {
         let entry = build_entry(sequence, previous_hash.into(), tx).unwrap();
         let membership_hash = membership_hash(&validators.set).unwrap();
         let message = ledger_entry_signing_message(&membership_hash, &entry.entry_hash);
@@ -844,6 +962,62 @@ mod tests {
             entry,
             membership_hash,
             signatures,
+        }
+    }
+
+    /// A refund of one shard's escrow. `requester` signs for paid work; for
+    /// community work it is absent, because minted CU goes back to the account
+    /// it was minted against and nobody receives it personally.
+    fn refund_tx(
+        job_id: &str,
+        shard_index: u32,
+        work: &WorkSpec,
+        system_funded: bool,
+        requester: Option<&NodeIdentity>,
+        created_at: i64,
+    ) -> LedgerTransaction {
+        let refund_mcu = work_cost_mcu(work);
+        let assignment_id = hocmesh_protocol::assignment_id(job_id, shard_index);
+        let auth = requester.map(|identity| {
+            let body_hash = refund_body_hash(
+                &assignment_id,
+                job_id,
+                shard_index,
+                work,
+                refund_mcu,
+                system_funded,
+            )
+            .unwrap();
+            identity.auth("refund", &body_hash)
+        });
+        let payee = match &auth {
+            Some(a) => a.node_id.clone(),
+            None => COMMUNITY_ISSUANCE_ACCOUNT.into(),
+        };
+        LedgerTransaction {
+            transaction_id: format!("refund-{assignment_id}"),
+            kind: TransactionKind::JobRefund,
+            postings: vec![
+                Posting {
+                    account_id: escrow_account(job_id),
+                    delta_mcu: -refund_mcu,
+                },
+                Posting {
+                    account_id: payee,
+                    delta_mcu: refund_mcu,
+                },
+            ],
+            evidence: TransactionEvidence::JobRefund(JobRefundEvidence {
+                job_id: job_id.into(),
+                assignment_id,
+                shard_index,
+                refund_mcu,
+                work: work.clone(),
+                system_funded,
+                requester_public_key_b64: requester.map(|i| i.public_key_b64()),
+                requester_auth: auth,
+            }),
+            created_at,
         }
     }
 
@@ -1057,5 +1231,188 @@ mod tests {
             assert_eq!(work.audit_class(), AuditClass::SelfContained);
             assert!(issuable(&work).is_ok());
         }
+    }
+
+    /// Escrow that was minted has no requester to return to. Paying it to a
+    /// node would make "reserve community work, let it fail, keep the CU" a
+    /// free mint, so it goes back to the account it was issued against.
+    #[test]
+    fn minted_escrow_can_only_be_refunded_to_the_issuance_account() {
+        let work = WorkSpec::PrimeCount { start: 2, end: 20 };
+        let honest = refund_tx("job-minted", 0, &work, true, None, 100);
+        validate_transaction(&honest, TEST_PREVIOUS_HASH, |_| Ok(10_000), 1_000_000).unwrap();
+
+        let thief = test_identity("refund-thief");
+        let stolen = refund_tx("job-minted", 0, &work, true, Some(&thief), 100);
+        let refused = refused(validate_transaction(
+            &stolen,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(10_000),
+            1_000_000,
+        ));
+        assert!(
+            refused.contains("no requester to refund"),
+            "a signature on minted escrow must not redirect it to a node: {refused}"
+        );
+    }
+
+    /// An unsigned refund pays the issuance account, so letting one settle
+    /// paid escrow would mint CU out of a requester's own money.
+    #[test]
+    fn a_refund_of_paid_escrow_without_the_requesters_signature_is_refused() {
+        let work = WorkSpec::PrimeCount { start: 2, end: 20 };
+        let unsigned = refund_tx("job-paid", 0, &work, false, None, 100);
+        let refused = refused(validate_transaction(
+            &unsigned,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(10_000),
+            1_000_000,
+        ));
+        assert!(
+            refused.contains("needs the requester's authorisation"),
+            "escrow somebody paid for must not be returned to issuance: {refused}"
+        );
+    }
+
+    /// The refund is the shard's price. Signing honestly for a larger number
+    /// still has to fail, or a requester could withdraw more than they put in.
+    #[test]
+    fn a_refund_cannot_take_more_than_the_shard_reserved() {
+        let requester = test_identity("refund-greedy");
+        let work = WorkSpec::PrimeCount { start: 2, end: 20 };
+        let mut tx = refund_tx("job-greedy", 0, &work, false, Some(&requester), 100);
+        tx.postings[0].delta_mcu -= 1;
+        tx.postings[1].delta_mcu += 1;
+        let TransactionEvidence::JobRefund(e) = &mut tx.evidence else {
+            unreachable!("refund_tx builds a refund")
+        };
+        e.refund_mcu += 1;
+        let body = refund_body_hash(
+            &e.assignment_id,
+            &e.job_id,
+            e.shard_index,
+            &e.work,
+            e.refund_mcu,
+            e.system_funded,
+        )
+        .unwrap();
+        e.requester_auth = Some(requester.auth("refund", &body));
+        let refused = refused(validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(10_000),
+            1_000_000,
+        ));
+        assert!(
+            refused.contains("declared refund does not equal deterministic work cost"),
+            "a valid signature over the wrong amount is still the wrong amount: {refused}"
+        );
+    }
+
+    /// Reserves one community shard, settles it the given way, and replays the
+    /// whole chain. Replay is where the stateful rules live, so this is what
+    /// says whether a settlement is really allowed to stand.
+    fn settle_and_replay(
+        set: &TestValidatorSet,
+        job_id: &str,
+        settlement: LedgerTransaction,
+    ) -> Result<crate::store::LedgerStore> {
+        let mut store = crate::store::LedgerStore::open(":memory:").unwrap();
+        let reserve = certified_community_reserve(set, job_id, 1, "GENESIS");
+        store.apply(&reserve, &set.set).unwrap();
+        let cert = certify(set, settlement, 2, &reserve.entry.entry_hash);
+        store.apply(&cert, &set.set)?;
+        store.audit(&set.set)?;
+        Ok(store)
+    }
+
+    /// The reason a settlement was refused matters as much as the refusal, so
+    /// every negative case here reads the message rather than trusting `is_err`.
+    fn refused<T>(outcome: Result<T>) -> String {
+        outcome.map(|_| ()).unwrap_err().to_string()
+    }
+    /// One shard settles once. If both windows were open at the same moment
+    /// the requester and the provider would race for the same escrow, and the
+    /// ledger would have to pick a winner after the fact.
+    #[test]
+    fn a_reward_and_a_refund_never_have_the_same_shard_open_at_once() {
+        let set = validator_set("refund-window");
+        let work = WorkSpec::PrimeCount { start: 2, end: 20 };
+        let provider = test_identity("refund-window-provider");
+        // The reservation is stamped at 1, so the window closes here.
+        let deadline = 1 + hocmesh_protocol::SETTLEMENT_WINDOW_SECS;
+
+        let early = refused(settle_and_replay(
+            &set,
+            "early",
+            refund_tx("early", 0, &work, true, None, deadline),
+        ));
+        assert!(
+            early.contains("refund inside the shard's settlement window"),
+            "a refund must not open while the provider still has time to answer: {early}"
+        );
+        let late = refund_tx("late", 0, &work, true, None, deadline + 1);
+        settle_and_replay(&set, "late", late).expect("a refund one second past the window stands");
+
+        let mut ontime = signed_reward("ontime", 0, &provider, &work, true);
+        ontime.created_at = deadline;
+        settle_and_replay(&set, "ontime", ontime).expect("a reward inside the window stands");
+
+        let mut stale = signed_reward("stale", 0, &provider, &work, true);
+        stale.created_at = deadline + 1;
+        let stale = refused(settle_and_replay(&set, "stale", stale));
+        assert!(
+            stale.contains("reward arrived after the shard's settlement window"),
+            "a reward must not land once a refund may already have settled: {stale}"
+        );
+    }
+
+    /// The refund carries the reward's claim key, so a shard settling twice is
+    /// refused by the store rather than by a rule somebody has to remember.
+    #[test]
+    fn a_shard_that_was_rewarded_cannot_also_be_refunded() {
+        let set = validator_set("refund-exclusive");
+        let work = WorkSpec::PrimeCount { start: 2, end: 20 };
+        let provider = test_identity("refund-exclusive-provider");
+        let mut store = crate::store::LedgerStore::open(":memory:").unwrap();
+        let reserve = certified_community_reserve(&set, "job-once", 1, "GENESIS");
+        store.apply(&reserve, &set.set).unwrap();
+        let reward = certify(
+            &set,
+            signed_reward("job-once", 0, &provider, &work, true),
+            2,
+            &reserve.entry.entry_hash,
+        );
+        store.apply(&reward, &set.set).unwrap();
+
+        let late = 1 + hocmesh_protocol::SETTLEMENT_WINDOW_SECS + 1;
+        let refund = certify(
+            &set,
+            refund_tx("job-once", 0, &work, true, None, late),
+            3,
+            &reward.entry.entry_hash,
+        );
+        let second = refused(store.apply(&refund, &set.set));
+        assert!(
+            second.contains("claim already settled"),
+            "the reward already spent this shard's one settlement: {second}"
+        );
+    }
+
+    /// The point of the whole transaction: escrow that would otherwise be
+    /// locked forever comes back, and no CU is created on the way.
+    #[test]
+    fn refunding_a_dead_shard_returns_every_unit_it_reserved() {
+        let set = validator_set("refund-conserved");
+        let work = WorkSpec::PrimeCount { start: 2, end: 20 };
+        let late = 1 + hocmesh_protocol::SETTLEMENT_WINDOW_SECS + 1;
+        let refund = refund_tx("job-dead", 0, &work, true, None, late);
+        let store = settle_and_replay(&set, "job-dead", refund).unwrap();
+        assert_eq!(store.balance(&escrow_account("job-dead")).unwrap(), 0);
+        assert_eq!(
+            store.balance(COMMUNITY_ISSUANCE_ACCOUNT).unwrap(),
+            0,
+            "CU minted for work nobody did is unminted"
+        );
     }
 }

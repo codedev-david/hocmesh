@@ -12,7 +12,7 @@ pub struct LedgerStore {
     conn: Connection,
 }
 
-type ReservationRecord = (hocmesh_protocol::WorkSpec, u32, bool, Option<String>);
+type ReservationRecord = (hocmesh_protocol::WorkSpec, u32, bool, Option<String>, i64);
 
 fn sqlite_sequence(sequence: u64) -> Result<i64> {
     i64::try_from(sequence).context("ledger sequence exceeds SQLite INTEGER range")
@@ -62,7 +62,8 @@ impl LedgerStore {
                 work_json TEXT NOT NULL,
                 shards INTEGER NOT NULL,
                 system_funded INTEGER NOT NULL,
-                requester_node_id TEXT
+                requester_node_id TEXT,
+                reserved_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS assignment_rewards(
                 assignment_id TEXT PRIMARY KEY,
@@ -76,6 +77,14 @@ impl LedgerStore {
                 ON assignment_rewards(job_id);
             "#,
         )?;
+        // job_reservations is a rebuildable index, but a database written
+        // before refunds existed has no reserved_at column and CREATE TABLE
+        // IF NOT EXISTS will not add one. Adding it is a no-op the second
+        // time, so the error for "already there" is the expected case.
+        let _ = c.execute(
+            "ALTER TABLE job_reservations ADD COLUMN reserved_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         let mut store = Self { conn: c };
         store.rebuild_indexes()?;
         Ok(store)
@@ -158,7 +167,7 @@ impl LedgerStore {
     pub fn reservation(&self, job_id: &str) -> Result<Option<ReservationRecord>> {
         self.conn
             .query_row(
-                "SELECT work_json,shards,system_funded,requester_node_id FROM job_reservations WHERE job_id=?1",
+                "SELECT work_json,shards,system_funded,requester_node_id,reserved_at FROM job_reservations WHERE job_id=?1",
                 params![job_id],
                 |r| {
                     let work_json: String = r.get(0)?;
@@ -167,14 +176,15 @@ impl LedgerStore {
                         r.get::<_, i64>(1)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, Option<String>>(3)?,
+                        r.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()?
-            .map(|(work_json, shards, system_funded, requester)| {
+            .map(|(work_json, shards, system_funded, requester, reserved_at)| {
                 let shards = u32::try_from(shards).context("stored shard count is outside u32")?;
                 let work = serde_json::from_str(&work_json)?;
-                Ok((work, shards, system_funded != 0, requester))
+                Ok((work, shards, system_funded != 0, requester, reserved_at))
             })
             .transpose()
     }
@@ -292,7 +302,7 @@ impl LedgerStore {
         let mut claims = std::collections::HashSet::<String>::new();
         let mut reservations = std::collections::HashMap::<
             String,
-            (hocmesh_protocol::WorkSpec, u32, bool, Option<String>),
+            (hocmesh_protocol::WorkSpec, u32, bool, Option<String>, i64),
         >::new();
         for c in certs {
             verify_certificate(&c, set)?;
@@ -320,6 +330,7 @@ impl LedgerStore {
                                 e.shards,
                                 false,
                                 Some(e.requester_auth.node_id.clone()),
+                                c.entry.transaction.created_at,
                             ),
                         )
                         .is_some()
@@ -333,14 +344,24 @@ impl LedgerStore {
                     shards,
                 } => {
                     if reservations
-                        .insert(job_id.clone(), (work.clone(), *shards, true, None))
+                        .insert(
+                            job_id.clone(),
+                            (
+                                work.clone(),
+                                *shards,
+                                true,
+                                None,
+                                c.entry.transaction.created_at,
+                            ),
+                        )
                         .is_some()
                     {
                         bail!("duplicate community job reservation: {job_id}")
                     }
                 }
                 TransactionEvidence::ProviderReward(e) => {
-                    let Some((root, shards, system, requester)) = reservations.get(&e.job_id)
+                    let Some((root, shards, system, requester, reserved_at)) =
+                        reservations.get(&e.job_id)
                     else {
                         bail!("reward references missing reservation: {}", e.job_id)
                     };
@@ -356,6 +377,45 @@ impl LedgerStore {
                     };
                     if expected != &e.work {
                         bail!("reward work differs from reserved shard")
+                    }
+                    // A reward and a refund for one shard are disjoint in
+                    // time, so a provider that misses the window it agreed to
+                    // cannot race the requester's refund for the same escrow.
+                    if c.entry.transaction.created_at
+                        > reserved_at + hocmesh_protocol::SETTLEMENT_WINDOW_SECS
+                    {
+                        bail!("reward arrived after the shard's settlement window")
+                    }
+                }
+                TransactionEvidence::JobRefund(e) => {
+                    let Some((root, shards, system, requester, reserved_at)) =
+                        reservations.get(&e.job_id)
+                    else {
+                        bail!("refund references missing reservation: {}", e.job_id)
+                    };
+                    if *system != e.system_funded {
+                        bail!("refund funding type differs from reservation")
+                    }
+                    // The escrow goes back where it came from, never to
+                    // whoever happened to ask.
+                    let claimant = e.requester_auth.as_ref().map(|a| a.node_id.as_str());
+                    if requester.as_deref() != claimant {
+                        bail!("refund pays someone other than the requester who reserved")
+                    }
+                    let parts = hocmesh_core::compute::split_work(root, *shards);
+                    let Some(expected) = parts.get(e.shard_index as usize) else {
+                        bail!("refund shard index outside reservation")
+                    };
+                    // Without this a refund could name a fatter shard than it
+                    // reserved and drain escrow that is not its own.
+                    if expected != &e.work {
+                        bail!("refund work differs from reserved shard")
+                    }
+                    // A reward and a refund for one shard never share a moment.
+                    if c.entry.transaction.created_at
+                        <= reserved_at + hocmesh_protocol::SETTLEMENT_WINDOW_SECS
+                    {
+                        bail!("refund inside the shard's settlement window")
                     }
                 }
             }
@@ -404,14 +464,15 @@ fn index_certificate(tx: &rusqlite::Transaction<'_>, cert: &QuorumCertificate) -
     match &cert.entry.transaction.evidence {
         TransactionEvidence::JobReserve(e) => {
             tx.execute(
-                "INSERT OR REPLACE INTO job_reservations(job_id,sequence,work_json,shards,system_funded,requester_node_id)
-                 VALUES(?1,?2,?3,?4,0,?5)",
+                "INSERT OR REPLACE INTO job_reservations(job_id,sequence,work_json,shards,system_funded,requester_node_id,reserved_at)
+                 VALUES(?1,?2,?3,?4,0,?5,?6)",
                 params![
                     e.job_id,
                     sequence,
                     serde_json::to_string(&e.work)?,
                     i64::from(e.shards),
                     e.requester_auth.node_id,
+                    cert.entry.transaction.created_at,
                 ],
             )?;
         }
@@ -421,9 +482,15 @@ fn index_certificate(tx: &rusqlite::Transaction<'_>, cert: &QuorumCertificate) -
             shards,
         } => {
             tx.execute(
-                "INSERT OR REPLACE INTO job_reservations(job_id,sequence,work_json,shards,system_funded,requester_node_id)
-                 VALUES(?1,?2,?3,?4,1,NULL)",
-                params![job_id, sequence, serde_json::to_string(work)?, i64::from(*shards)],
+                "INSERT OR REPLACE INTO job_reservations(job_id,sequence,work_json,shards,system_funded,requester_node_id,reserved_at)
+                 VALUES(?1,?2,?3,?4,1,NULL,?5)",
+                params![
+                    job_id,
+                    sequence,
+                    serde_json::to_string(work)?,
+                    i64::from(*shards),
+                    cert.entry.transaction.created_at,
+                ],
             )?;
         }
         TransactionEvidence::ProviderReward(e) => {
@@ -439,6 +506,12 @@ fn index_certificate(tx: &rusqlite::Transaction<'_>, cert: &QuorumCertificate) -
                     if e.system_funded { 1_i64 } else { 0_i64 },
                 ],
             )?;
+        }
+        TransactionEvidence::JobRefund(_) => {
+            // Nothing is indexed. A refund shares the claim key of the reward
+            // it replaces, so the claims table has already recorded that this
+            // shard is settled, and the escrow it empties is visible in the
+            // postings like every other movement of CU.
         }
     }
     Ok(())

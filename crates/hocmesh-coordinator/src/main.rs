@@ -283,14 +283,23 @@ fn finalize_reward_db(
     };
     tx.execute("UPDATE assignments SET status='completed',completed_at=?2,lease_until=NULL WHERE assignment_id=?1 AND status='settling'",params![assignment_id,now_unix()])?;
     let remaining: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM assignments WHERE job_id=?1 AND status!='completed'",
+        "SELECT COUNT(*) FROM assignments WHERE job_id=?1 AND status NOT IN ('completed','refunded')",
         params![job_id],
         |r| r.get(0),
     )?;
     if remaining == 0 {
+        // A job that had a shard refunded closed short of what it asked for,
+        // and the recovery path has to say so for the same reason the live
+        // one does: a partial result set should never read as a whole one.
+        let refunded: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM assignments WHERE job_id=?1 AND status='refunded'",
+            params![job_id],
+            |r| r.get(0),
+        )?;
+        let status = if refunded > 0 { "closed" } else { "completed" };
         tx.execute(
-            "UPDATE jobs SET status='completed',completed_at=?2 WHERE job_id=?1",
-            params![job_id, now_unix()],
+            "UPDATE jobs SET status=?2,completed_at=?3 WHERE job_id=?1",
+            params![job_id, status, now_unix()],
         )?;
     }
     tx.commit()?;

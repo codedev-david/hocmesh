@@ -167,6 +167,10 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         shards: u32,
     },
+    /// Take back the escrow on shards of your job that nobody ever delivered.
+    Reclaim {
+        job_id: String,
+    },
     Job {
         job_id: String,
     },
@@ -614,6 +618,37 @@ stored at: {}",
             );
             if let Some(t) = j.prime_count_total {
                 println!("Current prime-count result: {t}");
+            }
+            if !j.refundable.is_empty() {
+                println!(
+                    "Reclaimable: {} shard(s) worth {:.3} CU - run `hocmesh reclaim {}`",
+                    j.refundable.len(),
+                    j.refundable.iter().map(|s| s.refund_mcu).sum::<i64>() as f64 / 1000.0,
+                    j.job_id
+                );
+            }
+        }
+        Command::Reclaim { job_id } => {
+            let refunds = client.reclaim(&job_id).await?;
+            if refunds.is_empty() {
+                println!(
+                    "Nothing to reclaim: no shard of {job_id} has outlived its settlement window."
+                );
+            }
+            let total: i64 = refunds.iter().map(|r| r.refund_mcu).sum();
+            for r in &refunds {
+                println!(
+                    "Returned {:.3} CU to {}{}",
+                    r.refund_mcu as f64 / 1000.0,
+                    r.paid_to,
+                    r.ledger_entry_hash
+                        .as_deref()
+                        .map(|h| format!(" (ledger entry {h})"))
+                        .unwrap_or_default()
+                );
+            }
+            if !refunds.is_empty() {
+                println!("Reclaimed {:.3} CU in total.", total as f64 / 1000.0);
             }
         }
         Command::Network => {

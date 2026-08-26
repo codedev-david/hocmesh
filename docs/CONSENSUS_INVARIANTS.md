@@ -33,6 +33,7 @@ The only account allowed to supply newly issued bootstrap CU is `hocmesh:communi
 
 - Both user and community reservations claim `reserve:<job_id>`.
 - Provider settlements claim `reward:<assignment_id>`.
+- Escrow refunds claim `reward:<assignment_id>` too, so a shard settles in exactly one direction.
 - A claim can appear only once in certified history.
 - Job IDs are bound to requester-signed nonces for user jobs.
 - Assignment IDs are deterministic from `(job_id, shard_index)`.
@@ -47,7 +48,42 @@ A provider reward is valid only when:
 - the shard is exactly the deterministic split of a previously certified root reservation;
 - its funding type matches that reservation;
 - for member-funded jobs, provider != requester;
-- escrow has enough CU.
+- escrow has enough CU;
+- the reward arrives no later than `reserved_at + SETTLEMENT_WINDOW_SECS`.
+
+## Escrow refunds
+
+Escrow that can only ever pay out is a one-way valve: a shard whose provider
+cheats, crashes, or simply never answers takes the CU that funded it with it,
+and catching a cheat never becomes a settlement. `JobRefund` is the other
+direction, and it is safe because of three rules.
+
+**One claim key.** A refund claims `reward:<assignment_id>` - the same key the
+reward claims. Exactly-once is therefore enforced by the claims table rather
+than by a rule anyone has to remember: a shard settles once, in one direction,
+and no reconciliation pass can double-spend it.
+
+**The escrow returns where it came from.** A member-funded shard refunds only
+to the node whose signature reserved it, and only against that node's
+signature over the refund body. A community-funded shard has no requester at
+all: its CU was minted against `COMMUNITY_ISSUANCE_ACCOUNT` and it is unminted
+back to that account. Letting a node claim minted escrow would make "reserve
+community work, let it fail, keep the CU" a free mint, so the protocol refuses
+a community refund that carries any requester authorisation at all.
+
+**Reward and refund never overlap in time.** A reward is valid only at or
+before `reserved_at + SETTLEMENT_WINDOW_SECS`; a refund only strictly after.
+The two windows are disjoint, so a provider and a requester can never race for
+the same escrow, and a provider that misses the deadline it accepted cannot
+outbid the requester who is reclaiming it.
+
+`SETTLEMENT_WINDOW_SECS` is `DEFAULT_LEASE_SECONDS * 4` (3600s), and it is
+measured from the `created_at` of the certified reservation - never from a
+coordinator lease, which no validator has any reason to trust.
+
+A refund is otherwise validated exactly like a reward: same shard-split check
+against the certified root reservation, same funding-type check, same
+deterministic amount, and the same two-posting shape.
 
 ## Replay rules
 

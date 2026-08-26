@@ -223,7 +223,7 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
         if s.has_claim(&ck)? {
             bail!("claim already settled: {ck}")
         };
-        validate_reward_membership(&s, &r.transaction)?;
+        validate_settlement_membership(&s, &r.transaction)?;
         let h = s.head(&a.set)?;
         validate_transaction(
             &r.transaction,
@@ -272,7 +272,7 @@ async fn commit(
         }
         return Err("conflicting/stale certificate".into());
     }
-    validate_reward_membership(&s, &c.entry.transaction).map_err(|e| e.to_string())?;
+    validate_settlement_membership(&s, &c.entry.transaction).map_err(|e| e.to_string())?;
     validate_transaction(
         &c.entry.transaction,
         &c.entry.previous_hash,
@@ -300,25 +300,62 @@ async fn entries(
     }))
 }
 
-fn validate_reward_membership(store: &LedgerStore, tx: &LedgerTransaction) -> Result<()> {
-    if let TransactionEvidence::ProviderReward(e) = &tx.evidence {
-        let Some((root_work, shards, system_funded, requester)) = store.reservation(&e.job_id)?
-        else {
-            bail!("reward references a job with no certified reservation")
-        };
-        if system_funded != e.system_funded {
-            bail!("reward funding type does not match reservation")
-        };
-        if requester.as_deref() == Some(e.provider_auth.node_id.as_str()) {
-            bail!("requester cannot receive a reward from its own paid job")
-        };
-        let parts = hocmesh_core::compute::split_work(&root_work, shards);
-        let Some(expected) = parts.get(e.shard_index as usize) else {
-            bail!("reward shard index is outside reservation")
-        };
-        if expected != &e.work {
-            bail!("reward work is not the reserved shard")
-        };
+/// The reward and the refund for one shard are one claim seen from two sides,
+/// so both are checked against the same reservation and the same window.
+/// Replay in `hocmesh-ledger` enforces exactly these rules; this is the
+/// propose-time copy, so a validator declines to sign what it would later
+/// have to reject.
+fn validate_settlement_membership(store: &LedgerStore, tx: &LedgerTransaction) -> Result<()> {
+    let (job_id, shard_index, work, system_funded, payee, is_refund) = match &tx.evidence {
+        TransactionEvidence::ProviderReward(e) => (
+            &e.job_id,
+            e.shard_index,
+            &e.work,
+            e.system_funded,
+            Some(e.provider_auth.node_id.as_str()),
+            false,
+        ),
+        TransactionEvidence::JobRefund(e) => (
+            &e.job_id,
+            e.shard_index,
+            &e.work,
+            e.system_funded,
+            e.requester_auth.as_ref().map(|a| a.node_id.as_str()),
+            true,
+        ),
+        _ => return Ok(()),
+    };
+    let Some((root_work, shards, reserved_funding, requester, reserved_at)) =
+        store.reservation(job_id)?
+    else {
+        bail!("settlement references a job with no certified reservation")
+    };
+    if reserved_funding != system_funded {
+        bail!("settlement funding type does not match reservation")
+    };
+    if is_refund {
+        // The escrow returns where it came from, never to whoever asks.
+        if requester.as_deref() != payee {
+            bail!("refund pays someone other than the requester who reserved")
+        }
+    } else if requester.as_deref() == payee {
+        bail!("requester cannot receive a reward from its own paid job")
+    };
+    let parts = hocmesh_core::compute::split_work(&root_work, shards);
+    let Some(expected) = parts.get(shard_index as usize) else {
+        bail!("settlement shard index is outside reservation")
+    };
+    if expected != work {
+        bail!("settlement work is not the reserved shard")
+    };
+    // A shard settles once, and which way it settles is decided by the clock
+    // rather than by whoever reaches the validators first.
+    let deadline = reserved_at + hocmesh_protocol::SETTLEMENT_WINDOW_SECS;
+    if is_refund && tx.created_at <= deadline {
+        bail!("refund inside the shard's settlement window")
+    }
+    if !is_refund && tx.created_at > deadline {
+        bail!("reward arrived after the shard's settlement window")
     }
     Ok(())
 }

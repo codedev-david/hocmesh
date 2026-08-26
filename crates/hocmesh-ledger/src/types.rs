@@ -17,6 +17,7 @@ pub enum TransactionKind {
     JobReserve,
     CommunityReserve,
     ProviderReward,
+    JobRefund,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobReserveEvidence {
@@ -56,6 +57,23 @@ pub enum TransactionEvidence {
         shards: u32,
     },
     ProviderReward(ProviderRewardEvidence),
+    JobRefund(JobRefundEvidence),
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRefundEvidence {
+    pub job_id: String,
+    pub assignment_id: String,
+    pub shard_index: u32,
+    pub refund_mcu: i64,
+    pub work: WorkSpec,
+    pub system_funded: bool,
+    /// Who the CU goes back to, and their authorisation to ask for it.
+    ///
+    /// Absent exactly when `system_funded`. Minted CU has no requester to
+    /// return to: it goes back to the issuance account it was minted against,
+    /// and nobody signs for it because nobody receives it.
+    pub requester_public_key_b64: Option<String>,
+    pub requester_auth: Option<AuthProof>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerTransaction {

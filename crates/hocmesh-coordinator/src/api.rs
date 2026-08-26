@@ -20,8 +20,8 @@ use hocmesh_gpu::{BackendKind, DeviceCapability};
 use hocmesh_ledger::{
     network::LedgerNetwork,
     types::{
-        JobReserveEvidence, LedgerTransaction, Posting, ProviderRewardEvidence,
-        TransactionEvidence, TransactionKind, escrow_account,
+        COMMUNITY_ISSUANCE_ACCOUNT, JobRefundEvidence, JobReserveEvidence, LedgerTransaction,
+        Posting, ProviderRewardEvidence, TransactionEvidence, TransactionKind, escrow_account,
     },
     validate::claim_key,
 };
@@ -29,9 +29,10 @@ use hocmesh_model::ModelManifest;
 use hocmesh_protocol::{
     BalanceResponse, DEFAULT_LEASE_SECONDS, HeartbeatRequest, JobStatusResponse, NetworkCoordinate,
     NetworkStatsResponse, NodeCapabilities, NodeStatusResponse, PeerSample, PeerSampleResponse,
-    PollRequest, PollResponse, RegisterRequest, RegisterResponse, ResultRequest, ResultResponse,
-    SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, empty_body_hash,
-    heartbeat_body_hash, job_id_from_auth, now_unix, register_body_hash, result_body_hash,
+    PollRequest, PollResponse, RefundRequest, RefundResponse, RefundableShard, RegisterRequest,
+    RegisterResponse, ResultRequest, ResultResponse, SETTLEMENT_WINDOW_SECS, SubmitJobRequest,
+    SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, empty_body_hash, heartbeat_body_hash,
+    job_id_from_auth, now_unix, refund_body_hash, register_body_hash, result_body_hash,
     submit_body_hash, verify_auth,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -56,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/nodes/heartbeat", post(heartbeat))
         .route("/v1/work/poll", post(poll_work))
         .route("/v1/work/result", post(report_result))
+        .route("/v1/work/refund", post(refund_shard))
         .route("/v1/jobs/submit", post(submit_job))
         .route("/v1/jobs/{id}", get(job_status))
         .route("/v1/nodes/{id}/balance", get(balance))
@@ -812,20 +814,7 @@ async fn report_result(
             Some(&job_id),
             Some(&req.assignment_id),
         )?;
-        let remaining: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM assignments WHERE job_id=?1 AND status!='completed'",
-                params![job_id],
-                |r| r.get(0),
-            )
-            .map_err(ApiError::internal)?;
-        if remaining == 0 {
-            tx.execute(
-                "UPDATE jobs SET status='completed',completed_at=?2 WHERE job_id=?1",
-                params![job_id, now_unix()],
-            )
-            .map_err(ApiError::internal)?;
-        }
+        close_settled_job(&tx, &job_id)?;
         tx.commit().map_err(ApiError::internal)?;
     }
     let job_completed = {
@@ -847,6 +836,231 @@ async fn report_result(
         ledger_entry_hash: ledger_hash,
     }))
 }
+/// Returns one shard's escrow to whoever funded it. Without this an escrow is
+/// a one-way valve: a provider that cheats, or that simply never answers,
+/// leaves the requester's CU locked in the job forever, and catching a cheat
+/// never becomes a settlement. The coordinator only proposes here - the ledger
+/// is what decides whether the settlement window has really closed.
+async fn refund_shard(
+    State(state): State<AppState>,
+    Json(req): Json<RefundRequest>,
+) -> Result<Json<RefundResponse>, ApiError> {
+    let row = {
+        let conn = state.db.lock().map_err(ApiError::internal)?;
+        conn.query_row(
+            "SELECT a.job_id,a.shard_index,a.work_json,a.status,j.system_funded,j.requester_node_id,j.created_at FROM assignments a JOIN jobs j ON j.job_id=a.job_id WHERE a.assignment_id=?1",
+            params![req.assignment_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+    };
+    let Some((job_id, shard_index, work_json, status, system_funded, requester, job_created_at)) =
+        row
+    else {
+        return Err(ApiError::not_found("unknown assignment"));
+    };
+    // Escrow moves once, and only escrow that exists can move at all. A shard
+    // that already settled has nothing left to give back, and a blocked shard
+    // belongs to a job whose reserve was never certified, so it is holding
+    // nothing to return.
+    if status != "pending" && status != "leased" {
+        return Err(ApiError::conflict(format!(
+            "a shard in state '{status}' holds no reclaimable escrow"
+        )));
+    }
+    // The ledger is the authority on when a window closes, and it measures
+    // from the reserve it certified, which is never earlier than the job row
+    // read here. This clock therefore only ever refuses what the ledger would
+    // refuse too, and it turns a rejection into an answer worth reading.
+    if now_unix() <= job_created_at + SETTLEMENT_WINDOW_SECS {
+        return Err(ApiError::conflict(
+            "the settlement window for this shard has not closed yet",
+        ));
+    }
+    let system_funded = system_funded != 0;
+    let work: WorkSpec = serde_json::from_str(&work_json).map_err(ApiError::internal)?;
+    let shard_index = u32::try_from(shard_index).map_err(ApiError::internal)?;
+    let refund_mcu = work_cost_mcu(&work);
+    let body_hash = refund_body_hash(
+        &req.assignment_id,
+        &job_id,
+        shard_index,
+        &work,
+        refund_mcu,
+        system_funded,
+    )
+    .map_err(ApiError::internal)?;
+
+    // Who may claim is decided by who funded, not by who is asking.
+    let (paid_to, requester_public_key_b64) = match (&req.auth, system_funded) {
+        (Some(_), true) => {
+            return Err(ApiError::unauthorized(
+                "community escrow returns to the issuance account, not to a node",
+            ));
+        }
+        (None, false) => {
+            return Err(ApiError::unauthorized(
+                "escrow somebody paid for needs that requester's signature",
+            ));
+        }
+        (None, true) => (COMMUNITY_ISSUANCE_ACCOUNT.to_string(), None),
+        (Some(auth), false) => {
+            if requester.as_deref() != Some(auth.node_id.as_str()) {
+                return Err(ApiError::unauthorized(
+                    "only the requester who funded this job can reclaim its escrow",
+                ));
+            }
+            let conn = state.db.lock().map_err(ApiError::internal)?;
+            authenticate_known_node(&conn, auth, "refund", &body_hash)?;
+            let pk: String = conn
+                .query_row(
+                    "SELECT public_key_b64 FROM nodes WHERE node_id=?1",
+                    params![auth.node_id],
+                    |r| r.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            (auth.node_id.clone(), Some(pk))
+        }
+    };
+
+    let mut ledger_entry_hash = None;
+    if let Some(ledger) = &state.ledger {
+        let tx_record = LedgerTransaction {
+            transaction_id: format!("refund_{}", req.assignment_id),
+            kind: TransactionKind::JobRefund,
+            postings: vec![
+                Posting {
+                    account_id: escrow_account(&job_id),
+                    delta_mcu: -refund_mcu,
+                },
+                Posting {
+                    account_id: paid_to.clone(),
+                    delta_mcu: refund_mcu,
+                },
+            ],
+            evidence: TransactionEvidence::JobRefund(JobRefundEvidence {
+                job_id: job_id.clone(),
+                assignment_id: req.assignment_id.clone(),
+                shard_index,
+                refund_mcu,
+                work: work.clone(),
+                system_funded,
+                requester_public_key_b64,
+                requester_auth: req.auth.clone(),
+            }),
+            created_at: now_unix(),
+        };
+        let ck = claim_key(&tx_record);
+        let tx_json = serde_json::to_string(&tx_record).map_err(ApiError::internal)?;
+        // The ledger decides before the coordinator writes anything down. A
+        // refund and a reward race for the same escrow through the same claim
+        // key, so exactly one of them can win, and marking the shard refunded
+        // first would turn away a provider whose reward the ledger accepted.
+        let cert = ledger
+            .transact(tx_record)
+            .await
+            .map_err(|e| ApiError::conflict(format!("refund refused by the ledger: {e}")))?;
+        ledger_entry_hash = Some(cert.entry.entry_hash.clone());
+        {
+            let mut conn = state.db.lock().map_err(ApiError::internal)?;
+            let local = conn.transaction().map_err(ApiError::internal)?;
+            crate::db::persist_ledger_intent(
+                &local,
+                &ck,
+                "job_refund",
+                &req.assignment_id,
+                &tx_json,
+            )
+            .map_err(ApiError::internal)?;
+            crate::db::certify_ledger_intent(&local, &ck, &cert.entry.entry_hash)
+                .map_err(ApiError::internal)?;
+            settle_refunded_shard(&local, &req.assignment_id, &job_id)?;
+            local.commit().map_err(ApiError::internal)?;
+        }
+    } else {
+        let mut conn = state.db.lock().map_err(ApiError::internal)?;
+        let tx = conn.transaction().map_err(ApiError::internal)?;
+        // Without a ledger the coordinator keeps the balances itself, so it
+        // hands the CU back by hand. Minted escrow has no node to return to:
+        // it simply stops existing, which is what unminting it against the
+        // issuance account amounts to on the real ledger.
+        if !system_funded {
+            apply_ledger_delta(
+                &tx,
+                &paid_to,
+                refund_mcu,
+                "refund",
+                Some(&job_id),
+                Some(&req.assignment_id),
+            )?;
+        }
+        settle_refunded_shard(&tx, &req.assignment_id, &job_id)?;
+        tx.commit().map_err(ApiError::internal)?;
+    }
+
+    Ok(Json(RefundResponse {
+        refund_mcu,
+        paid_to,
+        ledger_entry_hash,
+    }))
+}
+
+/// Marks a shard refunded and closes its job if nothing is left to settle.
+/// A refunded shard is as final as a completed one - it is never leased
+/// again - so it is written down here without a status guard: by the time
+/// this runs the ledger has already decided who the escrow belongs to.
+fn settle_refunded_shard(
+    conn: &Connection,
+    assignment_id: &str,
+    job_id: &str,
+) -> Result<(), ApiError> {
+    conn.execute("UPDATE assignments SET status='refunded',completed_at=?2,lease_until=NULL WHERE assignment_id=?1",params![assignment_id,now_unix()]).map_err(ApiError::internal)?;
+    close_settled_job(conn, job_id)?;
+    Ok(())
+}
+
+/// A job is over once no shard is still waiting on a settlement. It only
+/// counts as completed if every shard actually produced work: one refunded
+/// shard means the job closed short of what it asked for, and a caller that
+/// reads a partial result set deserves to be told which of the two it got.
+fn close_settled_job(conn: &Connection, job_id: &str) -> Result<(), ApiError> {
+    let open: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assignments WHERE job_id=?1 AND status NOT IN ('completed','refunded')",
+            params![job_id],
+            |r| r.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    if open > 0 {
+        return Ok(());
+    }
+    let refunded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assignments WHERE job_id=?1 AND status='refunded'",
+            params![job_id],
+            |r| r.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    let status = if refunded > 0 { "closed" } else { "completed" };
+    conn.execute(
+        "UPDATE jobs SET status=?2,completed_at=?3 WHERE job_id=?1",
+        params![job_id, status, now_unix()],
+    )
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
 async fn submit_job(
     State(state): State<AppState>,
     Json(req): Json<SubmitJobRequest>,
@@ -995,15 +1209,15 @@ async fn job_status(
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
     let conn = state.db.lock().map_err(ApiError::internal)?;
-    let job: Option<(Option<String>, i64, String, i64)> = conn
+    let job: Option<(Option<String>, i64, String, i64, i64)> = conn
         .query_row(
-            "SELECT requester_node_id,system_funded,status,reserved_mcu FROM jobs WHERE job_id=?1",
+            "SELECT requester_node_id,system_funded,status,reserved_mcu,created_at FROM jobs WHERE job_id=?1",
             params![job_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(ApiError::internal)?;
-    let Some((requester_node_id, system_funded, status, reserved_mcu)) = job else {
+    let Some((requester_node_id, system_funded, status, reserved_mcu, created_at)) = job else {
         return Err(ApiError::not_found("job not found"));
     };
     let total: i64 = conn
@@ -1039,6 +1253,36 @@ async fn job_status(
             WorkResult::MatrixMultiply { .. } => {}
         }
     }
+    // Only a shard that is still waiting and whose window has closed can be
+    // reclaimed, which is the same pair of conditions the refund endpoint
+    // applies; listing anything else would only produce refusals.
+    let mut refundable = Vec::new();
+    if now_unix() > created_at + SETTLEMENT_WINDOW_SECS {
+        let mut stmt = conn
+            .prepare(
+                "SELECT assignment_id,shard_index,work_json FROM assignments WHERE job_id=?1 AND status IN ('pending','leased') ORDER BY shard_index",
+            )
+            .map_err(ApiError::internal)?;
+        let rows = stmt
+            .query_map(params![job_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(ApiError::internal)?;
+        for row in rows {
+            let (assignment_id, shard_index, work_json) = row.map_err(ApiError::internal)?;
+            let work: WorkSpec = serde_json::from_str(&work_json).map_err(ApiError::internal)?;
+            refundable.push(RefundableShard {
+                assignment_id,
+                shard_index: shard_index as u32,
+                refund_mcu: work_cost_mcu(&work),
+                work,
+            });
+        }
+    }
     Ok(Json(JobStatusResponse {
         job_id,
         requester_node_id,
@@ -1048,6 +1292,7 @@ async fn job_status(
         completed_assignments: completed as u32,
         reserved_mcu,
         prime_count_total: has.then_some(prime_total),
+        refundable,
     }))
 }
 
@@ -1215,20 +1460,7 @@ fn finalize_reward(
         )
         .map_err(ApiError::internal)?;
     tx.execute("UPDATE assignments SET status='completed',completed_at=?2,lease_until=NULL WHERE assignment_id=?1 AND status='settling'",params![assignment_id,now_unix()]).map_err(ApiError::internal)?;
-    let remaining: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM assignments WHERE job_id=?1 AND status!='completed'",
-            params![job_id],
-            |r| r.get(0),
-        )
-        .map_err(ApiError::internal)?;
-    if remaining == 0 {
-        tx.execute(
-            "UPDATE jobs SET status='completed',completed_at=?2 WHERE job_id=?1",
-            params![job_id, now_unix()],
-        )
-        .map_err(ApiError::internal)?;
-    }
+    close_settled_job(&tx, &job_id)?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(())
 }
@@ -1637,6 +1869,163 @@ mod ai_api_tests {
         let text = response.text().await.unwrap();
         assert!(status.is_success(), "{status}: {text}");
         serde_json::from_str(&text).unwrap()
+    }
+
+    /// Refusals are half of what a refund endpoint promises, so this reads
+    /// the status and the reason rather than unwrapping its way past them.
+    async fn post_raw<T: Serialize + ?Sized>(base: &str, path: &str, body: &T) -> (u16, String) {
+        let response = reqwest::Client::new()
+            .post(format!("{base}{path}"))
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.text().await.unwrap())
+    }
+
+    /// An escrow that can only ever pay out is a trap: a shard nobody
+    /// delivers takes the CU that funded it with it. The refund turns that
+    /// one-way valve into a loop, so this walks the whole way round it -
+    /// pay in, let the window close on nothing, take it back - and checks
+    /// that what comes out is exactly what went in.
+    #[tokio::test]
+    async fn escrow_for_a_shard_nobody_delivers_comes_back_to_the_requester() {
+        let root = std::env::temp_dir().join(format!("hocmesh-refund-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("coordinator.db");
+        let state = AppState {
+            db: Arc::new(Mutex::new(
+                crate::db::open(db_path.to_str().unwrap()).unwrap(),
+            )),
+            ledger: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let base = format!("http://{address}");
+
+        let requester = NodeIdentity::load_or_create(&root.join("requester")).unwrap();
+        register_test_node(&base, &requester, test_capabilities(false, 0)).await;
+        // Earning CU is a different story; this one starts with a node that
+        // already has some to spend.
+        let opening_mcu = 1_000_000i64;
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE balances SET balance_mcu=?2 WHERE node_id=?1",
+            params![requester.node_id(), opening_mcu],
+        )
+        .unwrap();
+        drop(conn);
+
+        let work = WorkSpec::PrimeCount {
+            start: 2,
+            end: 40_000,
+        };
+        let body_hash = submit_body_hash(&work, 2).unwrap();
+        let submitted: SubmitJobResponse = post(
+            &base,
+            "/v1/jobs/submit",
+            &SubmitJobRequest {
+                auth: requester.auth("submit", &body_hash),
+                work: work.clone(),
+                shards: 2,
+            },
+        )
+        .await;
+        assert_eq!(submitted.assignments, 2);
+        assert_eq!(
+            submitted.balance_mcu,
+            opening_mcu - submitted.reserved_mcu,
+            "submitting has to take the whole reservation out of the requester"
+        );
+
+        let shards = split_work(&work, 2);
+        let claim = |index: u32| {
+            let assignment_id = hocmesh_protocol::assignment_id(&submitted.job_id, index);
+            let hash = refund_body_hash(
+                &assignment_id,
+                &submitted.job_id,
+                index,
+                &shards[index as usize],
+                work_cost_mcu(&shards[index as usize]),
+                false,
+            )
+            .unwrap();
+            RefundRequest {
+                assignment_id,
+                auth: Some(requester.auth("refund", &hash)),
+            }
+        };
+
+        // The window is the whole protection. While it is open the shard is
+        // still somebody else's to finish, and taking the CU back would be
+        // taking it out from under them.
+        let (status, body) = post_raw(&base, "/v1/work/refund", &claim(0)).await;
+        assert_eq!(status, 409, "{body}");
+        assert!(
+            body.contains("settlement window for this shard has not closed"),
+            "{body}"
+        );
+
+        // Age the job past its window rather than waiting an hour for it.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE jobs SET created_at=?1 WHERE job_id=?2",
+            params![now_unix() - SETTLEMENT_WINDOW_SECS - 1, submitted.job_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let refunded: RefundResponse = post(&base, "/v1/work/refund", &claim(0)).await;
+        assert_eq!(refunded.paid_to, requester.node_id());
+        assert_eq!(refunded.refund_mcu, work_cost_mcu(&shards[0]));
+
+        // Escrow moves once and only once, whichever direction it moves in.
+        let (status, body) = post_raw(&base, "/v1/work/refund", &claim(0)).await;
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("holds no reclaimable escrow"), "{body}");
+
+        // One shard back does not end the job; the other is still open.
+        let midway: JobStatusResponse = get(&base, &format!("/v1/jobs/{}", submitted.job_id)).await;
+        assert_eq!(midway.status, "pending", "one live shard keeps a job open");
+        // A requester should not have to keep the work spec from the day they
+        // submitted to sign for its escrow back, so the coordinator names the
+        // shard that is still reclaimable and what it is worth.
+        assert_eq!(
+            midway.refundable.len(),
+            1,
+            "the one undelivered shard is the one still on offer"
+        );
+        assert_eq!(midway.refundable[0].shard_index, 1);
+        assert_eq!(
+            midway.refundable[0].refund_mcu,
+            work_cost_mcu(&shards[1]),
+            "what is offered back is what that shard cost"
+        );
+
+        let _: RefundResponse = post(&base, "/v1/work/refund", &claim(1)).await;
+        let closed: JobStatusResponse = get(&base, &format!("/v1/jobs/{}", submitted.job_id)).await;
+        assert_eq!(
+            closed.status, "closed",
+            "a job that gave every shard back never completed anything"
+        );
+        assert!(
+            closed.refundable.is_empty(),
+            "a settled shard is never offered back a second time"
+        );
+
+        let ending: BalanceResponse =
+            get(&base, &format!("/v1/nodes/{}/balance", requester.node_id())).await;
+        assert_eq!(
+            ending.balance_mcu, opening_mcu,
+            "every unit the job reserved has to come back, to the millicu"
+        );
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// The peer sample is a bootstrap directory, so it must only name nodes a

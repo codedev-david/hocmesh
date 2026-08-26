@@ -11,9 +11,10 @@ use hocmesh_model::ModelManifest;
 use hocmesh_protocol::{
     BalanceResponse, ErrorResponse, HeartbeatRequest, JobStatusResponse, NetworkStatsResponse,
     NodeCapabilities, NodeStatusResponse, PeerSampleResponse, PollRequest, PollResponse,
-    RegisterRequest, RegisterResponse, ResultRequest, ResultResponse, SubmitJobRequest,
-    SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, empty_body_hash, heartbeat_body_hash,
-    register_body_hash, result_body_hash, submit_body_hash,
+    RefundRequest, RefundResponse, RegisterRequest, RegisterResponse, ResultRequest,
+    ResultResponse, SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec,
+    empty_body_hash, heartbeat_body_hash, refund_body_hash, register_body_hash, result_body_hash,
+    submit_body_hash,
 };
 use reqwest::{Client, Response};
 use serde::de::DeserializeOwned;
@@ -101,6 +102,34 @@ impl HocMeshClient {
             shards,
         };
         self.post("/v1/jobs/submit", &req).await
+    }
+
+    /// Takes back the escrow on every shard of a job that the mesh let lapse.
+    /// The coordinator says which shards those are and what they were for;
+    /// this signs each one, and the ledger checks that story against the
+    /// reservation it certified before any CU moves.
+    pub async fn reclaim(&self, job_id: &str) -> Result<Vec<RefundResponse>> {
+        let job = self.job_status(job_id).await?;
+        let mut reclaimed = Vec::new();
+        for shard in job.refundable {
+            let body_hash = refund_body_hash(
+                &shard.assignment_id,
+                job_id,
+                shard.shard_index,
+                &shard.work,
+                shard.refund_mcu,
+                job.system_funded,
+            )?;
+            // Community work was never anyone-in-particular's to pay for, so
+            // there is nobody to sign for its return either.
+            let auth = (!job.system_funded).then(|| self.identity.auth("refund", &body_hash));
+            let req = RefundRequest {
+                assignment_id: shard.assignment_id,
+                auth,
+            };
+            reclaimed.push(self.post("/v1/work/refund", &req).await?);
+        }
+        Ok(reclaimed)
     }
 
     pub async fn balance(&self) -> Result<BalanceResponse> {

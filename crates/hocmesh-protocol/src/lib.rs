@@ -242,6 +242,21 @@ pub struct ResultResponse {
     pub job_completed: bool,
     pub ledger_entry_hash: Option<String>,
 }
+/// Asks for one shard's escrow back after its settlement window closed with no
+/// result. `auth` signs the refund body for paid work and is absent for
+/// community work, where the CU returns to the issuance account it was minted
+/// against and there is nobody to authorise on its behalf.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundRequest {
+    pub assignment_id: String,
+    pub auth: Option<AuthProof>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundResponse {
+    pub refund_mcu: i64,
+    pub paid_to: String,
+    pub ledger_entry_hash: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitJobRequest {
     pub auth: AuthProof,
@@ -275,7 +290,24 @@ pub struct JobStatusResponse {
     pub completed_assignments: u32,
     pub reserved_mcu: i64,
     pub prime_count_total: Option<u64>,
+    /// Shards whose settlement window has closed with nothing delivered, so
+    /// the requester can sign for their escrow back without having kept the
+    /// work spec from the day they submitted it. What is named here is only
+    /// a suggestion: the ledger checks every field against the reservation
+    /// it certified, so a coordinator that lies gets a refused refund.
+    #[serde(default)]
+    pub refundable: Vec<RefundableShard>,
 }
+
+/// One shard a requester may reclaim, with everything needed to sign for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundableShard {
+    pub assignment_id: String,
+    pub shard_index: u32,
+    pub work: WorkSpec,
+    pub refund_mcu: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatusResponse {
     pub node_id: String,
@@ -456,6 +488,42 @@ pub fn result_body_hash(
 }
 pub fn submit_body_hash(w: &WorkSpec, s: u32) -> Result<String, serde_json::Error> {
     hash_json(&(w, s))
+}
+
+/// How long a reserved shard has to settle before its CU may be refunded.
+///
+/// A reward and a refund for one shard are deliberately disjoint in time:
+/// inside the window only a reward is valid, outside it only a refund. That
+/// removes the race rather than adjudicating it: a requester cannot pull CU
+/// out from under a provider still inside the window it agreed to, and a
+/// provider cannot claim a shard the mesh has already written off.
+///
+/// It is measured from the reserve's own `created_at`, which is on the chain,
+/// and never from a coordinator's lease, which is not. The coordinator is
+/// never the authority for CU.
+pub const SETTLEMENT_WINDOW_SECS: i64 = DEFAULT_LEASE_SECONDS * 4;
+
+/// The body a requester signs to ask for an unsettled shard's CU back.
+///
+/// The leading tag keeps a signature over a result body from ever being
+/// replayed as a refund request.
+pub fn refund_body_hash(
+    id: &str,
+    job_id: &str,
+    shard_index: u32,
+    work: &WorkSpec,
+    refund_mcu: i64,
+    system_funded: bool,
+) -> Result<String, serde_json::Error> {
+    hash_json(&(
+        "refund",
+        id,
+        job_id,
+        shard_index,
+        work,
+        refund_mcu,
+        system_funded,
+    ))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
