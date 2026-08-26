@@ -275,7 +275,7 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
             &h.entry_hash,
             |x| s.balance(x),
             |j| s.inference_reservation(j),
-            a.set().community_issuance_limit_mcu,
+            &a.set(),
         )?;
         let e = build_entry(h.sequence + 1, h.entry_hash.clone(), r.transactions)?;
         s.lock_vote(e.sequence, &e.entry_hash)?;
@@ -326,7 +326,7 @@ async fn commit(
         &c.entry.previous_hash,
         |x| s.balance(x),
         |j| s.inference_reservation(j),
-        a.set().community_issuance_limit_mcu,
+        &a.set(),
     )
     .map_err(|e| e.to_string())?;
     s.apply(&c, &a.set()).map_err(|e| e.to_string())?;

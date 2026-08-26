@@ -40,7 +40,7 @@ The coordinator persists recent nonces and rejects reuse.
 
 ## Scheduler compromise
 
-In quorum-ledger mode, compromising only the coordinator does not allow silent CU balance rewriting.
+In quorum-ledger mode, compromising only the coordinator does not allow silent CU balance rewriting. It also does not allow minting: a `CommunityReserve` without threshold sponsorships from the sitting set is rejected by every validator.
 
 Validators independently verify ledger transactions and keep separate replicas.
 
@@ -166,7 +166,11 @@ Validator policy specifies a maximum cumulative issuance magnitude.
 
 The bootstrap job is reserved into escrow through a certified `CommunityReserve` transaction before providers are paid.
 
-Future production hardening should require a distinct governance authorization for new community reservations.
+A mint also has to be authorized, not merely affordable. Every `CommunityReserve` carries `sponsors`: signatures from named members of the sitting validator set over the job id, the workload, the shard count and the price. Validation rejects it unless at least `threshold` distinct sitting members signed - the same k-of-n that admits a validator.
+
+Sponsorships bind to one job. Lifting a signature off one mint and attaching it to another fails, because the price and the workload are inside what was signed.
+
+The coordinator holds no key that can mint. It carries sponsorships an operator collected with `hocmesh community-vouch`; it cannot produce them.
 
 ## Transport security
 

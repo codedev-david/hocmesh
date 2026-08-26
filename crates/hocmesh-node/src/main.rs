@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use client::HocMeshClient;
 use hocmesh_ai::{InferenceRequirements, PlanRequest, SubmitInferenceRequest};
+use hocmesh_core::compute::{split_work, work_cost_mcu};
 use hocmesh_core::{hardware, identity::NodeIdentity, limits::ResourceLimits, proximity::Vivaldi};
 use hocmesh_gpu::{InferenceBackend, InferenceRequest, LlamaCppBackend};
 use hocmesh_ledger::{
@@ -15,8 +16,8 @@ use hocmesh_ledger::{
         TransactionKind, ValidatorMember, ValidatorSet, ValidatorSignature,
     },
     validate::{
-        membership_hash, membership_result, validate_validator_set, verify_membership_change,
-        vouch_signing_message,
+        community_reserve_signing_message, membership_hash, membership_result,
+        validate_validator_set, verify_membership_change, vouch_signing_message,
     },
 };
 use hocmesh_model::{ChunkStore, ModelFormat, ModelRegistry, manifest_for_file};
@@ -229,6 +230,23 @@ enum Command {
         validators: String,
         #[arg(long, default_value = ".hocmesh/ledger-mirror.db")]
         db: String,
+    },
+    /// Sign a sponsorship for a community-funded job.
+    ///
+    /// The mint is the one place CU comes from nothing, so it is an operator
+    /// action for the same reason admission is: a validator that signed
+    /// whatever it was handed would make the shared budget free to spend.
+    CommunityVouch {
+        #[arg(long)]
+        validators: String,
+        #[arg(long)]
+        job_id: String,
+        #[arg(long, default_value_t = 2)]
+        start: u64,
+        #[arg(long, default_value_t = 5_000_000)]
+        end: u64,
+        #[arg(long, default_value_t = 32)]
+        shards: u32,
     },
     /// Sign a sponsorship for a change to the validator set.
     ///
@@ -870,6 +888,33 @@ stored at: {}",
             let set = store.current_set()?.unwrap_or(load_set(&validators)?);
             let removed = store.prune_below_checkpoint(&set)?;
             println!("PRUNED {removed} certificates already covered by a checkpoint");
+        }
+        Command::CommunityVouch {
+            validators,
+            job_id,
+            start,
+            end,
+            shards,
+        } => {
+            let set = load_set(&validators)?;
+            let work = WorkSpec::PrimeCount { start, end };
+            let shards = shards.clamp(1, 256);
+            let cost: i64 = split_work(&work, shards).iter().map(work_cost_mcu).sum();
+            let message = community_reserve_signing_message(&job_id, &work, shards, cost)?;
+            let vouch = ValidatorSignature {
+                validator_id: identity.node_id(),
+                signature_b64: identity.sign_bytes_b64(message.as_bytes()),
+            };
+            if !set
+                .members
+                .iter()
+                .any(|m| m.validator_id == vouch.validator_id)
+            {
+                bail!(
+                    "this node is not in the sitting validator set, so its sponsorship counts for nothing"
+                )
+            }
+            println!("{}", serde_json::to_string(&vouch)?);
         }
         Command::MembershipVouch {
             validators,

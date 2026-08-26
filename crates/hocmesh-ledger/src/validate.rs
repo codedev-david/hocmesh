@@ -153,7 +153,7 @@ pub fn validate_batch(
     previous_hash: &str,
     balance: impl Fn(&str) -> Result<i64>,
     reserved: impl Fn(&str) -> Result<Option<InferenceReservation>>,
-    community_issuance_limit_mcu: i64,
+    set: &ValidatorSet,
 ) -> Result<()> {
     let mut overlay = std::collections::HashMap::<String, i64>::new();
     // A job reserved earlier in this same entry has to be visible to a claim
@@ -170,7 +170,7 @@ pub fn validate_batch(
                 Some(r) => Ok(Some(r.clone())),
                 None => reserved(j),
             },
-            community_issuance_limit_mcu,
+            set,
         )?;
         if let TransactionEvidence::InferenceReserve(e) = &tx.evidence {
             reserved_here.insert(e.job_id.clone(), reservation_of(tx, e));
@@ -188,7 +188,7 @@ pub fn validate_transaction(
     previous_hash: &str,
     balance: impl Fn(&str) -> Result<i64>,
     reserved: impl Fn(&str) -> Result<Option<InferenceReservation>>,
-    community_issuance_limit_mcu: i64,
+    set: &ValidatorSet,
 ) -> Result<()> {
     if let TransactionEvidence::MembershipChange(e) = &tx.evidence {
         return validate_membership_shape(tx, e);
@@ -220,7 +220,7 @@ pub fn validate_transaction(
         let next = current
             .checked_add(p.delta_mcu)
             .ok_or_else(|| anyhow::anyhow!("community issuance overflow"))?;
-        if next < -community_issuance_limit_mcu.abs() {
+        if next < -set.community_issuance_limit_mcu.abs() {
             bail!("community issuance limit exceeded")
         }
     }
@@ -234,8 +234,9 @@ pub fn validate_transaction(
                 job_id,
                 work,
                 shards,
+                sponsors,
             },
-        ) => validate_community_reserve(tx, job_id, work, *shards)?,
+        ) => validate_community_reserve(tx, job_id, work, *shards, sponsors, set)?,
         (TransactionKind::ProviderReward, TransactionEvidence::ProviderReward(e)) => {
             validate_reward(tx, e, previous_hash)?
         }
@@ -508,6 +509,8 @@ fn validate_community_reserve(
     job_id: &str,
     work: &hocmesh_protocol::WorkSpec,
     shards: u32,
+    sponsors: &[ValidatorSignature],
+    set: &ValidatorSet,
 ) -> Result<()> {
     work.validate().map_err(anyhow::Error::msg)?;
     issuable(work)?;
@@ -528,7 +531,48 @@ fn validate_community_reserve(
     {
         bail!("community reserve postings do not match workload cost")
     };
+    // Minting is the one place CU comes from nothing, so it cannot be the
+    // coordinator's to do, and it cannot be any single validator's either. The
+    // same k-of-n that admits a member has to put its name on the job: spending
+    // the shared budget is never cheaper than agreeing on who may agree.
+    let message = community_reserve_signing_message(job_id, work, shards, cost)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut good = 0usize;
+    for v in sponsors {
+        if !seen.insert(&v.validator_id) {
+            continue;
+        }
+        if let Some(m) = set
+            .members
+            .iter()
+            .find(|m| m.validator_id == v.validator_id)
+            && verify_validator_signature(m, &message, &v.signature_b64).is_ok()
+        {
+            good += 1
+        }
+    }
+    if good < set.threshold {
+        bail!(
+            "community reserve carries {good} valid sponsorships from the sitting set; {} are required",
+            set.threshold
+        )
+    }
     Ok(())
+}
+
+/// What a sponsor signs to put its name behind a community mint.
+///
+/// The job, the workload, the shard count and the price it comes to are all in
+/// the message, so a sponsorship cannot be lifted off one job and stapled to
+/// another, and cannot outlive the work being changed underneath it.
+pub fn community_reserve_signing_message(
+    job_id: &str,
+    work: &hocmesh_protocol::WorkSpec,
+    shards: u32,
+    cost_mcu: i64,
+) -> Result<String> {
+    let body = hash_json(&(job_id, work, shards, cost_mcu))?;
+    Ok(format!("hocmesh-community-v1|{body}"))
 }
 fn validate_reward(
     tx: &LedgerTransaction,
@@ -580,7 +624,7 @@ pub fn validate_historical_transaction(
     previous_hash: &str,
     signatures: &[ValidatorSignature],
     balance: impl Fn(&str) -> Result<i64>,
-    community_issuance_limit_mcu: i64,
+    set: &ValidatorSet,
 ) -> Result<()> {
     verify_historical_evidence(tx, previous_hash, signatures)?;
     if let TransactionEvidence::MembershipChange(e) = &tx.evidence {
@@ -612,7 +656,7 @@ pub fn validate_historical_transaction(
         let next = balance(COMMUNITY_ISSUANCE_ACCOUNT)?
             .checked_add(p.delta_mcu)
             .ok_or_else(|| anyhow::anyhow!("community issuance overflow"))?;
-        if next < -community_issuance_limit_mcu.abs() {
+        if next < -set.community_issuance_limit_mcu.abs() {
             bail!("community issuance limit exceeded")
         }
     }
@@ -645,8 +689,9 @@ pub fn validate_historical_transaction(
                 job_id,
                 work,
                 shards,
+                sponsors,
             },
-        ) => validate_community_reserve(tx, job_id, work, *shards)?,
+        ) => validate_community_reserve(tx, job_id, work, *shards, sponsors, set)?,
         (TransactionKind::ProviderReward, TransactionEvidence::ProviderReward(e)) => {
             let reward = work_cost_mcu(&e.work);
             if e.reward_mcu != reward
@@ -1313,6 +1358,20 @@ mod tests {
 
     /// The four-argument shape the tests that are not about inference use.
     ///
+    /// The sitting set as these cases need it: the issuance ceiling they are
+    /// actually testing, and a threshold of zero.
+    ///
+    /// Sponsorship is a rule about who may spend the community budget, not
+    /// about balances or ceilings, so it is proved in its own cases against a
+    /// real set with real keys rather than restated in every unrelated one.
+    fn unsponsored_set(community_issuance_limit_mcu: i64) -> ValidatorSet {
+        ValidatorSet {
+            threshold: 0,
+            community_issuance_limit_mcu,
+            members: Vec::new(),
+        }
+    }
+
     /// A job nobody ever reserved is the honest default for them: it is what
     /// the ledger would really see, and it keeps the inference binding tested
     /// where it belongs rather than restated in every unrelated case.
@@ -1327,7 +1386,7 @@ mod tests {
             previous_hash,
             balance,
             |_| Ok(None),
-            community_issuance_limit_mcu,
+            &unsponsored_set(community_issuance_limit_mcu),
         )
     }
 
@@ -1343,7 +1402,7 @@ mod tests {
             previous_hash,
             balance,
             |_| Ok(None),
-            community_issuance_limit_mcu,
+            &unsponsored_set(community_issuance_limit_mcu),
         )
     }
 
@@ -1383,6 +1442,7 @@ mod tests {
                 job_id: "job_test".into(),
                 work,
                 shards,
+                sponsors: vec![],
             },
             created_at: 1,
         };
@@ -1409,6 +1469,7 @@ mod tests {
                 job_id: "job_bad".into(),
                 work,
                 shards: 1,
+                sponsors: vec![],
             },
             created_at: 1,
         };
@@ -1440,6 +1501,7 @@ mod tests {
                 job_id: "job_limit".into(),
                 work,
                 shards,
+                sponsors: vec![],
             },
             created_at: 1,
         };
@@ -1471,8 +1533,14 @@ mod tests {
         let old_auth = auth_at(&requester, "submit", &body_hash, 1);
         let tx = reserve_from_auth("old-job", &requester.public_key_b64(), old_auth, &work, 1);
 
-        validate_historical_transaction(&tx, TEST_PREVIOUS_HASH, &[], |_| Ok(10_000), 1_000_000)
-            .unwrap();
+        validate_historical_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            &[],
+            |_| Ok(10_000),
+            &unsponsored_set(1_000_000),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1640,6 +1708,18 @@ mod tests {
         let work = WorkSpec::PrimeCount { start: 2, end: 20 };
         let shards = 1;
         let cost: i64 = split_work(&work, shards).iter().map(work_cost_mcu).sum();
+        // Signed by the same seats that will certify the entry, because a mint
+        // the set did not agree to is not a mint the ledger should carry.
+        let message = community_reserve_signing_message(job_id, &work, shards, cost).unwrap();
+        let sponsors: Vec<ValidatorSignature> = validators
+            .identities
+            .iter()
+            .take(validators.set.threshold)
+            .map(|k| ValidatorSignature {
+                validator_id: k.node_id(),
+                signature_b64: k.sign_bytes_b64(message.as_bytes()),
+            })
+            .collect();
         let tx = LedgerTransaction {
             transaction_id: format!("community-{job_id}-{sequence}"),
             kind: TransactionKind::CommunityReserve,
@@ -1657,6 +1737,7 @@ mod tests {
                 job_id: job_id.into(),
                 work,
                 shards,
+                sponsors,
             },
             created_at: 1,
         };
@@ -1796,6 +1877,135 @@ mod tests {
             nonce_b64,
             signature_b64: identity.sign_bytes_b64(message.as_bytes()),
         }
+    }
+
+    /// A set of `n` validators with a real threshold, plus their keys.
+    fn sponsor_set(n: usize, threshold: usize) -> (ValidatorSet, Vec<NodeIdentity>) {
+        let ids: Vec<NodeIdentity> = (0..n)
+            .map(|i| test_identity(&format!("sponsor{i}")))
+            .collect();
+        let members = ids
+            .iter()
+            .map(|k| ValidatorMember {
+                validator_id: k.node_id(),
+                url: "http://127.0.0.1:1".into(),
+                public_key_b64: k.public_key_b64(),
+            })
+            .collect();
+        (
+            ValidatorSet {
+                threshold,
+                community_issuance_limit_mcu: 1_000_000_000,
+                members,
+            },
+            ids,
+        )
+    }
+
+    /// A community mint transaction, sponsored by whichever keys are handed in.
+    fn community_tx(job_id: &str, sponsors: Vec<ValidatorSignature>) -> LedgerTransaction {
+        let work = WorkSpec::PrimeCount { start: 2, end: 100 };
+        let shards = 2;
+        let cost: i64 = split_work(&work, shards).iter().map(work_cost_mcu).sum();
+        LedgerTransaction {
+            transaction_id: format!("community_reserve_{job_id}"),
+            kind: TransactionKind::CommunityReserve,
+            postings: vec![
+                Posting {
+                    account_id: COMMUNITY_ISSUANCE_ACCOUNT.into(),
+                    delta_mcu: -cost,
+                },
+                Posting {
+                    account_id: escrow_account(job_id),
+                    delta_mcu: cost,
+                },
+            ],
+            evidence: TransactionEvidence::CommunityReserve {
+                job_id: job_id.into(),
+                work,
+                shards,
+                sponsors,
+            },
+            created_at: 1,
+        }
+    }
+
+    /// Sign the mint the way an operator would, from a validator's own key.
+    fn sponsor(k: &NodeIdentity, job_id: &str) -> ValidatorSignature {
+        let work = WorkSpec::PrimeCount { start: 2, end: 100 };
+        let shards = 2;
+        let cost: i64 = split_work(&work, shards).iter().map(work_cost_mcu).sum();
+        let m = community_reserve_signing_message(job_id, &work, shards, cost).unwrap();
+        ValidatorSignature {
+            validator_id: k.node_id(),
+            signature_b64: k.sign_bytes_b64(m.as_bytes()),
+        }
+    }
+
+    /// The whole point: minting needs the set's own threshold behind it.
+    #[test]
+    fn a_community_mint_needs_the_sets_threshold_of_sponsors() {
+        let (set, keys) = sponsor_set(4, 3);
+        let sponsors = keys[..3].iter().map(|k| sponsor(k, "jobc")).collect();
+        let tx = community_tx("jobc", sponsors);
+        super::validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(0), |_| Ok(None), &set)
+            .unwrap();
+    }
+
+    /// An unsigned mint is the hole this closes: before sponsorship, anything
+    /// that reached a proposal could spend the shared budget on its own say-so.
+    #[test]
+    fn an_unsponsored_community_mint_is_rejected() {
+        let (set, _) = sponsor_set(4, 3);
+        let tx = community_tx("jobc", Vec::new());
+        let err =
+            super::validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(0), |_| Ok(None), &set)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("sponsorships"), "{err}");
+    }
+
+    /// Fewer than the threshold is not a smaller amount of authority, it is
+    /// none: a minority of the set cannot spend what the set holds jointly.
+    #[test]
+    fn a_minority_of_the_set_cannot_mint() {
+        let (set, keys) = sponsor_set(4, 3);
+        let sponsors = keys[..2].iter().map(|k| sponsor(k, "jobc")).collect();
+        let tx = community_tx("jobc", sponsors);
+        assert!(
+            super::validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(0), |_| Ok(None), &set)
+                .is_err()
+        );
+    }
+
+    /// Signatures are bound to the job they were given for, so a sponsorship
+    /// cannot be lifted off one mint and stapled onto another.
+    #[test]
+    fn a_sponsorship_does_not_transfer_to_another_job() {
+        let (set, keys) = sponsor_set(4, 3);
+        let sponsors = keys[..3].iter().map(|k| sponsor(k, "jobc")).collect();
+        let tx = community_tx("jobd", sponsors);
+        let err =
+            super::validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(0), |_| Ok(None), &set)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("sponsorships"), "{err}");
+    }
+
+    /// Outsiders do not count, however many of them sign.
+    #[test]
+    fn sponsorships_from_outside_the_set_count_for_nothing() {
+        let (set, _) = sponsor_set(4, 3);
+        let outsiders: Vec<NodeIdentity> = (0..3)
+            .map(|i| test_identity(&format!("outsider{i}")))
+            .collect();
+        let sponsors = outsiders.iter().map(|k| sponsor(k, "jobc")).collect();
+        let tx = community_tx("jobc", sponsors);
+        let err =
+            super::validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(0), |_| Ok(None), &set)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("sponsorships"), "{err}");
     }
 
     fn test_identity(name: &str) -> NodeIdentity {
@@ -2664,7 +2874,7 @@ mod tests {
             TEST_PREVIOUS_HASH,
             |_| Ok(1_000_000),
             |_| Ok(Some(r.clone())),
-            0,
+            &unsponsored_set(0),
         )
         .unwrap();
     }
@@ -2682,7 +2892,7 @@ mod tests {
             TEST_PREVIOUS_HASH,
             |_| Ok(1_000_000),
             |_| Ok(Some(r.clone())),
-            0,
+            &unsponsored_set(0),
         )
         .unwrap_err()
         .to_string();
@@ -2702,7 +2912,7 @@ mod tests {
             TEST_PREVIOUS_HASH,
             |_| Ok(100_000_000),
             |_| Ok(Some(r.clone())),
-            0,
+            &unsponsored_set(0),
         )
         .unwrap_err()
         .to_string();
@@ -2721,7 +2931,7 @@ mod tests {
             TEST_PREVIOUS_HASH,
             |_| Ok(1_000_000),
             |_| Ok(Some(r.clone())),
-            0,
+            &unsponsored_set(0),
         )
         .unwrap_err()
         .to_string();
@@ -2739,7 +2949,7 @@ mod tests {
             TEST_PREVIOUS_HASH,
             |_| Ok(1_000_000),
             |_| Ok(None),
-            0,
+            &unsponsored_set(0),
         )
         .unwrap_err()
         .to_string();

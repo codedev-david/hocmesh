@@ -680,7 +680,7 @@ impl LedgerStore {
                     &c.entry.previous_hash,
                     &c.signatures,
                     |a| Ok(*balances.get(a).unwrap_or(&0)),
-                    active.community_issuance_limit_mcu,
+                    &active,
                 )?;
                 match &txn.evidence {
                     TransactionEvidence::JobReserve(e) => {
@@ -704,6 +704,7 @@ impl LedgerStore {
                         job_id,
                         work,
                         shards,
+                        ..
                     } => {
                         if reservations
                             .insert(
@@ -957,6 +958,7 @@ fn index_certificate(tx: &rusqlite::Transaction<'_>, cert: &QuorumCertificate) -
                 job_id,
                 work,
                 shards,
+                ..
             } => {
                 tx.execute(
                 "INSERT OR REPLACE INTO job_reservations(job_id,sequence,work_json,shards,system_funded,requester_node_id,reserved_at)

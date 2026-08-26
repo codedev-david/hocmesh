@@ -96,9 +96,23 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
     }
 
     let coordinator_db = tmp.path.join("coordinator.db");
+    let node_bin = bin_dir.join(exe("hocmesh"));
+    let seed_job = "job_community_seed";
+    let seed_sponsors = sponsors_file(
+        &tmp.path,
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        seed_job,
+        (2, 200000, 4),
+    )?;
     run_ok(
         Command::new(&coordinator_bin)
             .arg("seed")
+            .arg("--job-id")
+            .arg(seed_job)
+            .arg("--sponsors")
+            .arg(&seed_sponsors)
             .arg("--db")
             .arg(&coordinator_db)
             .arg("--validators")
@@ -467,8 +481,22 @@ async fn coordinator_recovers_community_reservation_after_intent_persisted() -> 
         create_validator_set(&tmp, &validator_bin, &validator_ports)?;
 
     let coordinator_db = tmp.path.join("coordinator-recovery.db");
+    let node_bin = bin_dir.join(exe("hocmesh"));
+    let seed_job = "job_recovery_seed";
+    let seed_sponsors = sponsors_file(
+        &tmp.path,
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        seed_job,
+        (2, 500, 2),
+    )?;
     let failed_seed = Command::new(&coordinator_bin)
         .arg("seed")
+        .arg("--job-id")
+        .arg(seed_job)
+        .arg("--sponsors")
+        .arg(&seed_sponsors)
         .arg("--db")
         .arg(&coordinator_db)
         .arg("--validators")
@@ -1026,7 +1054,23 @@ async fn concurrent_settlements_share_ledger_entries() -> Result<()> {
     let work = WorkSpec::PrimeCount { start: 2, end: 200 };
     let cost: i64 = split_work(&work, 1).iter().map(work_cost_mcu).sum();
     let mut handles = Vec::new();
+    // Sponsorships are collected up front, on purpose. They are an operator
+    // action taken before a mint is submitted, and shelling out to a validator
+    // machine mid-loop would serialise the submissions this test exists to
+    // send at once - measuring the harness instead of the batching.
+    let node_bin = bin_dir.join(exe("hocmesh"));
+    let mut sponsorships = Vec::new();
     for index in 0..SETTLEMENTS {
+        let job_id = format!("job_batching_{index}");
+        sponsorships.push(community_vouches(
+            &node_bin,
+            &validator_homes,
+            &validators_path,
+            &job_id,
+            (2, 200, 1),
+        )?);
+    }
+    for (index, sponsors) in sponsorships.into_iter().enumerate() {
         let job_id = format!("job_batching_{index}");
         let tx = LedgerTransaction {
             transaction_id: format!("community_reserve_{job_id}"),
@@ -1045,6 +1089,7 @@ async fn concurrent_settlements_share_ledger_entries() -> Result<()> {
                 job_id,
                 work: work.clone(),
                 shards: 1,
+                sponsors,
             },
             created_at: now_unix(),
         };
@@ -1126,7 +1171,14 @@ async fn a_vouched_validator_joins_and_the_chain_carries_the_change() -> Result<
     // Something in the chain before the set moves, so the joiner has history to
     // replay that predates its own admission.
     let net = LedgerNetwork::new(set.clone())?;
-    settle_community(&net, "before").await?;
+    settle_community(
+        &net,
+        "before",
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+    )
+    .await?;
     let before = net.head_quorum().await?.sequence;
 
     // A fifth identity, created but in nobody's set.
@@ -1198,7 +1250,7 @@ async fn a_vouched_validator_joins_and_the_chain_carries_the_change() -> Result<
     // A client still holding the four-member file settles again. Quorum is four
     // of five now, which that file cannot reach, so this only passes if the
     // client followed the change forward on its own.
-    settle_community(&net, "after").await?;
+    settle_community(&net, "after", &node_bin, &validator_homes, &validators_path).await?;
     assert_eq!(net.set().members.len(), 5);
     assert!(net.head_quorum().await?.sequence > before);
 
@@ -1206,7 +1258,14 @@ async fn a_vouched_validator_joins_and_the_chain_carries_the_change() -> Result<
     // four, and one of them is the joiner: nothing settles from here unless the
     // admission was real.
     validators[0].kill();
-    settle_community(&net, "without-a-founder").await?;
+    settle_community(
+        &net,
+        "without-a-founder",
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+    )
+    .await?;
 
     let head = net.head_quorum().await?;
     let joiner_head = validator_head(&http, &joiner.url).await?;
@@ -1278,12 +1337,87 @@ fn vouch(
     Ok(serde_json::from_str(line)?)
 }
 
+/// Write the sponsorships a community mint needs into a file the coordinator
+/// can carry. The coordinator holds no key that can mint, so this is the only
+/// way a seeded job gets authorized.
+fn sponsors_file(
+    dir: &Path,
+    node_bin: &Path,
+    homes: &[PathBuf],
+    validators_path: &Path,
+    job_id: &str,
+    work: (u64, u64, u32),
+) -> Result<PathBuf> {
+    let vouches = community_vouches(node_bin, homes, validators_path, job_id, work)?;
+    let path = dir.join(format!("sponsors-{job_id}.json"));
+    fs::write(&path, serde_json::to_vec_pretty(&vouches)?)?;
+    Ok(path)
+}
+
+/// Collect enough real sponsorships to mint a community job.
+///
+/// Shelled out to the node binary on purpose: the sponsorship has to come off
+/// the key that actually sits in a validator's home, so a test that signed
+/// in-process would be proving something the operator flow never does.
+fn community_vouches(
+    node_bin: &Path,
+    homes: &[PathBuf],
+    validators_path: &Path,
+    job_id: &str,
+    work: (u64, u64, u32),
+) -> Result<Vec<ValidatorSignature>> {
+    let (start, end, shards) = work;
+    // Every home handed in signs. The set's threshold can move between
+    // collecting sponsorships and submitting the mint - that is what happens
+    // the moment a validator joins - and a spare signature costs nothing while
+    // a missing one costs the whole settlement.
+    let mut out = Vec::new();
+    for home in homes {
+        let output = Command::new(node_bin)
+            .arg("--home")
+            .arg(home)
+            .arg("community-vouch")
+            .arg("--validators")
+            .arg(validators_path)
+            .arg("--job-id")
+            .arg(job_id)
+            .arg("--start")
+            .arg(start.to_string())
+            .arg("--end")
+            .arg(end.to_string())
+            .arg("--shards")
+            .arg(shards.to_string())
+            .output()
+            .context("running community-vouch")?;
+        if !output.status.success() {
+            bail!(
+                "community-vouch failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let stdout = String::from_utf8(output.stdout)?;
+        let line = stdout
+            .lines()
+            .next_back()
+            .ok_or_else(|| anyhow!("community-vouch printed nothing"))?;
+        out.push(serde_json::from_str(line)?);
+    }
+    Ok(out)
+}
+
 /// Mint a small community job and settle its reservation through the quorum.
-async fn settle_community(net: &LedgerNetwork, label: &str) -> Result<()> {
+async fn settle_community(
+    net: &LedgerNetwork,
+    label: &str,
+    node_bin: &Path,
+    homes: &[PathBuf],
+    validators_path: &Path,
+) -> Result<()> {
     let work = WorkSpec::PrimeCount { start: 2, end: 200 };
     let shards = 1;
     let cost: i64 = split_work(&work, shards).iter().map(work_cost_mcu).sum();
     let job_id = format!("job_membership_{label}");
+    let sponsors = community_vouches(node_bin, homes, validators_path, &job_id, (2, 200, shards))?;
     net.transact(LedgerTransaction {
         transaction_id: format!("community_reserve_{job_id}"),
         kind: TransactionKind::CommunityReserve,
@@ -1301,6 +1435,7 @@ async fn settle_community(net: &LedgerNetwork, label: &str) -> Result<()> {
             job_id,
             work,
             shards,
+            sponsors,
         },
         created_at: now_unix(),
     })

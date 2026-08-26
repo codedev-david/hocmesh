@@ -10,7 +10,7 @@ use hocmesh_ledger::{
     network::LedgerNetwork,
     types::{
         COMMUNITY_ISSUANCE_ACCOUNT, LedgerTransaction, Posting, TransactionEvidence,
-        TransactionKind, ValidatorSet, escrow_account,
+        TransactionKind, ValidatorSet, ValidatorSignature, escrow_account,
     },
     validate::claim_key,
 };
@@ -51,6 +51,16 @@ enum Command {
         shards: u32,
         #[arg(long)]
         validators: Option<String>,
+        /// Sponsorships from the sitting validator set, as a JSON array.
+        ///
+        /// Required whenever a ledger is configured: minting is the set's
+        /// decision, not the coordinator's, so the coordinator can only carry
+        /// signatures it was handed.
+        #[arg(long)]
+        sponsors: Option<String>,
+        /// Fix the job id so sponsors can sign it before it exists.
+        #[arg(long)]
+        job_id: Option<String>,
     },
     Recover {
         #[arg(long, default_value = "hocmesh.db")]
@@ -79,12 +89,16 @@ async fn main() -> Result<()> {
             end,
             shards,
             validators,
+            sponsors,
+            job_id,
         } => {
             seed(
                 &db,
                 WorkSpec::PrimeCount { start, end },
                 shards,
                 validators.as_deref(),
+                sponsors.as_deref(),
+                job_id.as_deref(),
             )
             .await
         }
@@ -101,11 +115,29 @@ fn load_network(path: &str) -> Result<LedgerNetwork> {
     LedgerNetwork::new(set)
 }
 
-async fn seed(db_path: &str, work: WorkSpec, shards: u32, validators: Option<&str>) -> Result<()> {
+async fn seed(
+    db_path: &str,
+    work: WorkSpec,
+    shards: u32,
+    validators: Option<&str>,
+    sponsors: Option<&str>,
+    job_id: Option<&str>,
+) -> Result<()> {
     work.validate().map_err(anyhow::Error::msg)?;
     let shards = shards.clamp(1, 256);
-    let job_id = format!("job_community_{}", Uuid::new_v4().simple());
+    let job_id = job_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("job_community_{}", Uuid::new_v4().simple()));
     let network = validators.map(load_network).transpose()?;
+    // A mint with no sponsors would be rejected by every validator anyway, so
+    // say so here rather than let the operator find out from a quorum failure.
+    let sponsors: Vec<ValidatorSignature> = match sponsors {
+        Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+        None if network.is_some() => bail!(
+            "a community mint needs sponsorships from the sitting validator set; collect them with `hocmesh community-vouch` and pass --sponsors"
+        ),
+        None => Vec::new(),
+    };
     let ledger_tx = network.as_ref().map(|_| {
         let cost: i64 = split_work(&work, shards).iter().map(work_cost_mcu).sum();
         LedgerTransaction {
@@ -125,6 +157,7 @@ async fn seed(db_path: &str, work: WorkSpec, shards: u32, validators: Option<&st
                 job_id: job_id.clone(),
                 work: work.clone(),
                 shards,
+                sponsors: sponsors.clone(),
             },
             created_at: now_unix(),
         }

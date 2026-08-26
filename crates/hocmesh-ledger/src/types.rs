@@ -59,6 +59,13 @@ pub enum TransactionEvidence {
         job_id: String,
         work: WorkSpec,
         shards: u32,
+        /// Named validators putting their own keys behind this mint.
+        ///
+        /// Community issuance is the one place CU comes from nothing. The
+        /// quorum certificate says the entry was agreed; a sponsorship says a
+        /// particular validator chose to spend the shared budget on this
+        /// particular job, and that stays legible long after the set rotates.
+        sponsors: Vec<ValidatorSignature>,
     },
     ProviderReward(ProviderRewardEvidence),
     JobRefund(JobRefundEvidence),

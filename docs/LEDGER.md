@@ -37,6 +37,25 @@ community job escrow +100 CU
 
 The issuance account is the only account allowed to become negative and its magnitude is bounded by `community_issuance_limit_mcu` in the pinned validator set.
 
+## Who is allowed to mint
+
+Community issuance is the only place CU comes from nothing, so it is the only
+place the ledger has to answer "says who?" rather than "does this balance?".
+
+A `CommunityReserve` transaction carries `sponsors`: signatures from named
+members of the sitting validator set over the job id, the workload, the shard
+count and the price it comes to. A mint is valid only if at least `threshold`
+distinct sitting members have signed it - the same k-of-n that admits a new
+validator. Spending the shared budget is never cheaper than agreeing on who is
+allowed to agree.
+
+Sponsorships are produced by an operator on a validator machine with `hocmesh
+community-vouch`, and carried - never created - by whoever assembles the
+transaction. The coordinator holds no key that can mint.
+
+The limit still applies. Sponsorship says the set chose to spend; the limit
+says how much there was to spend. Neither replaces the other.
+
 ## Why escrow exists
 
 Without escrow a scheduler could accept a job, allow providers to work, then discover that the requester spent the same CU elsewhere.

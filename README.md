@@ -310,8 +310,11 @@ Terminal 1:
 
 ```bash
 hocmesh-coordinator seed --db hocmesh.db --start 2 --end 5000000 --shards 32
-hocmesh-coordinator serve --db hocmesh.db --listen 127.0.0.1:8080
 ```
+
+The local mode keeps a coordinator-owned ledger, so this mint answers to nobody
+but the operator running it. That is the whole reason it is development-only:
+with `--validators`, minting needs sponsorships from the sitting set.
 
 Terminal 2:
 
@@ -446,10 +449,27 @@ For a real Internet deployment, validators should be operated by independent par
 
 ## 3. Reserve community bootstrap work through quorum
 
+Minting is the set's decision, not the coordinator's, so the mint has to be
+sponsored first. On each validator machine, in turn:
+
+```bash
+hocmesh community-vouch \
+  --validators validators.json \
+  --job-id job_bootstrap_1 \
+  --start 2 \
+  --end 5000000 \
+  --shards 32
+```
+
+Each prints one signature line. Collect `threshold` of them into a JSON array
+in `sponsors.json`, then seed:
+
 ```bash
 hocmesh-coordinator seed \
   --db hocmesh.db \
   --validators validators.json \
+  --job-id job_bootstrap_1 \
+  --sponsors sponsors.json \
   --start 2 \
   --end 5000000 \
   --shards 32
@@ -457,10 +477,12 @@ hocmesh-coordinator seed \
 
 This does two things:
 
-1. proposes a `CommunityReserve` ledger transaction,
+1. proposes a `CommunityReserve` ledger transaction carrying those sponsorships,
 2. moves CU from the bounded community issuance account into that job's escrow account.
 
-The coordinator cannot simply credit a user balance.
+The coordinator cannot simply credit a user balance, and it holds no key that
+can mint: without `threshold` valid sponsorships from the sitting set, every
+validator rejects the transaction.
 
 ## 4. Start the scheduler
 
