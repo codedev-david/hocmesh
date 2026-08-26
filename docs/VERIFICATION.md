@@ -228,6 +228,36 @@ history, 758x after 5,000 accepted shards.
 The collateral is real because **CU cannot be purchased**. A balance is proof of
 work already performed, so slashing it destroys something money cannot replace.
 
+## Who loses when a cheat gets through
+
+The audit rate above is not the only thing standing between a lazy provider and
+a payout, and for most jobs it is not even the main thing. It matters who is out
+of pocket.
+
+A requester-funded shard moves CU from one account to another. Nothing is
+created. If a provider cheats, the requester paid for an answer it did not get -
+and the requester is the one party that holds the payload, wants it to be right,
+and can check it for a few percent of what the job cost. That is a party with
+both the means and the motive, which is the strongest verifier in the system.
+
+A community-funded shard is different in kind. It mints CU against the issuance
+limit, and there is no counterparty out of pocket to notice. A cheat there is
+not theft from a requester; it is inflation. So the ledger applies a rule that
+has nothing to do with probabilities:
+
+> CU may only be issued for work a validator can audit from the ledger entry
+> alone.
+
+`WorkSpec::audit_class` states which side of that line a workload falls on, and
+`validate.rs` refuses a community reservation or a system-funded reward for
+anything that is not `SelfContained` - at propose time and again at apply time.
+
+Both shipping workloads answer in a few dozen integers, so both qualify today
+and nothing is restricted in practice. The rule exists for the workload that is
+coming: a tensor shard answers in a matrix, which is `RevealRequired`, and it
+would otherwise have walked straight into the issuance path the day it landed.
+The match in `audit_class` is exhaustive, so it cannot be added silently.
+
 ## Reproducing the numbers
 
     cargo run --release -p hocmesh-core --example verification_proof

@@ -164,6 +164,26 @@ fn validate_reserve(tx: &LedgerTransaction, e: &JobReserveEvidence) -> Result<()
     Ok(())
 }
 
+/// CU may only be issued for work the ledger can check on its own.
+///
+/// A requester-funded shard moves CU between two accounts. A provider that
+/// cheats there robs the requester, who holds the answer and has every reason
+/// to check it. A community-funded shard mints CU against the issuance limit,
+/// so work nobody can audit is a mint nobody can question - and that is the
+/// one place where "the requester will notice" is not an answer.
+///
+/// The rule loosens the day the reveal exchange exists, not before.
+fn issuable(work: &hocmesh_protocol::WorkSpec) -> Result<()> {
+    issuable_class(work.audit_class())
+}
+
+fn issuable_class(class: hocmesh_protocol::AuditClass) -> Result<()> {
+    if class != hocmesh_protocol::AuditClass::SelfContained {
+        bail!("community-funded work must be auditable from the ledger entry")
+    }
+    Ok(())
+}
+
 fn validate_community_reserve(
     tx: &LedgerTransaction,
     job_id: &str,
@@ -171,6 +191,7 @@ fn validate_community_reserve(
     shards: u32,
 ) -> Result<()> {
     work.validate().map_err(anyhow::Error::msg)?;
+    issuable(work)?;
     if !(1..=256).contains(&shards) {
         bail!("invalid community shard count")
     };
@@ -206,6 +227,9 @@ fn validate_reward(
     )?;
     verify_auth_signature(&e.provider_public_key_b64, &e.provider_auth, "result", &bh)
         .map_err(anyhow::Error::msg)?;
+    if e.system_funded {
+        issuable(&e.work)?;
+    }
     if !witnessed(&e.work, &e.result, previous_hash, &tx.transaction_id) {
         bail!("provider result does not verify")
     };
@@ -405,6 +429,7 @@ pub fn verify_historical_evidence(
         }
         TransactionEvidence::CommunityReserve { work, shards, .. } => {
             work.validate().map_err(anyhow::Error::msg)?;
+            issuable(work)?;
             if !(1..=256).contains(shards) {
                 bail!("invalid historical community reservation")
             }
@@ -421,6 +446,9 @@ pub fn verify_historical_evidence(
             )?;
             verify_auth_signature(&e.provider_public_key_b64, &e.provider_auth, "result", &bh)
                 .map_err(anyhow::Error::msg)?;
+            if e.system_funded {
+                issuable(&e.work)?;
+            }
             if !certified_witness(
                 &e.work,
                 &e.result,
@@ -994,5 +1022,40 @@ mod tests {
         );
         let apply = verify_historical_evidence(&lazy, TEST_PREVIOUS_HASH, &test_quorum());
         assert!(apply.is_err(), "the beacon must catch what the vote missed");
+    }
+
+    /// Issuance is the only place a cheat creates CU rather than moving it, so
+    /// a workload the ledger cannot audit on its own must never reach it.
+    #[test]
+    fn unauditable_work_can_never_be_paid_for_with_issued_cu() {
+        use hocmesh_protocol::AuditClass;
+        assert!(issuable_class(AuditClass::SelfContained).is_ok());
+        let refused = issuable_class(AuditClass::RevealRequired);
+        assert!(
+            refused.is_err(),
+            "a shard nobody can check must not mint CU"
+        );
+    }
+
+    /// Both shipping workloads answer in a few dozen integers, so both stay on
+    /// the issuable side. If this ever fails, community funding broke.
+    #[test]
+    fn todays_workloads_are_auditable_from_the_entry() {
+        use hocmesh_protocol::AuditClass;
+        let prime = WorkSpec::PrimeCount {
+            start: 0,
+            end: 100_000,
+        };
+        let matmul = WorkSpec::MatrixMultiply {
+            seed_a: 1,
+            seed_b: 2,
+            dim: 64,
+            row_start: 0,
+            row_end: 64,
+        };
+        for work in [prime, matmul] {
+            assert_eq!(work.audit_class(), AuditClass::SelfContained);
+            assert!(issuable(&work).is_ok());
+        }
     }
 }

@@ -141,7 +141,38 @@ pub enum WorkSpec {
         row_end: u32,
     },
 }
+/// How much of a result a validator can check from the ledger entry alone.
+///
+/// This is the property that decides whether a workload may be paid for with
+/// newly issued CU. A shard whose answer fits in its entry can be audited by
+/// anyone holding the chain. A shard whose answer is a matrix cannot: the
+/// audit needs the provider to reveal sampled blocks after the challenge is
+/// drawn, and until that exchange exists a validator has nothing to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditClass {
+    /// The entry carries the whole answer, so any validator can redraw the
+    /// challenge and recheck a sample without talking to anyone.
+    SelfContained,
+    /// The answer is too large for an entry. Auditing it needs a reveal the
+    /// provider supplies after the challenge is drawn.
+    RevealRequired,
+}
+
 impl WorkSpec {
+    /// What a validator can check about this workload on its own.
+    ///
+    /// Both current workloads answer in a few dozen integers, so both are
+    /// self-contained. The match is exhaustive on purpose: adding a workload
+    /// forces the author to state which side of the line it falls on.
+    pub fn audit_class(&self) -> AuditClass {
+        match self {
+            WorkSpec::PrimeCount { .. } | WorkSpec::MatrixMultiply { .. } => {
+                AuditClass::SelfContained
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match self {
             WorkSpec::PrimeCount { start, end } if start >= end => {
