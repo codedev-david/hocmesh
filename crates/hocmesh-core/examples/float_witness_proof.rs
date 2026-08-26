@@ -30,6 +30,7 @@ fn main() {
     the_gap(&a, &b, &honest, &other_kernel);
     detection(&a, &b, &honest);
     cost(&a, &b, &honest);
+    ledger_size(&honest);
 }
 
 /// The tolerance has to separate two populations. Show both.
@@ -86,14 +87,23 @@ fn detection(a: &[f32], b: &[f32], honest: &[f32]) {
 /// The tier only works if every validator can afford it on every shard.
 fn cost(a: &[f32], b: &[f32], honest: &[f32]) {
     rule("3. Witnessing is cheap enough to run on every shard");
+    const REPS: u32 = 5;
     let start = Instant::now();
-    let product = multiply(a, b, SHAPE);
-    let compute_ms = start.elapsed().as_secs_f64() * 1000.0;
-    std::hint::black_box(&product);
+    for _ in 0..REPS {
+        std::hint::black_box(multiply(a, b, SHAPE));
+    }
+    let compute_ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(REPS);
     let start = Instant::now();
-    let residual = tensor::witness_residual(a, b, honest, SHAPE, 0xDEC0DE);
-    let witness_ms = start.elapsed().as_secs_f64() * 1000.0;
-    std::hint::black_box(residual);
+    for round in 0..REPS {
+        std::hint::black_box(tensor::witness_residual(
+            a,
+            b,
+            honest,
+            SHAPE,
+            0xDEC0DE ^ u64::from(round),
+        ));
+    }
+    let witness_ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(REPS);
     let predicted = SHAPE.compute_ops() as f64 / (SHAPE.witness_ops() * ROUNDS as u64) as f64;
     println!("  product  {compute_ms:>8.2} ms");
     println!("  witness  {witness_ms:>8.2} ms  ({ROUNDS} rounds)");
@@ -102,6 +112,35 @@ fn cost(a: &[f32], b: &[f32], honest: &[f32]) {
         compute_ms / witness_ms
     );
     assert!(compute_ms > witness_ms, "witnessing must be the cheap side");
+
+    // The timed shape above is small; the ratio structurally improves with size,
+    // because the product grows with rows*inner*cols and the witness only with
+    // the matrix areas. Real inference shapes are where this has to pay off.
+    println!(
+        "
+  op-count ratio at real model shapes (the timed shape is the pessimistic case):"
+    );
+    for (label, shape) in [
+        (
+            "512 x 4096 x 4096   attention batch",
+            Shape {
+                rows: 512,
+                inner: 4096,
+                cols: 4096,
+            },
+        ),
+        (
+            "4096 x 4096 x 14336  MLP projection",
+            Shape {
+                rows: 4096,
+                inner: 4096,
+                cols: 14336,
+            },
+        ),
+    ] {
+        let ratio = shape.compute_ops() as f64 / (shape.witness_ops() * ROUNDS as u64) as f64;
+        println!("    {label:<36} {ratio:>6.0}x cheaper");
+    }
 }
 
 fn rule(title: &str) {
@@ -168,4 +207,21 @@ fn multiply_blocked(a: &[f32], b: &[f32], shape: Shape) -> Vec<f32> {
         }
     }
     c
+}
+
+/// A witness needs the whole product, but a ledger cannot carry it. The entry
+/// commits; the payload rides along with the answer the requester gets anyway.
+fn ledger_size(honest: &[f32]) {
+    rule("4. The ledger commits to the answer instead of storing it");
+    let payload = size_of_val(honest);
+    let digest = tensor::commit(honest);
+    println!("  product payload  {:>9} bytes", payload);
+    println!("  ledger entry     {:>9} bytes", digest.len());
+    println!("  {:>25.0}x smaller", payload as f64 / digest.len() as f64);
+    assert!(
+        payload / digest.len() > 500,
+        "committing must actually save"
+    );
+    println!("\n  The commitment is checked before a single multiply is spent, so a provider");
+    println!("  that has seen the challenge cannot swap in a matrix that satisfies it.");
 }

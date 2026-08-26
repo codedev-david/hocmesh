@@ -89,10 +89,24 @@ independent challenges and requires all of them, which puts the escape
 probability below 1 in 250 even for an adversary who knows the algorithm.
 
 The eight challenges are stacked into one block so each matrix is read once
-rather than eight times. On a 128x512x512 projection that lands at 8.2x cheaper
-than the product measured, against 10.7x predicted from operation counts:
+rather than eight times, and each row accumulates in registers. On a small
+128x512x512 projection that lands at 5.5x cheaper than the product measured,
+against 10.7x predicted from operation counts. The small shape is the
+pessimistic case: the product grows with rows x inner x cols while the witness
+grows only with the matrix areas, so the margin widens with model size - 51x
+on a 512x4096x4096 attention batch, 224x on a 4096x4096x14336 MLP projection.
 
     cargo run --release -p hocmesh-core --example float_witness_proof
+
+A witness needs the whole product, but a ledger entry cannot carry a 262 KB
+matrix. The entry therefore carries a 64-byte SHA-256 commitment over the
+IEEE-754 bit pattern of every element (domain tag `hocmesh-tensor-commit-v1`),
+and the payload itself rides along with the answer the requester wanted anyway.
+A validator hashes the payload and compares it against the committed digest
+before spending a single multiply, so a provider that has already seen the
+challenge cannot swap in a different matrix that satisfies it. That is 4096x
+less ledger per shard, and it keeps the commitment-before-nonce rule below
+intact for float work.
 
 **Not yet wired.** `hocmesh-core::tensor` proves the witness works; there is no
 `WorkSpec` for inference yet, so no inference shard is priced, escrowed or paid

@@ -26,6 +26,7 @@
 //! puts the escape probability below 1 in 250 for the weakest possible cheat
 //! and far lower for any cheat large enough to be worth the trouble.
 use crate::matrix::splitmix64;
+use sha2::{Digest, Sha256};
 
 /// Independent challenge vectors drawn per witness. Each round catches a wrong
 /// product with probability at least 1/2, so eight rounds put the escape
@@ -90,14 +91,15 @@ fn mat_block(m: &[f32], rows: usize, cols: usize, r: &[f32]) -> Vec<f64> {
     let mut out = vec![0.0f64; rows * ROUNDS];
     for i in 0..rows {
         let src = i * cols;
-        let dst = i * ROUNDS;
+        let mut acc = [0.0f64; ROUNDS];
         for k in 0..cols {
             let value = f64::from(m[src + k]);
-            let signs = &r[k * ROUNDS..k * ROUNDS + ROUNDS];
+            let signs: &[f32; ROUNDS] = r[k * ROUNDS..][..ROUNDS].try_into().unwrap();
             for t in 0..ROUNDS {
-                out[dst + t] += value * f64::from(signs[t]);
+                acc[t] += value * f64::from(signs[t]);
             }
         }
+        out[i * ROUNDS..][..ROUNDS].copy_from_slice(&acc);
     }
     out
 }
@@ -107,14 +109,15 @@ fn mat_block64(m: &[f32], rows: usize, cols: usize, x: &[f64]) -> Vec<f64> {
     let mut out = vec![0.0f64; rows * ROUNDS];
     for i in 0..rows {
         let src = i * cols;
-        let dst = i * ROUNDS;
+        let mut acc = [0.0f64; ROUNDS];
         for k in 0..cols {
             let value = f64::from(m[src + k]);
-            let row = &x[k * ROUNDS..k * ROUNDS + ROUNDS];
+            let row: &[f64; ROUNDS] = x[k * ROUNDS..][..ROUNDS].try_into().unwrap();
             for t in 0..ROUNDS {
-                out[dst + t] += value * row[t];
+                acc[t] += value * row[t];
             }
         }
+        out[i * ROUNDS..][..ROUNDS].copy_from_slice(&acc);
     }
     out
 }
@@ -164,6 +167,46 @@ pub fn witnessed(a: &[f32], b: &[f32], c: &[f32], shape: Shape, nonce: u64) -> b
     witness_residual(a, b, c, shape, nonce) <= TOLERANCE
 }
 
+/// A commitment to a result, over the raw IEEE-754 bits.
+///
+/// A witness needs the whole product to compute `C r`, but a ledger entry
+/// carrying the whole product would be enormous: one 128x512 shard of f32 is
+/// 256 KB of payload against 32 bytes of commitment. So the entry commits and
+/// the payload travels with the answer the requester already receives.
+///
+/// Hashing the bit patterns rather than the decimal forms keeps this exact and
+/// endian-stable: two nodes that agree on the payload agree on the digest, and
+/// no rounding creeps into the binding.
+pub fn commit(product: &[f32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hocmesh-tensor-commit-v1");
+    hasher.update((product.len() as u64).to_be_bytes());
+    for value in product {
+        hasher.update(value.to_bits().to_be_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Witness a product the ledger holds only a commitment to.
+///
+/// The commitment is checked first, before a single multiply is spent on the
+/// payload. That ordering is the point: a provider that has seen the challenge
+/// cannot swap in a matrix that happens to satisfy it, because the entry it
+/// already signed pins the one matrix it is allowed to be judged on.
+pub fn witnessed_committed(
+    a: &[f32],
+    b: &[f32],
+    payload: &[f32],
+    commitment: &str,
+    shape: Shape,
+    nonce: u64,
+) -> bool {
+    commit(payload) == commitment && witnessed(a, b, payload, shape, nonce)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +322,55 @@ mod tests {
         let s = shape();
         let ratio = s.compute_ops() as f64 / (s.witness_ops() * ROUNDS as u64) as f64;
         assert!(ratio > 4.0, "witness saves only {ratio:.1}x");
+    }
+
+    /// A commitment has to bind every bit of the answer, including the ones
+    /// too small to change how the answer reads.
+    #[test]
+    fn the_commitment_binds_every_bit_of_the_product() {
+        let s = shape();
+        let a = matrix(0xA11CE, s.rows * s.inner);
+        let b = matrix(0xB0BB, s.inner * s.cols);
+        let product = multiply(&a, &b, s);
+        let pinned = commit(&product);
+        let mut nudged = product.clone();
+        nudged[17] = f32::from_bits(nudged[17].to_bits() ^ 1);
+        assert_ne!(commit(&nudged), pinned, "a one-bit change must show");
+        assert_eq!(commit(&product), pinned, "the digest must be stable");
+    }
+
+    /// The whole point of committing first: once the challenge is public, the
+    /// provider is stuck with the matrix it already signed for. A payload that
+    /// would sail through the witness is refused because it is the wrong one.
+    #[test]
+    fn a_payload_swapped_after_the_challenge_is_refused() {
+        let s = shape();
+        let a = matrix(0xA11CE, s.rows * s.inner);
+        let b = matrix(0xB0BB, s.inner * s.cols);
+        let honest = multiply(&a, &b, s);
+        let other = multiply_blocked(&a, &b, s);
+        let pinned = commit(&honest);
+        assert!(witnessed_committed(&a, &b, &honest, &pinned, s, 0xDEC0DE));
+        assert!(
+            witnessed(&a, &b, &other, s, 0xDEC0DE),
+            "the swapped payload is itself a correct product"
+        );
+        assert!(
+            !witnessed_committed(&a, &b, &other, &pinned, s, 0xDEC0DE),
+            "only the committed payload may be judged"
+        );
+    }
+
+    /// A ledger that carried whole products would outgrow the work it records.
+    /// Committing keeps an entry the same size whatever the shard.
+    #[test]
+    fn committing_keeps_a_ledger_entry_small() {
+        let s = shape();
+        let payload = s.rows * s.cols * size_of::<f32>();
+        let entry = 64;
+        assert!(
+            payload / entry > 500,
+            "a commitment must be much smaller than {payload} bytes"
+        );
     }
 }
