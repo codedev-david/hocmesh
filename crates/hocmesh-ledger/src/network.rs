@@ -2,7 +2,7 @@ use crate::{
     types::*,
     validate::{
         build_entry, ledger_entry_signing_message, membership_hash, validate_validator_set,
-        verify_certificate, verify_validator_signature,
+        verify_certificate, verify_membership_change, verify_validator_signature,
     },
 };
 use anyhow::{Result, bail};
@@ -15,7 +15,9 @@ use tokio::sync::{Mutex, oneshot};
 #[derive(Clone)]
 pub struct LedgerNetwork {
     http: Client,
-    pub set: ValidatorSet,
+    set: Arc<std::sync::RwLock<ValidatorSet>>,
+    /// The height at which the current set was last established.
+    set_sequence: Arc<std::sync::RwLock<u64>>,
     gate: Arc<Mutex<()>>,
     queue: Arc<std::sync::Mutex<VecDeque<Pending>>>,
 }
@@ -57,17 +59,76 @@ impl LedgerNetwork {
         validate_validator_set(&set)?;
         Ok(Self {
             http: Client::new(),
-            set,
+            set: Arc::new(std::sync::RwLock::new(set)),
+            set_sequence: Arc::default(),
             gate: Arc::new(Mutex::new(())),
             queue: Arc::default(),
         })
     }
+
+    /// The validator set this client currently believes in.
+    ///
+    /// Behind a lock because a certified membership change moves the set under
+    /// a running coordinator, and one still addressing the seats it booted with
+    /// would be asking a quorum that no longer exists.
+    pub fn set(&self) -> ValidatorSet {
+        self.set.read().expect("validator set lock").clone()
+    }
+
+    /// Follows membership changes the chain has certified since this client
+    /// last looked, and adopts the set they produce.
+    ///
+    /// The entries come from whichever validator answers, which is not a
+    /// trusted source and does not need to be. Nothing is adopted that was not
+    /// certified by the set already held, so the only way to move this client
+    /// onto a set is to have been admitted by the one before it - the same rule
+    /// an auditor replaying from genesis follows.
+    pub async fn refresh_set(&self) -> Result<bool> {
+        let mut active = self.set();
+        let mut at = *self.set_sequence.read().expect("set sequence lock");
+        let start = at;
+        let mut cursor = at;
+        loop {
+            let certs = self.fetch_certificates(cursor + 1, 256).await?;
+            if certs.is_empty() {
+                break;
+            }
+            for c in &certs {
+                // Only an entry that changes the set has to prove who signed
+                // it. The rest cannot move membership, so walking past them
+                // unverified costs nothing - a full audit still checks them.
+                let changes: Vec<_> = c
+                    .entry
+                    .transactions
+                    .iter()
+                    .filter_map(|t| match &t.evidence {
+                        TransactionEvidence::MembershipChange(e) => Some(e),
+                        _ => None,
+                    })
+                    .collect();
+                if !changes.is_empty() {
+                    verify_certificate(c, &active)?;
+                    for e in changes {
+                        active = verify_membership_change(&active, e)?;
+                    }
+                    at = c.entry.sequence;
+                }
+                cursor = c.entry.sequence;
+            }
+        }
+        if at == start {
+            return Ok(false);
+        }
+        *self.set.write().expect("validator set lock") = active;
+        *self.set_sequence.write().expect("set sequence lock") = at;
+        Ok(true)
+    }
     pub async fn head_quorum(&self) -> Result<LedgerHead> {
-        let mh = membership_hash(&self.set)?;
+        let mh = membership_hash(&self.set())?;
         // Ask every validator at once. Awaiting them one at a time made a round
         // of consensus cost N round trips instead of one, so adding validators
         // slowed the whole network down - the opposite of what it should do.
-        let heads: Vec<LedgerHead> = join_all(self.set.members.iter().map(|m| {
+        let heads: Vec<LedgerHead> = join_all(self.set().members.iter().map(|m| {
             let (http, mh) = (&self.http, &mh);
             async move {
                 let r = http
@@ -99,7 +160,7 @@ impl LedgerNetwork {
         let Some(((s, hash), n)) = counts.into_iter().max_by_key(|x| x.1) else {
             bail!("no signed validator heads available")
         };
-        if n < self.set.threshold {
+        if n < self.set().threshold {
             bail!("no quorum-agreed ledger head")
         };
         Ok(LedgerHead {
@@ -114,8 +175,8 @@ impl LedgerNetwork {
     /// the signatures gathered here need no translation: agreement is just
     /// enough of them saying the same (height, entry, state) triple.
     pub async fn checkpoint_quorum(&self) -> Result<LedgerCheckpoint> {
-        let mh = membership_hash(&self.set)?;
-        let proofs: Vec<StateProof> = join_all(self.set.members.iter().map(|m| {
+        let mh = membership_hash(&self.set())?;
+        let proofs: Vec<StateProof> = join_all(self.set().members.iter().map(|m| {
             let (http, mh) = (&self.http, &mh);
             async move {
                 let r = http
@@ -157,7 +218,7 @@ impl LedgerNetwork {
         else {
             bail!("no signed validator state available")
         };
-        if agreed.len() < self.set.threshold {
+        if agreed.len() < self.set().threshold {
             bail!("no quorum-agreed ledger state")
         };
         Ok(LedgerCheckpoint {
@@ -177,8 +238,8 @@ impl LedgerNetwork {
         })
     }
     pub async fn balance_quorum(&self, account: &str) -> Result<BalanceProof> {
-        let mh = membership_hash(&self.set)?;
-        let proofs: Vec<BalanceProof> = join_all(self.set.members.iter().map(|m| {
+        let mh = membership_hash(&self.set())?;
+        let proofs: Vec<BalanceProof> = join_all(self.set().members.iter().map(|m| {
             let (http, mh) = (&self.http, &mh);
             async move {
                 let r = http
@@ -230,7 +291,7 @@ impl LedgerNetwork {
         let Some(((b, e, sp, s, h), n)) = counts.into_iter().max_by_key(|x| x.1) else {
             bail!("no validator balance proofs available")
         };
-        if n < self.set.threshold {
+        if n < self.set().threshold {
             bail!("no quorum-agreed balance")
         };
         Ok(proofs
@@ -246,8 +307,8 @@ impl LedgerNetwork {
     }
 
     pub async fn claim_quorum(&self, claim: &str) -> Result<ClaimProof> {
-        let mh = membership_hash(&self.set)?;
-        let all: Vec<ClaimProof> = join_all(self.set.members.iter().map(|m| {
+        let mh = membership_hash(&self.set())?;
+        let all: Vec<ClaimProof> = join_all(self.set().members.iter().map(|m| {
             let (http, mh) = (&self.http, &mh);
             async move {
                 let r = http
@@ -284,7 +345,7 @@ impl LedgerNetwork {
         // the claim was already spent, whatever the rest of the set reports.
         if let Some(i) = all.iter().position(|p| {
             p.certificate.as_ref().is_some_and(|cert| {
-                verify_certificate(cert, &self.set).is_ok()
+                verify_certificate(cert, &self.set()).is_ok()
                     && cert
                         .entry
                         .transactions
@@ -312,7 +373,7 @@ impl LedgerNetwork {
         let Some(((seq, eh, hs, hh), n)) = counts.into_iter().max_by_key(|x| x.1) else {
             bail!("no validator claim proofs available")
         };
-        if n < self.set.threshold {
+        if n < self.set().threshold {
             bail!(
                 "no quorum-agreed absent claim status and no verifiable quorum certificate was returned"
             )
@@ -360,7 +421,19 @@ impl LedgerNetwork {
     /// Run one round for a batch, then hand each caller its own answer.
     async fn settle(&self, batch: Vec<Pending>) {
         let (txs, replies): (Vec<_>, Vec<_>) = batch.into_iter().map(|p| (p.tx, p.reply)).unzip();
-        match self.round(txs.clone()).await {
+        let mut outcome = self.round(txs.clone()).await;
+        // A client addressing seats that have since been replaced fails the
+        // same way one the validators merely disagree with fails, and a
+        // rejected round applied nothing anywhere. So follow the chain
+        // forward once and, when it really does hand back a different set,
+        // put the same batch to that one. Without this a single admission
+        // strands every running client until somebody restarts it by hand.
+        if matches!(outcome, Err(RoundError::Rejected(_)))
+            && self.refresh_set().await.unwrap_or(false)
+        {
+            outcome = self.round(txs.clone()).await;
+        }
+        match outcome {
             Ok(cert) => {
                 for r in replies {
                     let _ = r.send(Ok(cert.clone()));
@@ -400,7 +473,7 @@ impl LedgerNetwork {
         )
         .map_err(RoundError::rejected)?;
         let req = ProposalRequest { transactions };
-        let sigs: Vec<ValidatorSignature> = join_all(self.set.members.iter().map(|m| {
+        let sigs: Vec<ValidatorSignature> = join_all(self.set().members.iter().map(|m| {
             let (http, req, expected, head) = (&self.http, &req, &expected, &head);
             async move {
                 let r = http
@@ -431,20 +504,20 @@ impl LedgerNetwork {
         .into_iter()
         .flatten()
         .collect();
-        if sigs.len() < self.set.threshold {
+        if sigs.len() < self.set().threshold {
             return Err(RoundError::Rejected(format!(
                 "ledger proposal received only {} valid votes; threshold is {}",
                 sigs.len(),
-                self.set.threshold
+                self.set().threshold
             )));
         }
         let cert = QuorumCertificate {
             entry: expected,
-            membership_hash: membership_hash(&self.set).map_err(RoundError::rejected)?,
+            membership_hash: membership_hash(&self.set()).map_err(RoundError::rejected)?,
             signatures: sigs,
         };
-        verify_certificate(&cert, &self.set).map_err(RoundError::rejected)?;
-        let committed = join_all(self.set.members.iter().map(|m| {
+        verify_certificate(&cert, &self.set()).map_err(RoundError::rejected)?;
+        let committed = join_all(self.set().members.iter().map(|m| {
             let (http, cert) = (&self.http, &cert);
             async move {
                 http.post(format!("{}/v1/ledger/commit", m.url.trim_end_matches('/')))
@@ -458,7 +531,7 @@ impl LedgerNetwork {
         .into_iter()
         .filter(|ok| *ok)
         .count();
-        if committed < self.set.threshold {
+        if committed < self.set().threshold {
             return Err(RoundError::Committed(format!(
                 "certificate formed but committed on only {committed} validators; run validator sync/recovery"
             )));
@@ -470,7 +543,7 @@ impl LedgerNetwork {
         from: u64,
         limit: u64,
     ) -> Result<Vec<QuorumCertificate>> {
-        for m in &self.set.members {
+        for m in &self.set().members {
             let url = format!(
                 "{}/v1/ledger/entries?from={}&limit={}",
                 m.url.trim_end_matches('/'),
@@ -482,7 +555,7 @@ impl LedgerNetwork {
             {
                 let e = r.json::<EntriesResponse>().await?;
                 for c in &e.certificates {
-                    verify_certificate(c, &self.set)?;
+                    verify_certificate(c, &self.set())?;
                 }
                 return Ok(e.certificates);
             }

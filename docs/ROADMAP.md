@@ -36,7 +36,6 @@
 ## Priority 1 — production ledger hardening
 
 - Consensus/view-change protocol rather than coordinator-driven proposal sequencing.
-- Validator membership epochs and rotation.
 - Governance authorization for `CommunityReserve`.
 - Snapshot/checkpoint format.
 - Efficient indexed transaction/account history.

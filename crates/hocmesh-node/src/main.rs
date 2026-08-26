@@ -793,10 +793,15 @@ stored at: {}",
             let net = load_network(&validators)?;
             let mut store = LedgerStore::open(&db)?;
             loop {
-                let local = store.head(&net.set)?;
+                // The set a mirror verifies against is whatever the chain has
+                // last handed it, not the bootstrap file. A mirror that kept
+                // using the file would stop dead at the first admission.
+                let set = store.current_set()?.unwrap_or_else(|| net.set());
+                let local = store.head(&set)?;
+                net.refresh_set().await?;
                 let remote = net.head_quorum().await?;
                 if local.sequence >= remote.sequence {
-                    let audited = store.audit(&net.set)?;
+                    let audited = store.audit(&load_set(&validators)?)?;
                     println!(
                         "Ledger mirror synchronized and audited: height={} head={}",
                         audited.sequence, audited.entry_hash
@@ -809,8 +814,12 @@ stored at: {}",
                 if certs.is_empty() {
                     anyhow::bail!("validators report a newer head but returned no certificates")
                 };
+                let mut set = set;
                 for cert in certs {
-                    store.apply(&cert, &net.set)?;
+                    store.apply(&cert, &set)?;
+                    if let Some(next) = store.current_set()? {
+                        set = next;
+                    }
                 }
             }
         }
@@ -843,8 +852,11 @@ stored at: {}",
         Command::LedgerCheckpoint { validators, db } => {
             let net = load_network(&validators)?;
             let store = LedgerStore::open(&db)?;
+            // A checkpoint is only meaningful against the set that signed
+            // it, so follow the chain forward before storing one.
+            net.refresh_set().await?;
             let cp = net.checkpoint_quorum().await?;
-            store.store_checkpoint(&cp, &net.set)?;
+            store.store_checkpoint(&cp, &net.set())?;
             println!(
                 "CHECKPOINT STORED: height={} head={} state={} signatures={}",
                 cp.head.sequence,

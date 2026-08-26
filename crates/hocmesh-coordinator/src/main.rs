@@ -173,6 +173,17 @@ async fn serve(listen: &str, db_path: &str, validators: Option<&str>) -> Result<
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
             loop {
                 interval.tick().await;
+                // Pick the set up before settling against it rather than
+                // after. The ledger client recovers on its own failure path
+                // too, but only once a settlement has already been held up.
+                match net.refresh_set().await {
+                    Ok(true) => tracing::info!(
+                        validators = net.set().members.len(),
+                        "validator set advanced by a certified membership change"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(error=%e, "validator set refresh failed"),
+                }
                 if let Err(e) = recover_pending(&recovery_db, &net).await {
                     tracing::warn!(error=%e,"background ledger intent recovery incomplete")
                 }

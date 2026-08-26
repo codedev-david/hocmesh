@@ -114,10 +114,21 @@ hocmesh-node membership-commit --validators set.json --action join --member m.js
 Each sponsor runs `membership-vouch` and returns the signature it prints;
 `membership-commit` collects them and submits the transaction. Validators pick
 the new set up as soon as the change is certified — they read it from the
-store, not from disk. The coordinator and any `LedgerNetwork` built from a file
-still hold the set they were started with, so they must be restarted against
-`--out`. That is fail-safe rather than fail-open: they stop being able to reach
-quorum, they never certify against a stale set.
+store, not from disk.
+
+Clients built from a file follow the same change without being restarted.
+`LedgerNetwork::refresh_set` walks the chain forward from the height its set was
+last established at, verifies the certificate on any entry that carries a
+membership change against the set it already holds, and adopts the result. The
+entries come from whichever validator answers, which does not have to be
+trusted: nothing is adopted that the set already held did not certify, which is
+the same rule an auditor replaying from genesis follows. The coordinator calls
+it on its fifteen-second recovery tick, and the ledger client calls it once on a
+rejected round before retrying that batch — rejected means nothing was applied
+anywhere, so the retry is safe. A client whose *entire* set has rotated out has
+nobody left to ask and does still need a new file. Staleness remains fail-safe
+rather than fail-open throughout: a client on the wrong set cannot reach quorum,
+it never certifies against one.
 
 An audit follows the set the chain hands forward: each entry's certificate is
 checked against the set sitting *before* that entry, and membership changes
