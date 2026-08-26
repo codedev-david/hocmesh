@@ -36,10 +36,16 @@ pub const ROUNDS: usize = 8;
 /// How far apart two honest results may drift, relative to the magnitude of
 /// the answer itself.
 ///
-/// Measured, not chosen: honest kernels differing only in summation order stay
-/// four orders of magnitude below this, and the cheapest cheat worth running
-/// lands two orders above it. See the `float_witness_proof` example.
-pub const TOLERANCE: f32 = 1e-3;
+/// Measured, not chosen. Section 7 of the `float_witness_proof` example walks
+/// the inner dimension across a 64x range and reports two populations that
+/// never approach each other: an honest f32 kernel drifts 3.5e-7 to 2.9e-6,
+/// and the same shard run in fp16 or TF32 drifts 3.1e-3 to 2.3e-2.
+///
+/// This constant is their geometric centre. Honest work clears it by 35x at
+/// the worst shape measured; the cheapest cheat worth running misses it by
+/// 31x at the shape most favourable to the cheat. Neither margin closes as
+/// the shard grows, which is why one constant serves every job.
+pub const TOLERANCE: f32 = 1e-4;
 
 /// Shape of a matrix product `C = A x B`, with `A` as `rows x inner` and `B`
 /// as `inner x cols`, both stored row-major.
@@ -421,8 +427,8 @@ mod tests {
         let b = matrix(0xB0BB, s.inner * s.cols);
         let drift = witness_residual(&a, &b, &multiply_blocked(&a, &b, s), s, 0xDEC0DE);
         assert!(
-            drift < TOLERANCE / 100.0,
-            "honest drift {drift} leaves no headroom under {TOLERANCE}"
+            drift * 20.0 < TOLERANCE,
+            "honest drift {drift:e} leaves no headroom under {TOLERANCE}"
         );
     }
 
@@ -707,5 +713,96 @@ mod tests {
         let wide_root = commit_blocks(&block_commitments(&wide, bigger));
         assert_eq!(wide_root.len(), root.len());
         assert_ne!(wide_root, root);
+    }
+
+    /// Round to the mantissa a cheaper format carries, keeping f32's exponent.
+    /// bf16 keeps 7 mantissa bits, fp16 and TF32 keep 10.
+    fn truncated(value: f32, mantissa_bits: u32) -> f32 {
+        let drop = 23 - mantissa_bits;
+        let mask = !0u32 << drop;
+        f32::from_bits((value.to_bits() + (1 << (drop - 1))) & mask)
+    }
+
+    /// A product computed as if the hardware carried a shorter mantissa: the
+    /// operands are rounded going in and the running sum is rounded each step.
+    fn low_precision(a: &[f32], b: &[f32], s: Shape, mantissa_bits: u32) -> Vec<f32> {
+        let mut out = vec![0.0f32; s.rows * s.cols];
+        for row in 0..s.rows {
+            for col in 0..s.cols {
+                let mut acc = 0.0f32;
+                for k in 0..s.inner {
+                    let left = truncated(a[row * s.inner + k], mantissa_bits);
+                    let right = truncated(b[k * s.cols + col], mantissa_bits);
+                    acc = truncated(acc + left * right, mantissa_bits);
+                }
+                out[row * s.cols + col] = acc;
+            }
+        }
+        out
+    }
+
+    /// The cheat an inference provider would actually reach for: run the shard
+    /// in bf16 or fp16, return it as f32, and pocket the speedup. It has to
+    /// land outside the tolerance or the whole threshold is theatre.
+    #[test]
+    fn quietly_dropping_precision_is_caught() {
+        let s = shape();
+        let a = matrix(0xa11, s.rows * s.inner);
+        let b = matrix(0xb22, s.inner * s.cols);
+        let honest = multiply(&a, &b, s);
+        // 7 mantissa bits is bf16, 10 is fp16 and TF32.
+        for bits in [7u32, 10] {
+            let cheap = low_precision(&a, &b, s, bits);
+            let digests = block_commitments(&cheap, s);
+            let opened: Vec<u32> = (0..BLOCKS).collect();
+            let caught = opened.iter().any(|index| {
+                let rows = block_payload(&cheap, s, *index);
+                !block_reexecuted(&a, &b, s, *index, rows, &digests[*index as usize])
+            });
+            assert!(caught, "a {bits}-bit mantissa passed the block audit");
+            let drift = witness_residual(&a, &b, &cheap, s, 0xDEC0DE);
+            assert!(
+                drift > TOLERANCE,
+                "{bits}-bit mantissa drifted {drift:e}, inside the tolerance"
+            );
+        }
+        // f32 done honestly stays far inside it, or the test above proves
+        // nothing except that the threshold is too tight for everyone.
+        assert!(witness_residual(&a, &b, &honest, s, 0xDEC0DE) < TOLERANCE);
+    }
+
+    /// A threshold is only a threshold if it keeps its margins at every shape
+    /// the mesh would run. Honest f32 drift grows with the inner dimension,
+    /// and so does the drift from a cheaper format - faster. This walks a 64x
+    /// range and asserts the two populations never approach each other, which
+    /// is the entire basis for [`TOLERANCE`] being one constant rather than a
+    /// function of the shape.
+    #[test]
+    fn the_tolerance_holds_its_margins_at_every_shape() {
+        const MARGIN: f32 = 20.0;
+        for inner in [128usize, 1024, 8192] {
+            let s = Shape {
+                rows: 16,
+                inner,
+                cols: 64,
+            };
+            let a = matrix(0xa11, s.rows * s.inner);
+            let b = matrix(0xb22, s.inner * s.cols);
+            let honest = witness_residual(&a, &b, &multiply(&a, &b, s), s, 7);
+            assert!(
+                honest * MARGIN <= TOLERANCE,
+                "at inner={inner} an honest f32 kernel drifted {honest:e}, \
+                 leaving less than {MARGIN}x under {TOLERANCE}"
+            );
+            // 10 mantissa bits is the narrowest cheat worth running: fp16 and
+            // TF32. bf16 keeps 7 and lands further out, so bounding fp16
+            // bounds the whole family.
+            let cheap = witness_residual(&a, &b, &low_precision(&a, &b, s, 10), s, 7);
+            assert!(
+                cheap >= TOLERANCE * MARGIN,
+                "at inner={inner} an fp16 shard drifted only {cheap:e}, \
+                 less than {MARGIN}x above {TOLERANCE}"
+            );
+        }
     }
 }

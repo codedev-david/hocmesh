@@ -33,6 +33,8 @@ fn main() {
     cost(&a, &b, &honest);
     ledger_size(&honest);
     sampled_reveal(&a, &b, &honest);
+    precision(&a, &b, &honest);
+    threshold();
 }
 
 /// The witness above is the requester's tool: it checks a product you hold.
@@ -285,4 +287,91 @@ fn ledger_size(honest: &[f32]) {
     );
     println!("\n  The commitment is checked before a single multiply is spent, so a provider");
     println!("  that has seen the challenge cannot swap in a matrix that satisfies it.");
+}
+
+/// Skipping blocks is the cheat the audit was designed for. Dropping precision
+/// is the cheat a real inference provider would reach for first.
+fn precision(a: &[f32], b: &[f32], honest: &[f32]) {
+    rule("6. Running the shard in a cheaper format");
+    println!(
+        "  {:>18}  {:>12}  {:>8}  {:>10}",
+        "format", "residual", "vs tol", "verdict"
+    );
+    let honest_drift = tensor::witness_residual(a, b, honest, SHAPE, 0xDEC0DE);
+    report("f32 (honest)", honest_drift);
+    for (label, bits) in [("bf16 (7-bit)", 7u32), ("fp16/TF32 (10-bit)", 10)] {
+        let cheap = low_precision(a, b, SHAPE, bits);
+        report(
+            label,
+            tensor::witness_residual(a, b, &cheap, SHAPE, 0xDEC0DE),
+        );
+    }
+}
+
+/// Section 6 fixes one shape. The constant has to hold at every shape, so
+/// this walks the inner dimension across a 64x range and shows the two
+/// populations staying four orders of magnitude apart the whole way. That
+/// separation is the only reason one constant can serve every job.
+fn threshold() {
+    rule("7. Where the threshold sits");
+    println!(
+        "  {:>7}  {:>11}  {:>11}  {:>11}  {:>9}  {:>9}",
+        "inner", "honest", "fp16", "bf16", "under", "over"
+    );
+    for inner in [128usize, 512, 2048, 8192] {
+        let s = Shape {
+            rows: 16,
+            inner,
+            cols: 64,
+        };
+        let a = matrix(0xA11CE, s.rows * s.inner);
+        let b = matrix(0xB0BB, s.inner * s.cols);
+        let residual = |c: &[f32]| tensor::witness_residual(&a, &b, c, s, 0xDEC0DE);
+        let honest = residual(&multiply(&a, &b, s));
+        let fp16 = residual(&low_precision(&a, &b, s, 10));
+        let bf16 = residual(&low_precision(&a, &b, s, 7));
+        println!(
+            "  {inner:>7}  {honest:>11.3e}  {fp16:>11.3e}  {bf16:>11.3e}  {:>8.0}x  {:>8.0}x",
+            TOLERANCE / honest,
+            fp16 / TOLERANCE
+        );
+    }
+    println!("\n  under = how far honest f32 stays inside {TOLERANCE:e}.");
+    println!("  over  = how far the cheapest worthwhile cheat lands outside it.");
+    println!("  Neither margin closes as the shard grows, so the constant does");
+    println!("  not have to be a function of the shape.");
+}
+
+fn report(label: &str, residual: f32) {
+    let verdict = if residual <= TOLERANCE {
+        "accepted"
+    } else {
+        "REJECTED"
+    };
+    println!(
+        "  {label:>18}  {residual:>12.3e}  {:>7.0}x  {verdict:>10}",
+        residual / TOLERANCE
+    );
+}
+
+fn rounded(value: f32, mantissa_bits: u32) -> f32 {
+    let drop = 23 - mantissa_bits;
+    let mask = !0u32 << drop;
+    f32::from_bits((value.to_bits() + (1 << (drop - 1))) & mask)
+}
+
+fn low_precision(a: &[f32], b: &[f32], s: Shape, bits: u32) -> Vec<f32> {
+    let mut out = vec![0.0f32; s.rows * s.cols];
+    for row in 0..s.rows {
+        for col in 0..s.cols {
+            let mut acc = 0.0f32;
+            for k in 0..s.inner {
+                let left = rounded(a[row * s.inner + k], bits);
+                let right = rounded(b[k * s.cols + col], bits);
+                acc = rounded(acc + left * right, bits);
+            }
+            out[row * s.cols + col] = acc;
+        }
+    }
+    out
 }

@@ -71,16 +71,26 @@ whether the residual is zero, ask whether it is small enough to be rounding:
     max |C r - A (B r)| / max |C r|  <=  TOLERANCE
 
 That threshold is measured, not chosen. It has to sit in the gap between two
-populations, and it does, by a wide margin:
+populations, and it does, with room on both sides:
 
     two honest kernels, different summation order    1.733e-7
-    tolerance                                        1.000e-3
+    tolerance                                        1.000e-4
+    the same shard run in fp16 or TF32               5.427e-3
     stopped at 511 of 512 accumulation steps         6.609e-2
 
-The tolerance sits about 5,800x above honest hardware drift and 66x below the
-smallest cheat the workload can express - skipping one of 512 accumulation
-steps, a 0.2% saving. Over 200 independent challenges that cheat was caught 200
-times, and honest work was rejected zero times.
+The tolerance sits 577x above honest hardware drift and 54x below the cheapest
+cheat a real provider would reach for: quietly running the shard in fp16 or
+TF32 and returning the answer as f32. Skipping accumulation steps - the cheat
+the audit was designed for - lands further out still, at 661x. Over 200
+independent challenges that cheat was caught 200 times, and honest work was
+rejected zero times.
+
+Both margins survive scale, which is what lets the tolerance be one constant
+instead of a function of the shape. Section 7 of the proof walks the inner
+dimension across a 64x range: honest drift grows from 3.5e-7 to 2.9e-6, and
+fp16 drift from 3.1e-3 to 2.3e-2. The narrowest margin anywhere in that range
+is 31x, and a unit test asserts 20x at three sizes so the constant cannot
+quietly drift out of its gap.
 
 One round of Freivalds over the reals is weaker than one round over a large
 prime field: a plus-or-minus-one challenge catches a wrong product with
@@ -270,9 +280,12 @@ The match in `audit_class` is exhaustive, so it cannot be added silently.
 ## Reproducing the numbers
 
     cargo run --release -p hocmesh-core --example verification_proof
+    cargo run --release -p hocmesh-core --example float_witness_proof
 
-Every figure in this document is printed by that example, measured on the
-machine that runs it. It asserts its own claims, so it fails rather than lies.
+Every figure in this document is printed by one of those two - the first for
+the integer path and the economics, the second for everything float - measured
+on the machine that runs it. Both assert their own claims, so they fail rather
+than lie.
 
 Measured on a Windows 11 laptop, release build:
 

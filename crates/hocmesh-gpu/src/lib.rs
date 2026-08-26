@@ -468,6 +468,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
     fn temporary_executable() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "hocmesh-gpu-backend-{}-{}",
@@ -592,6 +593,7 @@ mod tests {
         assert!(LlamaCppBackend::new("definitely-missing", device(BackendKind::Cpu), 0).is_err());
     }
 
+    #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
     macro_rules! backend_contract_test {
         ($test:ident, $backend:ident, $kind:expr) => {
             #[test]
