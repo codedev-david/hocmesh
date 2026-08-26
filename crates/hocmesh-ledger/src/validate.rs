@@ -79,6 +79,7 @@ pub fn claim_key(tx: &LedgerTransaction) -> String {
         TransactionEvidence::InferenceReserve(e) => format!("reserve:{}", e.job_id),
         TransactionEvidence::InferenceReward(e) => format!("reward:{}", e.assignment_id),
         TransactionEvidence::InferenceRefund(e) => format!("reward:{}", e.assignment_id),
+        TransactionEvidence::MembershipChange(_) => format!("membership:{}", tx.transaction_id),
     }
 }
 
@@ -114,6 +115,9 @@ pub fn validate_transaction(
     balance: impl Fn(&str) -> Result<i64>,
     community_issuance_limit_mcu: i64,
 ) -> Result<()> {
+    if let TransactionEvidence::MembershipChange(e) = &tx.evidence {
+        return validate_membership_shape(tx, e);
+    }
     if tx.postings.len() < 2 {
         bail!("transaction needs at least two postings")
     }
@@ -460,6 +464,9 @@ pub fn validate_historical_transaction(
     community_issuance_limit_mcu: i64,
 ) -> Result<()> {
     verify_historical_evidence(tx, previous_hash, signatures)?;
+    if let TransactionEvidence::MembershipChange(e) = &tx.evidence {
+        return validate_membership_shape(tx, e);
+    }
     if tx.postings.len() < 2 {
         bail!("transaction needs at least two postings")
     }
@@ -980,6 +987,14 @@ pub fn verify_historical_evidence(
             )
             .map_err(anyhow::Error::msg)?;
         }
+        TransactionEvidence::MembershipChange(e) => {
+            if e.member.validator_id.is_empty() || e.member.public_key_b64.is_empty() {
+                bail!("membership change names no validator")
+            }
+            if e.vouches.is_empty() {
+                bail!("membership change carries no vouches")
+            }
+        }
     };
     Ok(())
 }
@@ -1033,6 +1048,145 @@ fn certified_witness(
         return verify::adjudicate(work, result).is_accepted();
     }
     verdict.is_accepted()
+}
+
+/// A membership change settles nothing, so it must move no CU at all.
+///
+/// Written as a requirement rather than an exemption. If an admission were
+/// allowed to carry postings it would be the one transaction kind able to
+/// move CU while presenting evidence that says nothing about balances.
+fn validate_membership_shape(tx: &LedgerTransaction, e: &MembershipChangeEvidence) -> Result<()> {
+    if !matches!(tx.kind, TransactionKind::MembershipChange) {
+        bail!("transaction kind/evidence mismatch")
+    }
+    if !tx.postings.is_empty() {
+        bail!("a membership change must move no CU")
+    }
+    if e.threshold == 0 {
+        bail!("membership change sets a zero threshold")
+    }
+    Ok(())
+}
+
+/// What a sitting validator signs to sponsor a change to the set.
+///
+/// The set it was signed against is part of the message, so a vouch
+/// collected for one transition cannot be re-presented against a set that
+/// has moved on since.
+pub fn vouch_signing_message(
+    previous_set_hash: &str,
+    action: MembershipAction,
+    member: &ValidatorMember,
+    resulting_set_hash: &str,
+) -> String {
+    let verb = match action {
+        MembershipAction::Join => "join",
+        MembershipAction::Leave => "leave",
+    };
+    format!(
+        "hocmesh-vouch-v1|{previous_set_hash}|{verb}|{}|{}|{resulting_set_hash}",
+        member.validator_id, member.public_key_b64
+    )
+}
+
+/// Works out the set a change produces, refusing one that makes no sense.
+pub fn membership_result(
+    set: &ValidatorSet,
+    action: MembershipAction,
+    member: &ValidatorMember,
+    threshold: usize,
+) -> Result<ValidatorSet> {
+    let mut next = set.clone();
+    match action {
+        MembershipAction::Join => {
+            if next
+                .members
+                .iter()
+                .any(|m| m.validator_id == member.validator_id)
+            {
+                bail!("{} is already a validator", member.validator_id)
+            }
+            next.members.push(member.clone());
+        }
+        MembershipAction::Leave => {
+            let Some(pos) = next
+                .members
+                .iter()
+                .position(|m| m.validator_id == member.validator_id)
+            else {
+                bail!("{} is not a validator", member.validator_id)
+            };
+            if next.members[pos] != *member {
+                bail!(
+                    "membership change describes {} differently from the sitting set",
+                    member.validator_id
+                )
+            }
+            next.members.remove(pos);
+        }
+    }
+    next.threshold = threshold;
+    validate_validator_set(&next)?;
+    Ok(next)
+}
+
+/// Applies a change and checks it produces the set it says it will.
+///
+/// The set hash is re-derived rather than trusted, because it is what every
+/// vouch was signed over: if the evidence could claim one set and produce
+/// another, a sponsor's signature would authorise something it never saw.
+pub fn apply_membership_change(
+    set: &ValidatorSet,
+    e: &MembershipChangeEvidence,
+) -> Result<ValidatorSet> {
+    let next = membership_result(set, e.action, &e.member, e.threshold)?;
+    let produced = membership_hash(&next)?;
+    if produced != e.resulting_set_hash {
+        bail!(
+            "membership change claims it produces set {} but produces {produced}",
+            e.resulting_set_hash
+        )
+    }
+    Ok(next)
+}
+
+/// Checks that enough sitting validators put their names to a change.
+///
+/// The bar is the set's own consensus threshold, deliberately. Eviction that
+/// is easier than agreement would itself be the attack: a minority able to
+/// vote out the majority captures the quorum without ever holding it. The
+/// cost is that a set which has already lost the ability to certify entries
+/// cannot repair itself either, which is the same liveness limit the ledger
+/// already has rather than a new one.
+pub fn verify_membership_change(
+    set: &ValidatorSet,
+    e: &MembershipChangeEvidence,
+) -> Result<ValidatorSet> {
+    let previous = membership_hash(set)?;
+    let next = apply_membership_change(set, e)?;
+    let message = vouch_signing_message(&previous, e.action, &e.member, &e.resulting_set_hash);
+    let mut seen = std::collections::HashSet::new();
+    let mut good = 0usize;
+    for v in &e.vouches {
+        if !seen.insert(&v.validator_id) {
+            continue;
+        }
+        if let Some(m) = set
+            .members
+            .iter()
+            .find(|m| m.validator_id == v.validator_id)
+            && verify_validator_signature(m, &message, &v.signature_b64).is_ok()
+        {
+            good += 1
+        }
+    }
+    if good < set.threshold {
+        bail!(
+            "membership change carries {good} valid vouches from the sitting set; {} are required",
+            set.threshold
+        )
+    }
+    Ok(next)
 }
 #[cfg(test)]
 mod tests {
@@ -2098,5 +2252,159 @@ mod tests {
             "reopening a pruned ledger must not change the state it holds"
         );
         reopened.audit_from(&v.set, Some(&cp)).unwrap();
+    }
+
+    /// A validator that is not in the set yet, ready to be sponsored in.
+    fn outsider(v: &TestValidatorSet, name: &str) -> (NodeIdentity, ValidatorMember) {
+        let id = NodeIdentity::load_or_create(&v._dir.join(name)).unwrap();
+        let member = ValidatorMember {
+            validator_id: id.node_id(),
+            url: format!("http://127.0.0.1:9999/{name}"),
+            public_key_b64: id.public_key_b64(),
+        };
+        (id, member)
+    }
+
+    /// A change sponsored by the first `signers` sitting validators.
+    fn change(
+        v: &TestValidatorSet,
+        action: MembershipAction,
+        member: &ValidatorMember,
+        threshold: usize,
+        signers: &[&NodeIdentity],
+    ) -> MembershipChangeEvidence {
+        let next = membership_result(&v.set, action, member, threshold).unwrap();
+        let resulting_set_hash = membership_hash(&next).unwrap();
+        let message = vouch_signing_message(
+            &membership_hash(&v.set).unwrap(),
+            action,
+            member,
+            &resulting_set_hash,
+        );
+        let vouches = signers
+            .iter()
+            .map(|id| ValidatorSignature {
+                validator_id: id.node_id(),
+                signature_b64: id.sign_bytes_b64(message.as_bytes()),
+            })
+            .collect();
+        MembershipChangeEvidence {
+            action,
+            member: member.clone(),
+            threshold,
+            vouches,
+            resulting_set_hash,
+        }
+    }
+
+    #[test]
+    fn a_join_needs_a_quorum_of_sitting_validators() {
+        let v = validator_set("membership_join_quorum");
+        let (_, member) = outsider(&v, "joiner");
+        let ids: Vec<&NodeIdentity> = v.identities.iter().collect();
+
+        let short = change(&v, MembershipAction::Join, &member, 4, &ids[..2]);
+        assert!(verify_membership_change(&v.set, &short).is_err());
+
+        let enough = change(&v, MembershipAction::Join, &member, 4, &ids[..3]);
+        let next = verify_membership_change(&v.set, &enough).unwrap();
+        assert_eq!(next.members.len(), 5);
+        assert!(
+            next.members
+                .iter()
+                .any(|m| m.validator_id == member.validator_id)
+        );
+    }
+
+    #[test]
+    fn an_outsider_cannot_vouch_itself_in() {
+        let v = validator_set("membership_self_vouch");
+        let (joiner, member) = outsider(&v, "joiner");
+        let mut signers: Vec<&NodeIdentity> = v.identities.iter().take(2).collect();
+        signers.push(&joiner);
+        let e = change(&v, MembershipAction::Join, &member, 4, &signers);
+        assert_eq!(e.vouches.len(), 3);
+        assert!(verify_membership_change(&v.set, &e).is_err());
+    }
+
+    #[test]
+    fn a_vouch_cannot_be_replayed_against_a_set_that_has_moved() {
+        let v = validator_set("membership_replay");
+        let (_, first) = outsider(&v, "first");
+        let (_, second) = outsider(&v, "second");
+        let ids: Vec<&NodeIdentity> = v.identities.iter().collect();
+
+        let admit = change(&v, MembershipAction::Join, &first, 4, &ids[..3]);
+        let moved = verify_membership_change(&v.set, &admit).unwrap();
+
+        let mut stale = change(&v, MembershipAction::Join, &second, 4, &ids[..3]);
+        stale.threshold = 5;
+        // Repointed at the set it is now presented against, so the only thing
+        // left wrong is what the sponsors actually put their names to.
+        stale.resulting_set_hash = membership_hash(
+            &membership_result(&moved, MembershipAction::Join, &second, 5).unwrap(),
+        )
+        .unwrap();
+        assert!(verify_membership_change(&moved, &stale).is_err());
+    }
+
+    #[test]
+    fn a_membership_change_cannot_claim_a_set_it_does_not_produce() {
+        let v = validator_set("membership_claimed_set");
+        let (_, member) = outsider(&v, "joiner");
+        let ids: Vec<&NodeIdentity> = v.identities.iter().collect();
+        let mut e = change(&v, MembershipAction::Join, &member, 4, &ids[..3]);
+        e.resulting_set_hash = membership_hash(&v.set).unwrap();
+        assert!(verify_membership_change(&v.set, &e).is_err());
+    }
+
+    #[test]
+    fn a_membership_change_must_move_no_credit() {
+        let v = validator_set("membership_no_credit");
+        let (_, member) = outsider(&v, "joiner");
+        let ids: Vec<&NodeIdentity> = v.identities.iter().collect();
+        let e = change(&v, MembershipAction::Join, &member, 4, &ids[..3]);
+        let mut tx = LedgerTransaction {
+            transaction_id: "membership_test".into(),
+            kind: TransactionKind::MembershipChange,
+            postings: Vec::new(),
+            evidence: TransactionEvidence::MembershipChange(e),
+            created_at: 0,
+        };
+        validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(0), 1_000_000).unwrap();
+        tx.postings = vec![
+            Posting {
+                account_id: COMMUNITY_ISSUANCE_ACCOUNT.into(),
+                delta_mcu: -5,
+            },
+            Posting {
+                account_id: "hocmesh:node:attacker".into(),
+                delta_mcu: 5,
+            },
+        ];
+        assert!(validate_transaction(&tx, TEST_PREVIOUS_HASH, |_| Ok(0), 1_000_000).is_err());
+    }
+
+    #[test]
+    fn a_leave_must_describe_the_member_the_set_actually_holds() {
+        let v = validator_set("membership_leave");
+        let sitting = v.set.members[3].clone();
+        let ids: Vec<&NodeIdentity> = v.identities.iter().collect();
+
+        let out = change(&v, MembershipAction::Leave, &sitting, 3, &ids[..3]);
+        let next = verify_membership_change(&v.set, &out).unwrap();
+        assert_eq!(next.members.len(), 3);
+        assert!(
+            !next
+                .members
+                .iter()
+                .any(|m| m.validator_id == sitting.validator_id)
+        );
+
+        let mut impostor = sitting.clone();
+        impostor.public_key_b64 = v.set.members[0].public_key_b64.clone();
+        let mut forged = out;
+        forged.member = impostor;
+        assert!(verify_membership_change(&v.set, &forged).is_err());
     }
 }

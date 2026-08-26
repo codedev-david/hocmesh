@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+uuid.workspace = true
 axum.workspace = true
 clap.workspace = true
 hocmesh-core = { path = "../hocmesh-core" }

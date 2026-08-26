@@ -1,15 +1,23 @@
 mod client;
 mod daemon;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use client::HocMeshClient;
 use hocmesh_ai::{InferenceRequirements, PlanRequest, SubmitInferenceRequest};
 use hocmesh_core::{hardware, identity::NodeIdentity, limits::ResourceLimits, proximity::Vivaldi};
 use hocmesh_gpu::{InferenceBackend, InferenceRequest, LlamaCppBackend};
 use hocmesh_ledger::{
-    network::LedgerNetwork, store::LedgerStore, types::ValidatorSet,
-    validate::validate_validator_set,
+    network::LedgerNetwork,
+    store::LedgerStore,
+    types::{
+        LedgerTransaction, MembershipAction, MembershipChangeEvidence, TransactionEvidence,
+        TransactionKind, ValidatorMember, ValidatorSet, ValidatorSignature,
+    },
+    validate::{
+        membership_hash, membership_result, validate_validator_set, verify_membership_change,
+        vouch_signing_message,
+    },
 };
 use hocmesh_model::{ChunkStore, ModelFormat, ModelRegistry, manifest_for_file};
 use hocmesh_protocol::WorkSpec;
@@ -221,6 +229,40 @@ enum Command {
         validators: String,
         #[arg(long, default_value = ".hocmesh/ledger-mirror.db")]
         db: String,
+    },
+    /// Sign a sponsorship for a change to the validator set.
+    ///
+    /// Deliberately an operator action rather than an endpoint. A validator
+    /// that vouched for whoever asked would make admission free, which is the
+    /// whole thing the vouch exists to stop.
+    MembershipVouch {
+        #[arg(long)]
+        validators: String,
+        #[arg(long, value_enum)]
+        action: MembershipActionArg,
+        /// JSON file describing the validator joining or leaving.
+        #[arg(long)]
+        member: String,
+        /// Consensus threshold the set should carry afterwards.
+        #[arg(long)]
+        threshold: usize,
+    },
+    /// Submit a set change once enough sitting validators have sponsored it.
+    MembershipCommit {
+        #[arg(long)]
+        validators: String,
+        #[arg(long, value_enum)]
+        action: MembershipActionArg,
+        #[arg(long)]
+        member: String,
+        #[arg(long)]
+        threshold: usize,
+        /// JSON file holding the collected vouch signatures.
+        #[arg(long)]
+        vouches: String,
+        /// Where to write the set the change produces.
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -777,12 +819,19 @@ stored at: {}",
             db,
             full,
         } => {
-            let set = load_set(&validators)?;
+            let genesis = load_set(&validators)?;
             let store = LedgerStore::open(&db)?;
             let from = if full {
                 None
             } else {
                 store.latest_checkpoint()?
+            };
+            // A full replay starts at genesis and evolves the set as the chain
+            // changed it; one that resumes from a checkpoint needs the set that
+            // was sitting when that checkpoint was signed.
+            let set = match &from {
+                Some(cp) => store.set_at(cp.head.sequence)?.unwrap_or(genesis),
+                None => genesis,
             };
             let h = store.audit_from(&set, from.as_ref())?;
             let start = from.as_ref().map_or(0, |c| c.head.sequence);
@@ -805,10 +854,72 @@ stored at: {}",
             );
         }
         Command::LedgerPrune { validators, db } => {
-            let set = load_set(&validators)?;
             let store = LedgerStore::open(&db)?;
+            let set = store.current_set()?.unwrap_or(load_set(&validators)?);
             let removed = store.prune_below_checkpoint(&set)?;
             println!("PRUNED {removed} certificates already covered by a checkpoint");
+        }
+        Command::MembershipVouch {
+            validators,
+            action,
+            member,
+            threshold,
+        } => {
+            let set = load_set(&validators)?;
+            let member: ValidatorMember = read_json(&member)?;
+            let action: MembershipAction = action.into();
+            let evidence = membership_evidence(&set, action, member, threshold, Vec::new())?;
+            let message = vouch_signing_message(
+                &membership_hash(&set)?,
+                action,
+                &evidence.member,
+                &evidence.resulting_set_hash,
+            );
+            let vouch = ValidatorSignature {
+                validator_id: identity.node_id(),
+                signature_b64: identity.sign_bytes_b64(message.as_bytes()),
+            };
+            if !set
+                .members
+                .iter()
+                .any(|m| m.validator_id == vouch.validator_id)
+            {
+                bail!(
+                    "this node is not in the sitting validator set, so its vouch counts for nothing"
+                )
+            }
+            println!("{}", serde_json::to_string(&vouch)?);
+        }
+        Command::MembershipCommit {
+            validators,
+            action,
+            member,
+            threshold,
+            vouches,
+            out,
+        } => {
+            let set = load_set(&validators)?;
+            let member: ValidatorMember = read_json(&member)?;
+            let vouches: Vec<ValidatorSignature> = read_json(&vouches)?;
+            let action: MembershipAction = action.into();
+            let evidence = membership_evidence(&set, action, member, threshold, vouches)?;
+            let next = verify_membership_change(&set, &evidence)?;
+            let tx = LedgerTransaction {
+                transaction_id: format!("membership_{}", uuid::Uuid::new_v4().simple()),
+                kind: TransactionKind::MembershipChange,
+                postings: Vec::new(),
+                evidence: TransactionEvidence::MembershipChange(evidence),
+                created_at: hocmesh_protocol::now_unix(),
+            };
+            let cert = LedgerNetwork::new(set)?.transact(tx).await?;
+            if let Some(path) = out {
+                std::fs::write(&path, serde_json::to_string_pretty(&next)?)?;
+                println!("Wrote the new validator set to {path}");
+            }
+            println!(
+                "MEMBERSHIP CHANGE CERTIFIED at sequence {} ({})",
+                cert.entry.sequence, cert.entry.entry_hash
+            );
         }
     }
     Ok(())
@@ -847,6 +958,47 @@ fn load_set(path: &str) -> Result<ValidatorSet> {
             .context("parsing validator set")?;
     validate_validator_set(&set)?;
     Ok(set)
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum MembershipActionArg {
+    Join,
+    Leave,
+}
+impl From<MembershipActionArg> for MembershipAction {
+    fn from(a: MembershipActionArg) -> Self {
+        match a {
+            MembershipActionArg::Join => MembershipAction::Join,
+            MembershipActionArg::Leave => MembershipAction::Leave,
+        }
+    }
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+    serde_json::from_str(&raw).with_context(|| format!("parsing {path}"))
+}
+
+/// Builds the change so a vouch and the commit describe the same thing.
+///
+/// The resulting set hash is derived on both sides rather than passed along,
+/// so a sponsor signs for the set its own copy of the rules produces and not
+/// for a hash somebody handed it.
+fn membership_evidence(
+    set: &ValidatorSet,
+    action: MembershipAction,
+    member: ValidatorMember,
+    threshold: usize,
+    vouches: Vec<ValidatorSignature>,
+) -> Result<MembershipChangeEvidence> {
+    let next = membership_result(set, action, &member, threshold)?;
+    Ok(MembershipChangeEvidence {
+        action,
+        member,
+        threshold,
+        vouches,
+        resulting_set_hash: membership_hash(&next)?,
+    })
 }
 fn load_network(path: &str) -> Result<LedgerNetwork> {
     LedgerNetwork::new(load_set(path)?)

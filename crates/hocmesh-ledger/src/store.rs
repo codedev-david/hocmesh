@@ -2,7 +2,7 @@ use crate::{
     types::*,
     validate::{
         claim_key, membership_hash, validate_historical_transaction, verify_certificate,
-        verify_checkpoint, verify_historical_evidence,
+        verify_checkpoint, verify_historical_evidence, verify_membership_change,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -98,6 +98,10 @@ impl LedgerStore {
             CREATE TABLE IF NOT EXISTS checkpoints(
                 sequence INTEGER PRIMARY KEY,
                 checkpoint_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS validator_set(
+                sequence INTEGER PRIMARY KEY,
+                set_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS votes(
                 sequence INTEGER PRIMARY KEY,
@@ -305,8 +309,15 @@ impl LedgerStore {
     }
     pub fn apply(&mut self, cert: &QuorumCertificate, set: &ValidatorSet) -> Result<()> {
         verify_certificate(cert, set)?;
+        let mut next_set: Option<ValidatorSet> = None;
         for t in &cert.entry.transactions {
             verify_historical_evidence(t, &cert.entry.previous_hash, &cert.signatures)?;
+            if let TransactionEvidence::MembershipChange(e) = &t.evidence {
+                next_set = Some(verify_membership_change(
+                    next_set.as_ref().unwrap_or(set),
+                    e,
+                )?);
+            }
         }
         let h = self.head(set)?;
         if cert.entry.sequence != h.sequence + 1 || cert.entry.previous_hash != h.entry_hash {
@@ -363,8 +374,56 @@ impl LedgerStore {
             params![sqlite_sequence(cert.entry.sequence)?, cert.entry.entry_hash],
         )?;
         index_certificate(&tx, cert)?;
+        if let Some(next) = &next_set {
+            tx.execute(
+                "INSERT OR REPLACE INTO validator_set(sequence,set_json) VALUES(?1,?2)",
+                params![
+                    sqlite_sequence(cert.entry.sequence)?,
+                    serde_json::to_string(next)?
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+    /// The set the chain recognised at a given height.
+    ///
+    /// An audit that starts from a checkpoint has to verify that checkpoint's
+    /// signatures against the set that was sitting when it was signed, not
+    /// against whoever holds the seats today.
+    pub fn set_at(&self, sequence: u64) -> Result<Option<ValidatorSet>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT set_json FROM validator_set WHERE sequence<=?1 ORDER BY sequence DESC LIMIT 1",
+                params![sqlite_sequence(sequence)?],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match json {
+            Some(j) => Some(serde_json::from_str(&j)?),
+            None => None,
+        })
+    }
+    /// The validator set as the chain last changed it, if it ever has.
+    ///
+    /// A node that has been running is bound by what the quorum certified,
+    /// not by whatever the operator last wrote in the bootstrap file. That
+    /// file is the genesis set and nothing more: it stops being the authority
+    /// the moment a membership change is agreed.
+    pub fn current_set(&self) -> Result<Option<ValidatorSet>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT set_json FROM validator_set ORDER BY sequence DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match json {
+            Some(j) => Some(serde_json::from_str(&j)?),
+            None => None,
+        })
     }
     pub fn certificates_from(&self, from: u64, limit: u64) -> Result<Vec<QuorumCertificate>> {
         let from = sqlite_sequence(from)?;
@@ -611,8 +670,9 @@ impl LedgerStore {
             reservations,
             inference,
         } = &mut state;
+        let mut active = set.clone();
         for c in certs {
-            verify_certificate(&c, set)?;
+            verify_certificate(&c, &active)?;
             if c.entry.sequence != seq + 1 || c.entry.previous_hash != prev {
                 bail!("broken chain at sequence {}", c.entry.sequence)
             };
@@ -626,7 +686,7 @@ impl LedgerStore {
                     &c.entry.previous_hash,
                     &c.signatures,
                     |a| Ok(*balances.get(a).unwrap_or(&0)),
-                    set.community_issuance_limit_mcu,
+                    active.community_issuance_limit_mcu,
                 )?;
                 match &txn.evidence {
                     TransactionEvidence::JobReserve(e) => {
@@ -805,6 +865,9 @@ impl LedgerStore {
                             bail!("refund inside the shard's settlement window")
                         }
                     }
+                    TransactionEvidence::MembershipChange(e) => {
+                        active = verify_membership_change(&active, e)?
+                    }
                 }
                 for p in &txn.postings {
                     let next = balances
@@ -965,6 +1028,11 @@ fn index_certificate(tx: &rusqlite::Transaction<'_>, cert: &QuorumCertificate) -
                 // shard is settled, and the escrow it empties is visible in the
                 // postings like every other movement of CU.
             }
+            TransactionEvidence::MembershipChange(_) => {
+                // Nothing is indexed. A membership change moves no CU and
+                // reserves nothing; the set it produces is applied by the
+                // caller, which is the only place the previous set is known.
+            }
         }
     }
     Ok(())
@@ -973,6 +1041,11 @@ fn index_certificate(tx: &rusqlite::Transaction<'_>, cert: &QuorumCertificate) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validate::{
+        build_entry, ledger_entry_signing_message, membership_result, verify_certificate,
+        vouch_signing_message,
+    };
+    use hocmesh_core::identity::NodeIdentity;
 
     #[test]
     fn validator_cannot_double_vote_at_same_height() {
@@ -980,5 +1053,164 @@ mod tests {
         store.lock_vote(1, "aaa").unwrap();
         store.lock_vote(1, "aaa").unwrap();
         assert!(store.lock_vote(1, "bbb").is_err());
+    }
+
+    fn store_dir(name: &str) -> std::path::PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("hocmesh-store-test-{name}-{suffix}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn member_of(id: &NodeIdentity, index: usize) -> ValidatorMember {
+        ValidatorMember {
+            validator_id: id.node_id(),
+            url: format!("http://127.0.0.1:{}", 9200 + index),
+            public_key_b64: id.public_key_b64(),
+        }
+    }
+
+    /// Signs an entry the way a validator does when it votes for it.
+    fn certify(
+        entry: LedgerEntry,
+        set: &ValidatorSet,
+        signers: &[&NodeIdentity],
+    ) -> QuorumCertificate {
+        let mh = membership_hash(set).unwrap();
+        let message = ledger_entry_signing_message(&mh, &entry.entry_hash);
+        QuorumCertificate {
+            entry,
+            membership_hash: mh,
+            signatures: signers
+                .iter()
+                .map(|id| ValidatorSignature {
+                    validator_id: id.node_id(),
+                    signature_b64: id.sign_bytes_b64(message.as_bytes()),
+                })
+                .collect(),
+        }
+    }
+
+    /// A membership transaction sponsored by the given sitting validators.
+    fn vouched(
+        set: &ValidatorSet,
+        action: MembershipAction,
+        member: &ValidatorMember,
+        threshold: usize,
+        signers: &[&NodeIdentity],
+    ) -> LedgerTransaction {
+        let next = membership_result(set, action, member, threshold).unwrap();
+        let resulting_set_hash = membership_hash(&next).unwrap();
+        let message = vouch_signing_message(
+            &membership_hash(set).unwrap(),
+            action,
+            member,
+            &resulting_set_hash,
+        );
+        LedgerTransaction {
+            transaction_id: format!("membership_{}", member.validator_id),
+            kind: TransactionKind::MembershipChange,
+            postings: Vec::new(),
+            evidence: TransactionEvidence::MembershipChange(MembershipChangeEvidence {
+                action,
+                member: member.clone(),
+                threshold,
+                vouches: signers
+                    .iter()
+                    .map(|id| ValidatorSignature {
+                        validator_id: id.node_id(),
+                        signature_b64: id.sign_bytes_b64(message.as_bytes()),
+                    })
+                    .collect(),
+                resulting_set_hash,
+            }),
+            created_at: 0,
+        }
+    }
+
+    /// The chain, not the bootstrap file, decides who may certify.
+    ///
+    /// An auditor that starts from the genesis set has to end up accepting
+    /// signatures from a validator that set has never heard of, purely because
+    /// the history says a quorum admitted it - and has to stop accepting the
+    /// one the same history says left. That is the whole reason membership is
+    /// a ledger event rather than a file every operator is trusted to match.
+    #[test]
+    fn an_audit_follows_the_set_the_chain_admits() {
+        let dir = store_dir("membership_audit");
+        let ids: Vec<NodeIdentity> = (0..5)
+            .map(|i| NodeIdentity::load_or_create(&dir.join(format!("v{i}"))).unwrap())
+            .collect();
+        let genesis = ValidatorSet {
+            threshold: 3,
+            community_issuance_limit_mcu: 1_000_000,
+            members: ids[..4]
+                .iter()
+                .enumerate()
+                .map(|(i, id)| member_of(id, i))
+                .collect(),
+        };
+        let newcomer = member_of(&ids[4], 4);
+        let mut store = LedgerStore::open(":memory:").unwrap();
+
+        // Entry 1: the sitting four admit a fifth, and the threshold rises with
+        // the set. Sponsored and certified by the set as it stands.
+        let join = vouched(
+            &genesis,
+            MembershipAction::Join,
+            &newcomer,
+            4,
+            &[&ids[0], &ids[1], &ids[2]],
+        );
+        let e1 = build_entry(1, "GENESIS".into(), vec![join]).unwrap();
+        let c1 = certify(e1, &genesis, &[&ids[0], &ids[1], &ids[2]]);
+        store.apply(&c1, &genesis).unwrap();
+
+        let admitted = store.current_set().unwrap().unwrap();
+        assert_eq!(admitted.members.len(), 5);
+        assert_eq!(admitted.threshold, 4);
+
+        // Entry 2: a change the genesis set could not have certified. It is
+        // sponsored and signed by four validators, one of whom the genesis set
+        // has never heard of, and it carries the membership hash of a set that
+        // only exists because entry 1 said so.
+        let quorum = [&ids[1], &ids[2], &ids[3], &ids[4]];
+        let departing = admitted.members[0].clone();
+        let leave = vouched(&admitted, MembershipAction::Leave, &departing, 3, &quorum);
+        let e2 = build_entry(2, c1.entry.entry_hash.clone(), vec![leave]).unwrap();
+        let c2 = certify(e2, &admitted, &quorum);
+        store.apply(&c2, &admitted).unwrap();
+
+        // The genesis set cannot verify it. Nothing about entry 2 is legible
+        // without the history that produced the set which signed it.
+        assert!(verify_certificate(&c2, &genesis).is_err());
+
+        // A full replay from the genesis set nevertheless accepts both, because
+        // it follows the set the chain itself hands forward.
+        let head = store.audit_from(&genesis, None).unwrap();
+        assert_eq!(head.sequence, 2);
+        assert_eq!(head.entry_hash, c2.entry.entry_hash);
+
+        // And the set is queryable at height, which is what a checkpoint-
+        // resumed audit needs: the seats as they were, not as they are.
+        assert_eq!(store.set_at(1).unwrap().unwrap(), admitted);
+        let after = store.current_set().unwrap().unwrap();
+        assert_eq!(after.members.len(), 4);
+        assert_eq!(after.threshold, 3);
+        assert!(
+            !after
+                .members
+                .iter()
+                .any(|m| m.validator_id == departing.validator_id)
+        );
+        assert!(
+            after
+                .members
+                .iter()
+                .any(|m| m.validator_id == newcomer.validator_id)
+        );
     }
 }

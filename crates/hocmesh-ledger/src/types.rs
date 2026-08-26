@@ -21,6 +21,7 @@ pub enum TransactionKind {
     InferenceReserve,
     InferenceReward,
     InferenceRefund,
+    MembershipChange,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobReserveEvidence {
@@ -64,6 +65,7 @@ pub enum TransactionEvidence {
     InferenceReserve(InferenceReserveEvidence),
     InferenceReward(InferenceRewardEvidence),
     InferenceRefund(InferenceRefundEvidence),
+    MembershipChange(MembershipChangeEvidence),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRefundEvidence {
@@ -251,4 +253,37 @@ pub struct LedgerCheckpoint {
     pub head: LedgerHead,
     pub state_hash: String,
     pub signatures: Vec<ValidatorSignature>,
+}
+
+/// Whether a membership change lets a validator in or puts one out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MembershipAction {
+    Join,
+    Leave,
+}
+
+/// A change to who is allowed to certify entries, recorded in the chain itself.
+///
+/// Earning CU is already Sybil-proof: a fake node's results fail the
+/// recompute. What spinning up machines could still buy is a seat at the
+/// quorum, and a captured quorum can certify anything at all. So the validator
+/// set is the one part of hocMESH that is deliberately not open: a joiner
+/// needs existing members to sign for it by name, and the whole history of who
+/// admitted whom replays out of the ledger instead of living in a file that
+/// every operator has to be trusted to have edited identically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipChangeEvidence {
+    pub action: MembershipAction,
+    pub member: ValidatorMember,
+    /// The consensus threshold the set carries once this change lands.
+    pub threshold: usize,
+    /// Named sponsors from the set as it stands before the change.
+    ///
+    /// Separate from the quorum certificate on purpose. The certificate says
+    /// the entry is agreed; a vouch says a particular validator put its name
+    /// to this particular admission, and that stays legible in the evidence
+    /// long after the set has rotated past everyone involved.
+    pub vouches: Vec<ValidatorSignature>,
+    pub resulting_set_hash: String,
 }

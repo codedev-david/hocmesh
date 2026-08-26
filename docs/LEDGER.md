@@ -267,6 +267,26 @@ An attacker attempting to rewrite history must contend with:
 
 A single compromised coordinator database is not sufficient in quorum mode.
 
+## Validator set changes
+
+The set that certifies entries is itself recorded in the chain. A
+`MembershipChange` transaction carries the joining or departing member, the
+threshold the set takes on afterwards, individually signed vouches from sitting
+validators, and the hash of the set it produces.
+
+Both the sponsor and the committer re-derive that hash rather than trusting the
+one supplied, so evidence can never claim one set and produce another. The
+change moves no CU, and is rejected if it tries to.
+
+Validators persist the resulting set alongside the entry that certified it, in
+a `validator_set(sequence, set_json)` table that survives pruning. `set_at()`
+answers what the seats were at a height; `current_set()` answers what they are
+now. A node that has been running is bound by what the quorum certified, not by
+whatever is still sitting in its bootstrap file.
+
+See `docs/SECURITY.md`, *Validator set membership*, for the vouch message, the
+threshold rationale, and the operator commands.
+
 ## Consensus boundary
 
 This implementation is intentionally a practical v0.2 quorum-certified linear log. It is not yet a complete production BFT state machine with leader election, view changes, membership epochs, and automated fork resolution.

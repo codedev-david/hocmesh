@@ -19,7 +19,7 @@ use serde::Deserialize;
 use std::{
     fs,
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 use tracing_subscriber::EnvFilter;
 
@@ -68,7 +68,18 @@ enum Cmd {
 struct App {
     store: Arc<Mutex<LedgerStore>>,
     id: NodeIdentity,
-    set: ValidatorSet,
+    set: Arc<RwLock<ValidatorSet>>,
+}
+impl App {
+    /// The set as the chain last left it.
+    ///
+    /// Read through a lock rather than held as a plain field because a
+    /// certified membership change moves the set underneath a running
+    /// validator, and one still signing against the set it booted with would
+    /// be producing heads the rest of the quorum cannot verify.
+    fn set(&self) -> ValidatorSet {
+        self.set.read().expect("validator set lock").clone()
+    }
 }
 #[derive(Deserialize)]
 struct EntriesQ {
@@ -117,19 +128,24 @@ fn load_set(path: &str) -> Result<ValidatorSet> {
     Ok(set)
 }
 async fn serve(listen: &str, db: &str, home: &FsPath, validators: &str) -> Result<()> {
-    let set = load_set(validators)?;
+    let file_set = load_set(validators)?;
+    let store = LedgerStore::open(db)?;
+    // The bootstrap file is the genesis set and nothing more. Once the quorum
+    // has certified a change to membership, that is the set this node is
+    // bound by, whatever the operator still has sitting on disk.
+    let set = store.current_set()?.unwrap_or(file_set);
     let id = NodeIdentity::load_or_create(home)?;
     if !set
         .members
         .iter()
         .any(|m| m.validator_id == id.node_id() && m.public_key_b64 == id.public_key_b64())
     {
-        bail!("this validator identity is not in membership file")
+        bail!("this validator identity is not in the set the ledger currently recognises")
     };
     let app = App {
-        store: Arc::new(Mutex::new(LedgerStore::open(db)?)),
+        store: Arc::new(Mutex::new(store)),
         id,
-        set,
+        set: Arc::new(RwLock::new(set)),
     };
     let r = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -151,7 +167,7 @@ async fn head(State(a): State<App>) -> Result<Json<HeadProof>, String> {
         .store
         .lock()
         .map_err(|_| "lock".to_string())?
-        .head(&a.set)
+        .head(&a.set())
         .map_err(|e| e.to_string())?;
     let msg = format!(
         "hocmesh-head-v1|{}|{}|{}",
@@ -169,7 +185,7 @@ async fn head(State(a): State<App>) -> Result<Json<HeadProof>, String> {
 /// so a caller that collects a quorum of these has a checkpoint already.
 async fn ledger_state(State(a): State<App>) -> Result<Json<StateProof>, String> {
     let s = a.store.lock().map_err(|_| "lock".to_string())?;
-    let head = s.head(&a.set).map_err(|e| e.to_string())?;
+    let head = s.head(&a.set()).map_err(|e| e.to_string())?;
     let state_hash = s
         .state()
         .and_then(|st| st.digest())
@@ -195,7 +211,7 @@ async fn balance(
     let s = a.store.lock().map_err(|_| "lock".to_string())?;
     let b = s.balance(&account).map_err(|e| e.to_string())?;
     let (earned, spent) = s.activity(&account).map_err(|e| e.to_string())?;
-    let h = s.head(&a.set).map_err(|e| e.to_string())?;
+    let h = s.head(&a.set()).map_err(|e| e.to_string())?;
     let msg = format!(
         "hocmesh-balance-v1|{}|{}|{}|{}|{}|{}|{}",
         h.membership_hash, account, b, earned, spent, h.sequence, h.entry_hash
@@ -217,7 +233,7 @@ async fn claim(
 ) -> Result<Json<ClaimProof>, String> {
     let s = a.store.lock().map_err(|_| "lock".to_string())?;
     let detail = s.claim_detail(&claim).map_err(|e| e.to_string())?;
-    let h = s.head(&a.set).map_err(|e| e.to_string())?;
+    let h = s.head(&a.set()).map_err(|e| e.to_string())?;
     let (sequence, entry_hash, certificate) = match detail {
         Some((seq, hash)) => {
             let cert = s.certificate_at(seq).map_err(|e| e.to_string())?;
@@ -245,7 +261,7 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
             .store
             .lock()
             .map_err(|_| anyhow::anyhow!("ledger lock poisoned"))?;
-        let h = s.head(&a.set)?;
+        let h = s.head(&a.set())?;
         let mut settled = std::collections::HashSet::new();
         for t in &r.transactions {
             let ck = claim_key(t);
@@ -258,11 +274,11 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
             &r.transactions,
             &h.entry_hash,
             |x| s.balance(x),
-            a.set.community_issuance_limit_mcu,
+            a.set().community_issuance_limit_mcu,
         )?;
         let e = build_entry(h.sequence + 1, h.entry_hash.clone(), r.transactions)?;
         s.lock_vote(e.sequence, &e.entry_hash)?;
-        let mh = membership_hash(&a.set)?;
+        let mh = membership_hash(&a.set())?;
         let sig =
             a.id.sign_bytes_b64(ledger_entry_signing_message(&mh, &e.entry_hash).as_bytes());
         Ok(ProposalVote {
@@ -289,9 +305,9 @@ async fn commit(
     State(a): State<App>,
     Json(c): Json<QuorumCertificate>,
 ) -> Result<Json<CommitResponse>, String> {
-    verify_certificate(&c, &a.set).map_err(|e| e.to_string())?;
+    verify_certificate(&c, &a.set()).map_err(|e| e.to_string())?;
     let mut s = a.store.lock().map_err(|_| "lock".to_string())?;
-    let local = s.head(&a.set).map_err(|e| e.to_string())?;
+    let local = s.head(&a.set()).map_err(|e| e.to_string())?;
     if c.entry.sequence <= local.sequence {
         if c.entry.sequence == local.sequence && c.entry.entry_hash == local.entry_hash {
             return Ok(Json(CommitResponse {
@@ -308,11 +324,16 @@ async fn commit(
         &c.entry.transactions,
         &c.entry.previous_hash,
         |x| s.balance(x),
-        a.set.community_issuance_limit_mcu,
+        a.set().community_issuance_limit_mcu,
     )
     .map_err(|e| e.to_string())?;
-    s.apply(&c, &a.set).map_err(|e| e.to_string())?;
-    let h = s.head(&a.set).map_err(|e| e.to_string())?;
+    s.apply(&c, &a.set()).map_err(|e| e.to_string())?;
+    // A change to the set takes effect the moment it is certified, so pick it
+    // up before signing the head this same request is about to return.
+    if let Some(next) = s.current_set().map_err(|e| e.to_string())? {
+        *a.set.write().expect("validator set lock") = next;
+    }
+    let h = s.head(&a.set()).map_err(|e| e.to_string())?;
     Ok(Json(CommitResponse {
         committed: true,
         head: h,
