@@ -206,6 +206,21 @@ pub struct InferenceReserveEvidence {
 /// Only a digest of the outputs is recorded. The ledger is not the place to
 /// publish somebody's generated text, and the digest is enough to bind the
 /// provider to what it actually returned.
+/// What the ledger remembers about a certified inference job.
+///
+/// The reservation is the requester's own signed statement of which machine
+/// takes which batch and what the whole thing costs. That makes it the only
+/// honest answer to "was this the claim that was actually agreed?", which is
+/// why rewards and refunds are checked against it rather than taken on trust.
+#[derive(Debug, Clone)]
+pub struct InferenceReservation {
+    pub job_id: String,
+    pub billing: InferenceBilling,
+    pub batches: Vec<PricedBatch>,
+    pub requester: String,
+    pub reserved_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRewardEvidence {
     pub job_id: String,

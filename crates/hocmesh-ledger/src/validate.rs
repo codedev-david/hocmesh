@@ -77,10 +77,69 @@ pub fn claim_key(tx: &LedgerTransaction) -> String {
         TransactionEvidence::ProviderReward(e) => format!("reward:{}", e.assignment_id),
         TransactionEvidence::JobRefund(e) => format!("reward:{}", e.assignment_id),
         TransactionEvidence::InferenceReserve(e) => format!("reserve:{}", e.job_id),
-        TransactionEvidence::InferenceReward(e) => format!("reward:{}", e.assignment_id),
-        TransactionEvidence::InferenceRefund(e) => format!("reward:{}", e.assignment_id),
+        TransactionEvidence::InferenceReward(e) => {
+            inference_claim_key(&e.job_id, e.batch_start, e.batch_end)
+        }
+        TransactionEvidence::InferenceRefund(e) => {
+            inference_claim_key(&e.job_id, e.batch_start, e.batch_end)
+        }
         TransactionEvidence::MembershipChange(_) => format!("membership:{}", tx.transaction_id),
     }
+}
+
+/// One batch of one job settles once, in one direction.
+///
+/// The key is the batch itself, not the assignment id the coordinator handed
+/// out. An assignment id is the coordinator's to choose, so keying on it would
+/// let the same batch be claimed twice under two names; the batch is the thing
+/// the requester actually paid for, so it is the thing that can only go once.
+fn inference_claim_key(job_id: &str, batch_start: u32, batch_end: u32) -> String {
+    format!("reward:{job_id}:{batch_start}:{batch_end}")
+}
+
+/// What the ledger will remember about a job, read straight off the reserve.
+fn reservation_of(tx: &LedgerTransaction, e: &InferenceReserveEvidence) -> InferenceReservation {
+    InferenceReservation {
+        job_id: e.job_id.clone(),
+        billing: e.billing.clone(),
+        batches: e.batches.clone(),
+        requester: e.requester_auth.node_id.clone(),
+        reserved_at: tx.created_at,
+    }
+}
+
+/// The batch a claim names, and what the requester agreed it would cost.
+///
+/// Price is recomputed from the bill the requester signed rather than read off
+/// the claim, so the amount is never the claimant's to choose. A batch that is
+/// not in the reservation has no price at all, which is the point: it was
+/// never bought.
+fn reserved_batch(
+    r: &InferenceReservation,
+    assignment_id: &str,
+    start: u32,
+    end: u32,
+) -> Result<(PricedBatch, i64)> {
+    // Found by the assignment id the job itself determines, then checked
+    // against the bounds being claimed - the same order a replay uses, so a
+    // claim the validators take cannot be one an auditor later throws out.
+    let Some(index) = (0..r.batches.len() as u32)
+        .find(|i| hocmesh_protocol::inference_assignment_id(&r.job_id, *i) == assignment_id)
+    else {
+        bail!("inference claim names an assignment this job never had")
+    };
+    let b = &r.batches[index as usize];
+    if b.batch_start != start || b.batch_end != end {
+        bail!("inference claim changes the bounds of the batch it names")
+    }
+    let price = hocmesh_core::compute::inference_batch_cost_mcu(
+        &r.billing.prompt_bytes,
+        start,
+        end,
+        r.billing.max_tokens,
+        r.billing.parameter_count,
+    );
+    Ok((b.clone(), price))
 }
 
 /// Checks a whole entry's worth of transactions the way they will be applied.
@@ -93,26 +152,42 @@ pub fn validate_batch(
     transactions: &[LedgerTransaction],
     previous_hash: &str,
     balance: impl Fn(&str) -> Result<i64>,
+    reserved: impl Fn(&str) -> Result<Option<InferenceReservation>>,
     community_issuance_limit_mcu: i64,
 ) -> Result<()> {
     let mut overlay = std::collections::HashMap::<String, i64>::new();
+    // A job reserved earlier in this same entry has to be visible to a claim
+    // made later in it, for the same reason balances are: the entry applies as
+    // one step, so validating against only what was committed before it would
+    // reject a reserve-and-settle pair that is perfectly legal once applied.
+    let mut reserved_here = std::collections::HashMap::<String, InferenceReservation>::new();
     for tx in transactions {
         validate_transaction(
             tx,
             previous_hash,
             |a| Ok(balance(a)? + overlay.get(a).copied().unwrap_or(0)),
+            |j| match reserved_here.get(j) {
+                Some(r) => Ok(Some(r.clone())),
+                None => reserved(j),
+            },
             community_issuance_limit_mcu,
         )?;
+        if let TransactionEvidence::InferenceReserve(e) = &tx.evidence {
+            reserved_here.insert(e.job_id.clone(), reservation_of(tx, e));
+        }
         for p in &tx.postings {
             *overlay.entry(p.account_id.clone()).or_default() += p.delta_mcu;
         }
     }
     Ok(())
 }
+
+/// The reservation an inference reserve establishes, as the store would record it.
 pub fn validate_transaction(
     tx: &LedgerTransaction,
     previous_hash: &str,
     balance: impl Fn(&str) -> Result<i64>,
+    reserved: impl Fn(&str) -> Result<Option<InferenceReservation>>,
     community_issuance_limit_mcu: i64,
 ) -> Result<()> {
     if let TransactionEvidence::MembershipChange(e) = &tx.evidence {
@@ -169,10 +244,10 @@ pub fn validate_transaction(
             validate_inference_reserve(tx, e)?
         }
         (TransactionKind::InferenceReward, TransactionEvidence::InferenceReward(e)) => {
-            validate_inference_reward(tx, e)?
+            validate_inference_reward(tx, e, reserved(&e.job_id)?.as_ref())?
         }
         (TransactionKind::InferenceRefund, TransactionEvidence::InferenceRefund(e)) => {
-            validate_inference_refund(tx, e)?
+            validate_inference_refund(tx, e, reserved(&e.job_id)?.as_ref())?
         }
         _ => bail!("transaction kind/evidence mismatch"),
     }
@@ -291,7 +366,11 @@ fn batches_partition_prompts(batches: &[PricedBatch], prompts: usize) -> Result<
 /// worth paying for - so what the ledger checks here is the bill and the
 /// binding, not the answer. Whether the answer was any good is the requester's
 /// judgement, and the requester is the party out of pocket if it was not.
-fn validate_inference_reward(tx: &LedgerTransaction, e: &InferenceRewardEvidence) -> Result<()> {
+fn validate_inference_reward(
+    tx: &LedgerTransaction,
+    e: &InferenceRewardEvidence,
+    reserved: Option<&InferenceReservation>,
+) -> Result<()> {
     let bh = hocmesh_protocol::inference_reward_body_hash(
         &e.assignment_id,
         &e.job_id,
@@ -309,6 +388,29 @@ fn validate_inference_reward(tx: &LedgerTransaction, e: &InferenceRewardEvidence
     .map_err(anyhow::Error::msg)?;
     if e.reward_mcu <= 0 {
         bail!("an inference reward must move CU")
+    }
+    // A claim is only worth what the requester reserved for it. Without this
+    // the ledger is taking the claimant's word for who did the work and what
+    // it was worth, which leaves the coordinator as the only thing standing
+    // between a provider and somebody else's escrow - and the coordinator is
+    // deliberately not the authority for CU.
+    let Some(r) = reserved else {
+        bail!("an inference reward has no reservation to be paid out of")
+    };
+    let (batch, price) = reserved_batch(r, &e.assignment_id, e.batch_start, e.batch_end)?;
+    if batch.node_id != e.provider_auth.node_id {
+        bail!(
+            "batch {}..{} was assigned to {}, not to the claimant",
+            e.batch_start,
+            e.batch_end,
+            batch.node_id
+        )
+    }
+    if e.reward_mcu != price {
+        bail!("inference reward does not equal the price the requester signed for the batch")
+    }
+    if r.requester == e.provider_auth.node_id {
+        bail!("a requester cannot pay itself for its own inference batch")
     }
     let escrow = escrow_account(&e.job_id);
     if tx.postings.len() != 2
@@ -330,7 +432,11 @@ fn validate_inference_reward(tx: &LedgerTransaction, e: &InferenceRewardEvidence
 ///
 /// The mirror of the reward, down to the claim key, so the two race for one
 /// settlement and exactly one of them wins.
-fn validate_inference_refund(tx: &LedgerTransaction, e: &InferenceRefundEvidence) -> Result<()> {
+fn validate_inference_refund(
+    tx: &LedgerTransaction,
+    e: &InferenceRefundEvidence,
+    reserved: Option<&InferenceReservation>,
+) -> Result<()> {
     let bh = hocmesh_protocol::inference_refund_body_hash(
         &e.assignment_id,
         &e.job_id,
@@ -347,6 +453,19 @@ fn validate_inference_refund(tx: &LedgerTransaction, e: &InferenceRefundEvidence
     .map_err(anyhow::Error::msg)?;
     if e.refund_mcu <= 0 {
         bail!("an inference refund must move CU")
+    }
+    // A refund is the other direction out of the same escrow, so it needs the
+    // same binding: only the requester who reserved the batch may take it
+    // back, and only for what that batch actually cost.
+    let Some(r) = reserved else {
+        bail!("an inference refund has no reservation to be taken back")
+    };
+    let (_, price) = reserved_batch(r, &e.assignment_id, e.batch_start, e.batch_end)?;
+    if r.requester != e.requester_auth.node_id {
+        bail!("only the node that reserved this job may take its escrow back")
+    }
+    if e.refund_mcu != price {
+        bail!("inference refund does not equal the price the requester signed for the batch")
     }
     let escrow = escrow_account(&e.job_id);
     if tx.postings.len() != 2
@@ -1192,12 +1311,50 @@ pub fn verify_membership_change(
 mod tests {
     use super::*;
 
+    /// The four-argument shape the tests that are not about inference use.
+    ///
+    /// A job nobody ever reserved is the honest default for them: it is what
+    /// the ledger would really see, and it keeps the inference binding tested
+    /// where it belongs rather than restated in every unrelated case.
+    fn validate_transaction(
+        tx: &LedgerTransaction,
+        previous_hash: &str,
+        balance: impl Fn(&str) -> Result<i64>,
+        community_issuance_limit_mcu: i64,
+    ) -> Result<()> {
+        super::validate_transaction(
+            tx,
+            previous_hash,
+            balance,
+            |_| Ok(None),
+            community_issuance_limit_mcu,
+        )
+    }
+
+    /// The same, for whole entries.
+    fn validate_batch(
+        transactions: &[LedgerTransaction],
+        previous_hash: &str,
+        balance: impl Fn(&str) -> Result<i64>,
+        community_issuance_limit_mcu: i64,
+    ) -> Result<()> {
+        super::validate_batch(
+            transactions,
+            previous_hash,
+            balance,
+            |_| Ok(None),
+            community_issuance_limit_mcu,
+        )
+    }
+
     /// Stands in for the ledger head an entry chains onto. Honest work has to
     /// pass whatever challenge this produces, so its value is arbitrary.
     const TEST_PREVIOUS_HASH: &str =
         "0f8b1c7d2e3a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
     use hocmesh_core::identity::NodeIdentity;
-    use hocmesh_protocol::{AuthProof, WorkResult, WorkSpec, canonical_auth_message};
+    use hocmesh_protocol::{
+        AuthProof, InferenceBilling, PricedBatch, WorkResult, WorkSpec, canonical_auth_message,
+    };
     use std::{
         fs,
         path::PathBuf,
@@ -2406,5 +2563,196 @@ mod tests {
         let mut forged = out;
         forged.member = impostor;
         assert!(verify_membership_change(&v.set, &forged).is_err());
+    }
+
+    /// A job somebody reserved: two prompts, one batch, priced by the bill.
+    fn reservation_for(requester: &str, provider: &str) -> InferenceReservation {
+        InferenceReservation {
+            job_id: "job1".into(),
+            billing: InferenceBilling {
+                manifest_digest: "manifest".into(),
+                parameter_count: 1_000_000,
+                total_size_bytes: 4_000_000,
+                prompts_digest: "prompts".into(),
+                prompt_bytes: vec![40, 60],
+                max_tokens: 128,
+                max_cost_mcu: 1_000_000,
+            },
+            batches: vec![PricedBatch {
+                batch_start: 0,
+                batch_end: 2,
+                node_id: provider.to_string(),
+            }],
+            requester: requester.to_string(),
+            reserved_at: 1_700_000_000,
+        }
+    }
+
+    /// The assignment id a job determines for one of its batches.
+    fn det(job_id: &str, index: u32) -> String {
+        hocmesh_protocol::inference_assignment_id(job_id, index)
+    }
+
+    /// The price that reservation implies, recomputed the way the ledger does.
+    fn reserved_price(r: &InferenceReservation) -> i64 {
+        reserved_batch(
+            r,
+            &hocmesh_protocol::inference_assignment_id(&r.job_id, 0),
+            0,
+            2,
+        )
+        .unwrap()
+        .1
+    }
+
+    /// A provider's claim on a batch, signed the way a provider signs one.
+    fn signed_inference_reward(
+        provider: &NodeIdentity,
+        job_id: &str,
+        assignment_id: &str,
+        start: u32,
+        end: u32,
+        reward_mcu: i64,
+    ) -> LedgerTransaction {
+        let outputs_digest = "outputs".to_string();
+        let bh = hocmesh_protocol::inference_reward_body_hash(
+            assignment_id,
+            job_id,
+            start,
+            end,
+            reward_mcu,
+            &outputs_digest,
+        )
+        .unwrap();
+        let auth = provider.auth("report_inference", &bh);
+        LedgerTransaction {
+            transaction_id: format!("reward-{assignment_id}"),
+            kind: TransactionKind::InferenceReward,
+            postings: vec![
+                Posting {
+                    account_id: escrow_account(job_id),
+                    delta_mcu: -reward_mcu,
+                },
+                Posting {
+                    account_id: auth.node_id.clone(),
+                    delta_mcu: reward_mcu,
+                },
+            ],
+            evidence: TransactionEvidence::InferenceReward(InferenceRewardEvidence {
+                job_id: job_id.to_string(),
+                assignment_id: assignment_id.to_string(),
+                batch_start: start,
+                batch_end: end,
+                reward_mcu,
+                outputs_digest,
+                provider_public_key_b64: provider.public_key_b64(),
+                provider_auth: auth,
+            }),
+            created_at: 1_700_000_100,
+        }
+    }
+
+    /// The honest claim: the assigned node, the reserved batch, the agreed price.
+    #[test]
+    fn an_assigned_provider_is_paid_the_reserved_price() {
+        let provider = test_identity("inf-provider");
+        let r = reservation_for("hocmesh:node:requester", &provider.node_id());
+        let price = reserved_price(&r);
+        let tx = signed_inference_reward(&provider, "job1", &det("job1", 0), 0, 2, price);
+        super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            0,
+        )
+        .unwrap();
+    }
+
+    /// Somebody else's batch. Nothing about the claim is forged - the signature
+    /// is real - it is simply a claim on work that was never assigned to them.
+    #[test]
+    fn a_node_cannot_claim_a_batch_assigned_to_another() {
+        let thief = test_identity("inf-thief");
+        let r = reservation_for("hocmesh:node:requester", "hocmesh:node:assigned");
+        let price = reserved_price(&r);
+        let tx = signed_inference_reward(&thief, "job1", &det("job1", 0), 0, 2, price);
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not to the claimant"), "{err}");
+    }
+
+    /// The right node, the right batch, a price it made up. The signature covers
+    /// the amount, so this is the provider's own honest signature over a lie.
+    #[test]
+    fn a_provider_cannot_price_its_own_batch() {
+        let provider = test_identity("inf-greedy");
+        let r = reservation_for("hocmesh:node:requester", &provider.node_id());
+        let price = reserved_price(&r);
+        let tx = signed_inference_reward(&provider, "job1", &det("job1", 0), 0, 2, price * 10);
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(100_000_000),
+            |_| Ok(Some(r.clone())),
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("price the requester signed"), "{err}");
+    }
+
+    /// A batch nobody bought. Without the reservation to check against, this is
+    /// indistinguishable from an honest claim.
+    #[test]
+    fn an_unreserved_batch_cannot_be_claimed() {
+        let provider = test_identity("inf-ghost");
+        let r = reservation_for("hocmesh:node:requester", &provider.node_id());
+        let tx = signed_inference_reward(&provider, "job1", &det("job1", 1), 2, 4, 1_000);
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("assignment this job never had"), "{err}");
+    }
+
+    /// A job with no reservation at all - the escrow was funded some other way,
+    /// or the reserve never certified. There is nothing to pay out of.
+    #[test]
+    fn a_reward_without_a_reservation_is_rejected() {
+        let provider = test_identity("inf-orphan");
+        let tx = signed_inference_reward(&provider, "job1", "a1", 0, 2, 1_000);
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(None),
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no reservation"), "{err}");
+    }
+
+    /// Two assignment ids, one batch. The claim key is the batch, so the second
+    /// claim collides with the first instead of drawing the escrow down twice.
+    #[test]
+    fn one_batch_settles_once_whatever_the_assignment_is_called() {
+        let provider = test_identity("inf-double");
+        let a = signed_inference_reward(&provider, "job1", "a1", 0, 2, 1_000);
+        let b = signed_inference_reward(&provider, "job1", "a2", 0, 2, 1_000);
+        assert_eq!(claim_key(&a), claim_key(&b));
     }
 }

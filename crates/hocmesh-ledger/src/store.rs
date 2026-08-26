@@ -15,14 +15,7 @@ pub struct LedgerStore {
 }
 
 type ReservationRecord = (hocmesh_protocol::WorkSpec, u32, bool, Option<String>, i64);
-/// What the ledger remembers about a certified inference job.
-#[derive(Debug, Clone)]
-pub struct InferenceReservation {
-    pub billing: InferenceBilling,
-    pub batches: Vec<PricedBatch>,
-    pub requester: String,
-    pub reserved_at: i64,
-}
+pub use crate::types::InferenceReservation;
 
 type InferenceRecord = (InferenceBilling, Vec<PricedBatch>, String, i64);
 
@@ -253,6 +246,7 @@ impl LedgerStore {
             .optional()?
             .map(|(billing, batches, requester, reserved_at)| {
                 Ok(InferenceReservation {
+                    job_id: job_id.to_string(),
                     billing: serde_json::from_str(&billing)?,
                     batches: serde_json::from_str(&batches)?,
                     requester,
