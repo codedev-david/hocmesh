@@ -258,7 +258,31 @@ async fn serve(listen: &str, db: &str, home: &FsPath, validators: &str) -> Resul
     axum::serve(l, r).await?;
     Ok(())
 }
-async fn head(State(a): State<App>) -> Result<Json<HeadProof>, String> {
+/// A refusal that actually reads as one over HTTP.
+///
+/// Axum renders a bare `String` error as 200 OK with the message as the body,
+/// which makes every refusal in this file indistinguishable from success to
+/// anything that checks the status line - and the ledger client checks the
+/// status line when it counts commits. A validator that rejected a
+/// certificate was therefore reported back to the proposer as having stored
+/// it. The wrapper exists so that "no" is transmitted as "no".
+struct Refusal(String);
+
+impl<E: std::fmt::Display> From<E> for Refusal {
+    fn from(e: E) -> Self {
+        Self(e.to_string())
+    }
+}
+
+impl axum::response::IntoResponse for Refusal {
+    fn into_response(self) -> axum::response::Response {
+        (axum::http::StatusCode::BAD_REQUEST, self.0).into_response()
+    }
+}
+
+type Answer<T> = Result<Json<T>, Refusal>;
+
+async fn head(State(a): State<App>) -> Answer<HeadProof> {
     let h = a
         .store
         .lock()
@@ -279,7 +303,7 @@ async fn head(State(a): State<App>) -> Result<Json<HeadProof>, String> {
 ///
 /// The signature is over exactly the message a checkpoint is checked against,
 /// so a caller that collects a quorum of these has a checkpoint already.
-async fn ledger_state(State(a): State<App>) -> Result<Json<StateProof>, String> {
+async fn ledger_state(State(a): State<App>) -> Answer<StateProof> {
     let s = a.store.lock().map_err(|_| "lock".to_string())?;
     let head = s.head(&a.set()).map_err(|e| e.to_string())?;
     let state_hash = s
@@ -300,10 +324,7 @@ async fn ledger_state(State(a): State<App>) -> Result<Json<StateProof>, String> 
         signature_b64: a.id.sign_bytes_b64(msg.as_bytes()),
     }))
 }
-async fn balance(
-    State(a): State<App>,
-    Path(account): Path<String>,
-) -> Result<Json<BalanceProof>, String> {
+async fn balance(State(a): State<App>, Path(account): Path<String>) -> Answer<BalanceProof> {
     let s = a.store.lock().map_err(|_| "lock".to_string())?;
     let b = s.balance(&account).map_err(|e| e.to_string())?;
     let (earned, spent) = s.activity(&account).map_err(|e| e.to_string())?;
@@ -323,10 +344,7 @@ async fn balance(
     }))
 }
 
-async fn claim(
-    State(a): State<App>,
-    Path(claim): Path<String>,
-) -> Result<Json<ClaimProof>, String> {
+async fn claim(State(a): State<App>, Path(claim): Path<String>) -> Answer<ClaimProof> {
     let s = a.store.lock().map_err(|_| "lock".to_string())?;
     let detail = s.claim_detail(&claim).map_err(|e| e.to_string())?;
     let h = s.head(&a.set()).map_err(|e| e.to_string())?;
@@ -454,10 +472,7 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
         }
     }))
 }
-async fn commit(
-    State(a): State<App>,
-    Json(c): Json<QuorumCertificate>,
-) -> Result<Json<CommitResponse>, String> {
+async fn commit(State(a): State<App>, Json(c): Json<QuorumCertificate>) -> Answer<CommitResponse> {
     verify_certificate(&c, &a.set()).map_err(|e| e.to_string())?;
     let mut s = a.store.lock().map_err(|_| "lock".to_string())?;
     let local = s.head(&a.set()).map_err(|e| e.to_string())?;
@@ -493,10 +508,7 @@ async fn commit(
         head: h,
     }))
 }
-async fn entries(
-    State(a): State<App>,
-    Query(q): Query<EntriesQ>,
-) -> Result<Json<EntriesResponse>, String> {
+async fn entries(State(a): State<App>, Query(q): Query<EntriesQ>) -> Answer<EntriesResponse> {
     let s = a.store.lock().map_err(|_| "lock".to_string())?;
     let certs = s
         .certificates_from(q.from.unwrap_or(1), q.limit.unwrap_or(500).min(5000))
@@ -514,7 +526,7 @@ async fn history(
     State(a): State<App>,
     Path(account): Path<String>,
     Query(q): Query<HistoryQ>,
-) -> Result<Json<AccountHistory>, String> {
+) -> Answer<AccountHistory> {
     let s = a.store.lock().map_err(|_| "lock".to_string())?;
     let page = s
         .history(&account, q.before, q.limit.unwrap_or(100))

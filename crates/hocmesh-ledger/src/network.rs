@@ -737,12 +737,24 @@ impl LedgerNetwork {
         verify_certificate(&cert, &self.set()).map_err(RoundError::rejected)?;
         let committed = join_all(self.set().members.iter().map(|m| {
             let (http, cert) = (&self.http, &cert);
+            // A commit counts only when the validator says in its own words
+            // that it stored the entry. Reading success off the status line
+            // alone once let a refusal - which arrives as a body, not a code -
+            // be tallied as a commit, so a certificate every seat rejected came
+            // back to the caller as settled.
             async move {
-                http.post(format!("{}/v1/ledger/commit", m.url.trim_end_matches('/')))
+                let Ok(r) = http
+                    .post(format!("{}/v1/ledger/commit", m.url.trim_end_matches('/')))
                     .json(cert)
                     .send()
                     .await
-                    .is_ok_and(|r| r.status().is_success())
+                else {
+                    return false;
+                };
+                r.status().is_success()
+                    && r.json::<CommitResponse>()
+                        .await
+                        .is_ok_and(|c| c.committed && c.head.sequence >= cert.entry.sequence)
             }
         }))
         .await

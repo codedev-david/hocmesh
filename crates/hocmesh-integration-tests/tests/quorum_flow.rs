@@ -7,9 +7,10 @@ use hocmesh_ledger::{
     network::LedgerNetwork,
     types::{
         AccountHistory, COMMUNITY_ISSUANCE_ACCOUNT, LedgerHead, LedgerTransaction, Posting,
-        TransactionEvidence, TransactionKind, ValidatorMember, ValidatorSet, ValidatorSignature,
-        escrow_account,
+        ProviderRewardEvidence, QuorumCertificate, TransactionEvidence, TransactionKind,
+        ValidatorMember, ValidatorSet, ValidatorSignature, escrow_account,
     },
+    validate::{build_entry, membership_hash},
 };
 use hocmesh_protocol::{
     AuthProof, BalanceResponse, ErrorResponse, JobStatusResponse, NodeCapabilities, PollRequest,
@@ -2917,4 +2918,572 @@ fn test_client() -> Client {
         .timeout(Duration::from_secs(60))
         .build()
         .expect("an HTTP client with a timeout")
+}
+
+/// The reason one validator gives for refusing a transaction.
+///
+/// `LedgerNetwork::transact` reports a round as "only N valid votes", which is
+/// the right thing for a caller to see and useless for a test that wants to
+/// know which rule fired. Asking a single seat directly gets the rule.
+async fn refusal_reason(
+    http: &Client,
+    net: &LedgerNetwork,
+    url: &str,
+    tx: &LedgerTransaction,
+) -> Result<String> {
+    let head = net.head_quorum().await?;
+    let vote: serde_json::Value = post_json(
+        http,
+        url,
+        "/v1/ledger/propose",
+        &json!({
+            "transactions": [tx],
+            "sequence": head.sequence + 1,
+            "ballot": { "number": 1, "proposer": "test-liar" },
+        }),
+    )
+    .await?;
+    if vote.get("accepted").and_then(serde_json::Value::as_bool) == Some(true) {
+        bail!("the validator accepted a transaction the test expected it to refuse: {vote}");
+    }
+    Ok(vote
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// A validator that signs two different histories at the same height, while
+/// the network it belongs to cannot see it doing so.
+///
+/// This is the failure the threshold exists for. The advertised URL of every
+/// seat is part of the signed membership, so a fault link in front of one seat
+/// removes it from the network's view - but the seat is still listening on its
+/// real port, and an attacker that knows the port can talk to it in private.
+/// That is a validator alone with someone who wants a fork.
+///
+/// Nothing stops it signing. Refusing to sign is not what makes a quorum safe;
+/// arithmetic is. Three of four is a quorum, so any two quorums share two
+/// seats, so any two quorums share at least one seat that is not the traitor -
+/// and that seat has already committed. The equivocating signature is real,
+/// verifiable, and worth nothing on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_equivocating_seat_cannot_fork_a_partitioned_quorum() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = test_client();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let mut links = Vec::new();
+    for port in validator_ports {
+        links.push(FaultLink::to(port).await?);
+    }
+    let urls: Vec<String> = links.iter().map(|l| l.url()).collect();
+    let (validators_path, validator_homes, validator_dbs, set) =
+        create_validator_set_at(&tmp, &validator_bin, &urls)?;
+
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    // The seat's real address, which the membership does not mention. Reaching
+    // it this way is the whole point: the network believes seat 3 is gone.
+    let traitor_direct = format!("http://127.0.0.1:{}", validator_ports[3]);
+
+    let net = LedgerNetwork::new(set.clone())?;
+    let genesis = net.head_quorum().await?;
+    assert_eq!(genesis.sequence, 0);
+
+    let honest = community_mint(
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        "job_equivocation_honest",
+    )?;
+    let fork = community_mint(
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        "job_equivocation_fork",
+    )?;
+
+    // Cut the seat out of the network, then get it alone.
+    links[3].cut();
+
+    let fork_vote: serde_json::Value = post_json(
+        &http,
+        &traitor_direct,
+        "/v1/ledger/propose",
+        &json!({
+            "transactions": [fork.clone()],
+            "sequence": 1,
+            "ballot": { "number": 9, "proposer": "byzantine" },
+        }),
+    )
+    .await?;
+    assert_eq!(
+        fork_vote
+            .get("accepted")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the partitioned seat should have had no reason to refuse: {fork_vote}"
+    );
+    let fork_signature = fork_vote
+        .get("signature_b64")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("no signature in the fork vote: {fork_vote}"))?
+        .to_string();
+    let fork_entry_hash = fork_vote
+        .get("entry_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    // Meanwhile the three seats that remain reachable settle the real history.
+    let settled = net
+        .transact(honest.clone())
+        .await
+        .context("three of four seats must still be a quorum")?;
+    assert_eq!(settled.entry.sequence, 1);
+    let honest_hash = settled.entry.entry_hash.clone();
+    assert_ne!(honest_hash, fork_entry_hash);
+
+    // And now the equivocation proper: the same seat, at the same height,
+    // signing the history it just contradicted. It accepts, because a lone
+    // validator has no way to know the rest of the set has moved.
+    let second_vote: serde_json::Value = post_json(
+        &http,
+        &traitor_direct,
+        "/v1/ledger/propose",
+        &json!({
+            "transactions": [honest],
+            "sequence": 1,
+            "ballot": { "number": 10, "proposer": "byzantine" },
+        }),
+    )
+    .await?;
+    assert_eq!(
+        second_vote
+            .get("accepted")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the second half of the equivocation was refused, so the test proves nothing: {second_vote}"
+    );
+    assert_ne!(
+        second_vote
+            .get("entry_hash")
+            .and_then(serde_json::Value::as_str),
+        Some(fork_entry_hash.as_str()),
+        "two votes at one height that agree are not an equivocation"
+    );
+
+    links[3].heal();
+
+    // The attacker now needs two more signatures for its fork, and there is
+    // nowhere left to get them: every other seat has committed height 1, so
+    // height 1 is no longer a proposal any of them will entertain.
+    for index in 0..3 {
+        let refusal: serde_json::Value = post_json(
+            &http,
+            &set.members[index].url,
+            "/v1/ledger/propose",
+            &json!({
+                "transactions": [fork.clone()],
+                "sequence": 1,
+                "ballot": { "number": 99, "proposer": "byzantine" },
+            }),
+        )
+        .await?;
+        assert_eq!(
+            refusal.get("accepted").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "seat {index} was willing to re-vote a height it had already committed: {refusal}"
+        );
+    }
+
+    // So the best certificate the fork will ever have carries one signature.
+    // It is a real signature over a real entry, and it is two short of a
+    // quorum: post it and the honest seats do the arithmetic themselves.
+    let forged = QuorumCertificate {
+        entry: build_entry(1, genesis.entry_hash.clone(), vec![fork])?,
+        membership_hash: membership_hash(&set)?,
+        signatures: vec![ValidatorSignature {
+            validator_id: set.members[3].validator_id.clone(),
+            signature_b64: fork_signature,
+        }],
+    };
+    for index in 0..4 {
+        let rejected = http
+            .post(format!("{}/v1/ledger/commit", set.members[index].url))
+            .json(&forged)
+            .send()
+            .await?;
+        assert!(
+            !rejected.status().is_success(),
+            "seat {index} committed a fork carrying one signature out of a threshold of {}",
+            set.threshold
+        );
+    }
+
+    // Nothing moved. The chain still has exactly one history at height 1, the
+    // fork's job was never funded, and the set is still able to settle.
+    let head = net.head_quorum().await?;
+    assert_eq!(head.sequence, 1);
+    assert_eq!(head.entry_hash, honest_hash);
+    assert_eq!(
+        net.balance_quorum(&escrow_account("job_equivocation_fork"))
+            .await?
+            .balance_mcu,
+        0,
+        "a fork that never certified must never have funded anything"
+    );
+    let after = net
+        .transact(community_mint(
+            &node_bin,
+            &validator_homes,
+            &validators_path,
+            "job_equivocation_after",
+        )?)
+        .await
+        .context("an equivocating seat must not be able to wedge the set")?;
+    assert_eq!(after.entry.sequence, 2);
+    assert_eq!(after.entry.previous_hash, honest_hash);
+
+    drop(validators);
+    Ok(())
+}
+
+/// A coordinator that lies about what it scheduled.
+///
+/// The coordinator is the one component with no key of consequence. It hands
+/// out work, watches results come back, and proposes settlements - but a
+/// settlement is only ever a proposal, and every claim inside one is
+/// re-derived by the validators from evidence the coordinator did not author.
+/// This walks through the lies a corrupted coordinator would actually want to
+/// tell.
+///
+/// The work here is real and the provider's signature over it is real: the
+/// test polls a genuine assignment, computes the answer, and signs it, then
+/// never gives it to the coordinator. What it builds instead is the exact
+/// transaction the coordinator would have built, and then spoils one field at
+/// a time. Two of the lies are told with the provider's help, because the
+/// interesting question is not whether a coordinator can forge a signature -
+/// it cannot - but whether a coordinator and a provider working together can
+/// take more than the work was worth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lying_coordinator_cannot_take_more_than_the_work_was_worth() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let coordinator_bin = bin_dir.join(exe("hocmesh-coordinator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = test_client();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let (validators_path, validator_homes, validator_dbs, set) =
+        create_validator_set(&tmp, &validator_bin, &validator_ports)?;
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    let coordinator_db = tmp.path.join("coordinator-liar.db");
+    let job = "job_lying_coordinator";
+    let sponsors = sponsors_file(
+        &tmp.path,
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        job,
+        (2, 50000, 4),
+    )?;
+    run_ok(
+        Command::new(&coordinator_bin)
+            .arg("seed")
+            .arg("--job-id")
+            .arg(job)
+            .arg("--sponsors")
+            .arg(&sponsors)
+            .arg("--db")
+            .arg(&coordinator_db)
+            .arg("--validators")
+            .arg(&validators_path)
+            .arg("--start")
+            .arg("2")
+            .arg("--end")
+            .arg("50000")
+            .arg("--shards")
+            .arg("4"),
+        "seed the job the coordinator will lie about",
+    )?;
+
+    let coordinator_port = free_port()?;
+    let _coordinator = ProcessGuard::spawn(
+        Command::new(&coordinator_bin)
+            .arg("serve")
+            .arg("--db")
+            .arg(&coordinator_db)
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{coordinator_port}"))
+            .arg("--validators")
+            .arg(&validators_path),
+    )?;
+    wait_health(&http, coordinator_port).await?;
+    let coordinator = format!("http://127.0.0.1:{coordinator_port}");
+
+    let worker = TestNode::new(&tmp.path.join("liar-worker"))?;
+    let accomplice = TestNode::new(&tmp.path.join("liar-accomplice"))?;
+    register(&http, &coordinator, &worker).await?;
+
+    // A real assignment, really computed, really signed - and deliberately
+    // never handed back, so the ledger has not yet seen this shard.
+    let assignment = poll_until_assignment(&http, &coordinator, &worker, Some(job)).await?;
+    let result = execute_work(&assignment.work);
+    let reward = work_cost_mcu(&assignment.work);
+    assert_eq!(reward, assignment.reward_mcu);
+
+    // Exactly what the coordinator builds on a good day. Every lie below is
+    // this transaction with one field moved.
+    let lie =
+        |result: WorkResult, reward_mcu: i64, assignment_id: &str, payee: &str, auth: AuthProof| {
+            LedgerTransaction {
+                transaction_id: format!("reward_{}", assignment.assignment_id),
+                kind: TransactionKind::ProviderReward,
+                postings: vec![
+                    Posting {
+                        account_id: escrow_account(job),
+                        delta_mcu: -reward_mcu,
+                    },
+                    Posting {
+                        account_id: payee.to_string(),
+                        delta_mcu: reward_mcu,
+                    },
+                ],
+                evidence: TransactionEvidence::ProviderReward(ProviderRewardEvidence {
+                    job_id: job.to_string(),
+                    assignment_id: assignment_id.to_string(),
+                    shard_index: assignment.shard_index,
+                    reward_mcu,
+                    provider_public_key_b64: worker.identity.public_key_b64(),
+                    provider_auth: auth,
+                    work: assignment.work.clone(),
+                    result,
+                    system_funded: assignment.system_funded,
+                    // A coordinator colluding with a provider would pick the
+                    // gentlest audit it could find. It is recorded and ignored.
+                    provisional_audit_nonce: 0,
+                }),
+                created_at: now_unix(),
+            }
+        };
+    // The provider signs whatever it is handed, which is what makes the
+    // collusion cases possible: every field the coordinator would want to move
+    // is inside the body hash, so moving one alone only breaks the signature.
+    // A test that stopped there would be testing ed25519, not this system.
+    let sign_result =
+        |assignment_id: &str, result: &WorkResult, reward_mcu: i64| -> Result<AuthProof> {
+            let bh = result_body_hash(
+                assignment_id,
+                job,
+                assignment.shard_index,
+                &assignment.work,
+                reward_mcu,
+                assignment.system_funded,
+                result,
+            )?;
+            Ok(worker.identity.auth("result", &bh))
+        };
+    let truthful_auth = sign_result(&assignment.assignment_id, &result, reward)?;
+
+    let net = LedgerNetwork::new(set.clone())?;
+    let escrow_before = net.balance_quorum(&escrow_account(job)).await?.balance_mcu;
+    assert!(escrow_before >= reward);
+
+    // Lie one: the shard was done, but pay somebody else for it. The provider
+    // signed a result, not a destination, so the destination is not the
+    // coordinator's to choose - it is read back off the signature.
+    let stolen = lie(
+        result.clone(),
+        reward,
+        &assignment.assignment_id,
+        &accomplice.identity.node_id(),
+        truthful_auth.clone(),
+    );
+    let err = refusal_reason(&http, &net, &set.members[0].url, &stolen).await?;
+    assert!(
+        err.contains("reward postings do not match verified work"),
+        "a coordinator redirected a reward to a node that did nothing: {err}"
+    );
+
+    // Lie two: the same shard, honestly done, billed at twice the price - and
+    // this time the provider is in on it and signs the inflated figure, so the
+    // signature verifies. The price is not a claim either party gets to make:
+    // it falls out of the work spec, and the validators recompute it.
+    //
+    // The overcharge is deliberately small enough to fit inside the escrow the
+    // job already holds. Asking for ten times the price would be refused too,
+    // but for want of funds, and that would prove only that this job was
+    // underfunded rather than that the price is not negotiable.
+    let inflated = reward * 2;
+    assert!(
+        inflated < escrow_before,
+        "the overcharge has to be affordable or the balance rule answers first"
+    );
+    let padded = lie(
+        result.clone(),
+        inflated,
+        &assignment.assignment_id,
+        &worker.identity.node_id(),
+        sign_result(&assignment.assignment_id, &result, inflated)?,
+    );
+    let err = refusal_reason(&http, &net, &set.members[0].url, &padded).await?;
+    assert!(
+        err.contains("declared reward does not equal deterministic work cost"),
+        "coordinator and provider together overcharged for a shard: {err}"
+    );
+
+    // Lie three: an assignment that was never scheduled. The id binds a job to
+    // a shard index by construction, so a coordinator inventing schedule
+    // history has to invent an id that cannot be derived.
+    let made_up = "assignment-the-coordinator-made-up";
+    let invented = lie(
+        result.clone(),
+        reward,
+        made_up,
+        &worker.identity.node_id(),
+        sign_result(made_up, &result, reward)?,
+    );
+    let err = refusal_reason(&http, &net, &set.members[0].url, &invented).await?;
+    assert!(
+        err.contains("assignment id is not deterministic"),
+        "a coordinator paid out an assignment it invented: {err}"
+    );
+
+    // Lie four: the answer is wrong, the provider signs it anyway, and the
+    // coordinator reports a flattering audit. The recorded nonce is advisory;
+    // the validators draw their own challenge from the chain position, which
+    // neither of them could see when they chose the lie.
+    let wrong = match &result {
+        WorkResult::PrimeCount {
+            count,
+            bucket_counts,
+            duration_ms,
+        } => WorkResult::PrimeCount {
+            count: count + 1,
+            bucket_counts: bucket_counts.clone(),
+            duration_ms: *duration_ms,
+        },
+        WorkResult::CollatzPeak {
+            peak_steps,
+            peak_seed,
+            bucket_peaks,
+            bucket_seeds,
+            duration_ms,
+        } => WorkResult::CollatzPeak {
+            peak_steps: peak_steps + 1,
+            peak_seed: *peak_seed,
+            bucket_peaks: bucket_peaks.clone(),
+            bucket_seeds: bucket_seeds.clone(),
+            duration_ms: *duration_ms,
+        },
+        WorkResult::MatrixMultiply { rows, duration_ms } => {
+            let mut rows = rows.clone();
+            if let Some(first) = rows.first_mut() {
+                *first = first.wrapping_add(1);
+            }
+            WorkResult::MatrixMultiply {
+                rows,
+                duration_ms: *duration_ms,
+            }
+        }
+    };
+    assert_ne!(wrong, result, "the test needs a genuinely different answer");
+    let fabricated = lie(
+        wrong.clone(),
+        reward,
+        &assignment.assignment_id,
+        &worker.identity.node_id(),
+        sign_result(&assignment.assignment_id, &wrong, reward)?,
+    );
+    let err = refusal_reason(&http, &net, &set.members[0].url, &fabricated).await?;
+    assert!(
+        err.contains("provider result does not verify"),
+        "a signed wrong answer was paid for: {err}"
+    );
+
+    // None of it moved anything.
+    assert_eq!(
+        net.balance_quorum(&escrow_account(job)).await?.balance_mcu,
+        escrow_before,
+        "a refused settlement still touched the escrow"
+    );
+    assert_eq!(
+        net.balance_quorum(&worker.identity.node_id())
+            .await?
+            .balance_mcu,
+        0
+    );
+
+    // The truth settles, once. Told twice it is no longer true the second
+    // time: the shard is the claim, and the claim is the ledger's, not the
+    // coordinator's.
+    let truthful = lie(
+        result,
+        reward,
+        &assignment.assignment_id,
+        &worker.identity.node_id(),
+        truthful_auth,
+    );
+    net.transact(truthful.clone())
+        .await
+        .context("an honest reward was refused")?;
+    let err = refusal_reason(&http, &net, &set.members[0].url, &truthful).await?;
+    assert!(
+        err.contains("claim already settled"),
+        "a coordinator paid one shard twice: {err}"
+    );
+    assert_eq!(
+        net.balance_quorum(&worker.identity.node_id())
+            .await?
+            .balance_mcu,
+        reward,
+        "the provider must hold exactly one shard's worth of CU"
+    );
+    assert_eq!(
+        net.balance_quorum(&accomplice.identity.node_id())
+            .await?
+            .balance_mcu,
+        0,
+        "the node that did nothing must hold nothing"
+    );
+
+    drop(validators);
+    Ok(())
 }
