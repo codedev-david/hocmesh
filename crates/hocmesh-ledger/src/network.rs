@@ -678,6 +678,22 @@ impl LedgerNetwork {
             })
             .collect();
         if sigs.len() < self.set().threshold {
+            // A round falls short for two very different reasons: the set
+            // disliked the batch, or somebody else filled this height while we
+            // were collecting votes. The first is final; the second is a race
+            // that a fresh head settles. Ask the chain which one happened
+            // rather than reading it out of a refusal message. A round that
+            // fell short applied nothing anywhere, so re-proposing the same
+            // batch on top of the new head is safe.
+            if self
+                .head_quorum()
+                .await
+                .is_ok_and(|h| h.sequence >= sequence)
+            {
+                return Ok(Attempt::Deferred(format!(
+                    "height {sequence} was filled by another proposer"
+                )));
+            }
             return Err(RoundError::Rejected(format!(
                 "ledger proposal received only {} valid votes; threshold is {}",
                 sigs.len(),

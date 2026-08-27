@@ -144,6 +144,19 @@ The cost is that a proposer which adopts somebody else's entry has not settled i
 
 Without this a split is terminal: half the set signs one entry and half signs another, neither reaches threshold, nothing is applied, and the height can never be filled by anything else. That failure is covered by `a_split_proposal_does_not_wedge_the_height`.
 
+There is one more way to lose the race, and it is not a split. A proposer can
+be promised a height, and then have that same height committed by somebody else
+before its own votes come back. Every validator has moved on by then, so the
+proposal collects nothing at all — not a minority, zero. Reading that as "the
+set rejected this batch" is wrong and, worse, final: it fails a settlement that
+nothing was ever wrong with.
+
+So a round that falls short asks the chain what happened rather than reading it
+out of a refusal message: if the head has advanced past the height it aimed at,
+the round was overtaken and is retried on the new head, and only otherwise is it
+reported as rejected. A round that fell short applied nothing anywhere, which is
+what makes re-proposing the same batch safe.
+
 ## Settlement claims
 
 Validators also keep unique claims.
