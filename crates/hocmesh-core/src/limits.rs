@@ -19,18 +19,36 @@ pub struct ResourceLimits {
     pub gpu_percent: u8,
     /// Ceiling on the share of system memory a workload may occupy.
     pub memory_percent: u8,
+    /// Whether this node offers inference to the hocmesh.
+    ///
+    /// `None` means the operator has not said, and the node falls back to
+    /// "offer it when a GPU is lent" -- which is exactly what every node did
+    /// before this field existed, so an existing `limits.json` keeps its
+    /// behaviour on upgrade.
+    ///
+    /// It has to be sayable separately because a CPU-only machine has no GPU
+    /// share to read consent out of, and reading it out of the CPU share
+    /// instead would treat "run allow-listed arithmetic for me" as "run a
+    /// stranger's prompt through a stranger's weights on my desktop". Those
+    /// are different questions, so the operator gets asked the second one.
+    #[serde(default)]
+    pub ai: Option<bool>,
 }
 
 impl Default for ResourceLimits {
-    /// Conservative default: half the CPU, no GPU, half of RAM.
+    /// Conservative default: half the CPU, no GPU, half of RAM, and no
+    /// stated position on inference.
     ///
     /// GPU defaults to zero because lending a GPU is far more disruptive to an
     /// interactive desktop than lending a couple of cores, so it is opt-in.
+    /// `ai` defaults to unstated rather than to `false` so that the fallback,
+    /// not this constant, decides -- see [`ResourceLimits::offers_ai`].
     fn default() -> Self {
         Self {
             cpu_percent: 50,
             gpu_percent: 0,
             memory_percent: 50,
+            ai: None,
         }
     }
 }
@@ -78,6 +96,16 @@ impl ResourceLimits {
     /// Whether the operator lends the GPU at all.
     pub fn offers_gpu(&self) -> bool {
         self.gpu_percent > 0
+    }
+
+    /// Whether this node offers inference, given what it still advertises.
+    ///
+    /// `accelerator_shared` is whether any GPU survived [`Self::offers_gpu`],
+    /// which is the signal AI readiness was inferred from before there was a
+    /// field for it. An operator who never touched `--ai` therefore gets the
+    /// old answer, and one who set it gets theirs.
+    pub fn offers_ai(&self, accelerator_shared: bool) -> bool {
+        self.ai.unwrap_or(accelerator_shared)
     }
 
     /// Resolve a requested worker count against the operator's ceiling.
@@ -268,6 +296,7 @@ mod tests {
             cpu_percent: 30,
             gpu_percent: 70,
             memory_percent: 40,
+            ai: None,
         };
         limits.save(&home).unwrap();
         assert_eq!(ResourceLimits::load_or_default(&home).unwrap(), limits);
@@ -281,6 +310,53 @@ mod tests {
             ResourceLimits::load_or_default(&home).unwrap(),
             ResourceLimits::default()
         );
+    }
+
+    #[test]
+    fn an_unstated_ai_share_keeps_the_pre_existing_rule() {
+        // Every `limits.json` written before the field existed deserialises to
+        // this, so this case is what "upgrading changes nobody's behaviour"
+        // actually means. Lending a GPU offered inference; not lending one did
+        // not.
+        let unstated = ResourceLimits::default();
+        assert!(unstated.ai.is_none());
+        assert!(unstated.offers_ai(true));
+        assert!(!unstated.offers_ai(false));
+    }
+
+    #[test]
+    fn a_stated_ai_share_overrides_the_gpu_signal_in_both_directions() {
+        let on = ResourceLimits {
+            ai: Some(true),
+            ..Default::default()
+        };
+        // The whole point: a machine with nothing to accelerate on can still
+        // say yes.
+        assert!(on.offers_ai(false));
+        assert!(on.offers_ai(true));
+
+        let off = ResourceLimits {
+            ai: Some(false),
+            ..Default::default()
+        };
+        // And lending a GPU no longer conscripts the node into inference.
+        assert!(!off.offers_ai(true));
+        assert!(!off.offers_ai(false));
+    }
+
+    #[test]
+    fn a_limits_file_written_before_the_ai_field_existed_still_loads() {
+        let home = scratch_home();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            ResourceLimits::path(&home),
+            r#"{"cpu_percent":50,"gpu_percent":25,"memory_percent":50}"#,
+        )
+        .unwrap();
+        let loaded = ResourceLimits::load_or_default(&home).unwrap();
+        assert_eq!(loaded.ai, None);
+        assert!(loaded.offers_ai(true));
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

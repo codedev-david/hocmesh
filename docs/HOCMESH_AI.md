@@ -75,7 +75,9 @@ hocmesh daemon `
   --model-seed-url http://public-host:8090
 ```
 
-The node advertises AI readiness only when a runtime is available and a supported accelerator was detected *and* the operator has lent GPU. The coordinator will not place AI work on CPU-only or unconfigured nodes. Installing a runtime is not by itself consent to run other people's inference: `limits --gpu-percent 0` keeps the node a CPU worker no matter what is installed.
+The node advertises AI readiness only when a runtime is available *and* the operator has agreed to serve inference, which `limits --ai on|off|auto` records. Installing a runtime is not by itself that agreement — an operator may want `hocmesh infer` for themselves and nothing else — so the two are asked separately. `auto`, the default, means "offer it when a GPU is lent" and is what every node did before the switch existed.
+
+A node that agrees but has no accelerator advertises its shared CPU slice as a `cpu` device and is placed on like any other, bounded by `--memory-percent`; a request that names a backend in `required_backends` still will not land there. The coordinator will not place AI work on a node that advertises no device.
 
 ## Scheduling and execution
 

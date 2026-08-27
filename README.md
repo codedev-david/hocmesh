@@ -343,9 +343,22 @@ optional when the source publishes a digest and required with `--url`.
 
 Once installed, `infer` and `daemon` find the runtime without a flag.
 `--runtime` / `--ai-runtime` still override it, and `daemon --no-ai` declines AI
-work outright. A daemon only advertises AI readiness when the operator has also
-lent GPU — installing a runtime is not by itself consent to run other people's
-inference.
+work outright.
+
+Running a model for yourself and running one for strangers are separate
+decisions, so serving inference to the mesh is asked for separately:
+
+```bash
+hocmesh limits --ai on        # run other people's inference here
+hocmesh limits --ai off       # never, whatever hardware is lent
+hocmesh limits --ai auto      # the default: on when a GPU is lent
+```
+
+`--ai on` works on a machine with no GPU at all. The node then advertises its
+shared CPU slice as a device and serves inference on it — slowly, but it serves
+it, which is what the pinned CPU runtime is for. `auto` is what an existing
+`limits.json` says, so upgrading changes nothing about what a node already
+offered.
 
 `docs/DEPLOYMENT.md` has the full two-machine runbook.
 
@@ -572,7 +585,10 @@ hocmesh --home .hocmesh-a limits --cpu-percent 50 --memory-percent 25 --gpu-perc
 
 Limits apply from the first contact: `hocmesh init` registers the same share the
 daemon will advertise. Setting `--gpu-percent 0` withdraws the GPU entirely, and
-the node stops advertising accelerators at all.
+the node stops advertising accelerators at all. `--ai on|off|auto` is a separate
+question from all three, because inference is the one workload that runs a
+stranger's prompt through a stranger's weights rather than allow-listed
+arithmetic; see "Run a local model".
 
 ### Seeing where the node sits
 

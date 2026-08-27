@@ -255,17 +255,29 @@ anything other than the model you asked for.
 ### 5d. Offer AI work to the mesh
 
 A daemon advertises AI readiness when it has a runtime **and** the operator has
-lent GPU. If `--gpu-percent 0` is set, the node stays a CPU worker no matter
-what is installed — lending a GPU is a decision, not a side effect of running
-`runtime-install`.
+agreed to serve inference. Agreeing is its own switch, because running a model
+for yourself is not the same decision as running one for strangers:
 
 ```bash
-hocmesh --home .hocmesh limits --gpu-percent 80
+hocmesh --home .hocmesh limits --ai on
 hocmesh --home .hocmesh daemon --workers 4
 ```
 
+`--ai` takes `on`, `off`, or `auto`. `auto` is the default and means "offer it
+when a GPU is lent", which is what every node did before the switch existed —
+so an existing `limits.json` keeps its behaviour exactly.
+
+**A machine with no GPU can serve inference.** With `--ai on` the node
+advertises its shared CPU slice as a device and takes AI work on it. That is
+what the CPU build from `runtime-install` is for. It will be slow, and the size
+of model it will be offered is bounded by `--memory-percent`, because the
+advertised device reports the lent slice rather than the whole machine.
+
+On a GPU box, `--gpu-percent` still governs the accelerator: at `0` the GPU is
+not advertised at all, and `--ai on` then offers CPU inference instead.
+
 `--ai-runtime` overrides which executable is used. `--no-ai` declines AI work
-outright even when a runtime is installed.
+for one run without changing the stored limits.
 
 ---
 
@@ -362,7 +374,9 @@ you can pick a single-file quantisation.
 
 **A node never receives work.** Check `hocmesh status` from the node itself,
 then confirm the operator limits are not zero for the resource the job needs.
-`--gpu-percent 0` disables AI work regardless of what is installed.
+For AI work specifically, run `hocmesh limits` and read the `ai:` line: `auto`
+with no GPU lent means the node is not offering inference, whatever is
+installed. `hocmesh limits --ai on` offers it.
 
 **The daemon logs an unsealed-key warning on every command.** Set
 `HOCMESH_IDENTITY_PASSPHRASE`. On platforms without file-mode enforcement there

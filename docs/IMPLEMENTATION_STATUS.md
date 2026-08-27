@@ -20,7 +20,7 @@
 | Client mirror and offline audit | Implemented | Validator quorum sync/audit commands |
 | Snapshot bootstrap and out-of-band checkpoints | Implemented | `snapshot`/`ledger-restore` write and adopt a quorum-signed state file; it is refused unless certificate, checkpoint and state hash all agree against the operator's own validator set, and refused again over a store that already holds a chain |
 | Indexed account history | Implemented | Every posting is indexed on `(account_id, sequence, posting_index)` as it is applied; validators serve `/v1/ledger/history/{account}` and `ledger-history` reads it from a mirror or off the network, paging newest-first on a sequence cursor that never splits one entry |
-| Operator resource limits | Implemented | Persisted share of CPU/memory/GPU; advertised capacity is the share, not the machine |
+| Operator resource limits | Implemented | Persisted share of CPU/memory/GPU plus a separate `--ai on\|off\|auto` consent to serve inference; advertised capacity is the share, not the machine |
 | Network coordinates | Implemented | Vivaldi fit from measured probes, persisted across restarts, advertised only once fitted |
 | Contested-height recovery | Implemented | Ballot-ordered proposals: any client can take a height, and one that finds an entry already half-signed there is obliged to finish it |
 | Community issuance authorization | Implemented | `CommunityReserve` carries threshold sponsorships from the sitting set, bound to job id, workload, shards and price |

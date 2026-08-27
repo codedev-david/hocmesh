@@ -79,6 +79,9 @@ enum Command {
         gpu_percent: Option<u8>,
         #[arg(long)]
         memory_percent: Option<u8>,
+        /// Whether to run other people's inference on this machine.
+        #[arg(long, value_enum)]
+        ai: Option<AiSharing>,
     },
     Status,
     Balance,
@@ -462,15 +465,23 @@ async fn main() -> Result<()> {
             } else {
                 ai_runtime.or_else(|| hocmesh_gpu::runtime::installed_runtime(&cli.home))
             };
-            // Offering AI work stays gated on sharing a GPU, because that is
-            // where the operator's consent to it was recorded: `limits
-            // --gpu-percent 0` clears `caps.gpus` above, and this line must not
-            // put back what that cleared.
-            caps.ai_runtime_ready = ai_runtime.is_some() && !caps.gpus.is_empty();
+            hardware::apply_ai_readiness(&mut caps, &limits, ai_runtime.is_some());
             if ai_runtime.is_some() && !caps.ai_runtime_ready {
                 println!(
-                    "An inference runtime is installed but no GPU is shared, so this node will \
-                     not claim AI work. Raise --gpu-percent with `hocmesh limits` to offer it."
+                    "An inference runtime is available but this node is not offering AI work. \
+                     Run `hocmesh limits --ai on` to run other people's inference here."
+                );
+            } else if let Some(cpu) = caps
+                .gpus
+                .iter()
+                .find(|gpu| gpu.stable_id == hardware::SHARED_CPU_DEVICE_ID)
+            {
+                println!(
+                    "Offering AI work on CPU ({}, {} MiB shared). Inference will run and will be \
+                     slow; for acceleration build llama.cpp for the local backend and pass \
+                     --ai-runtime.",
+                    cpu.name,
+                    cpu.memory_mb.unwrap_or(0)
                 );
             }
             caps.probe_endpoint = probe_listen.as_ref().map(|listen| probe_url(listen));
@@ -516,10 +527,13 @@ async fn main() -> Result<()> {
             cpu_percent,
             gpu_percent,
             memory_percent,
+            ai,
         } => {
             let mut limits = ResourceLimits::load_or_default(&cli.home)?;
-            let changed =
-                cpu_percent.is_some() || gpu_percent.is_some() || memory_percent.is_some();
+            let changed = cpu_percent.is_some()
+                || gpu_percent.is_some()
+                || memory_percent.is_some()
+                || ai.is_some();
             if let Some(v) = cpu_percent {
                 limits.cpu_percent = v;
             }
@@ -529,17 +543,22 @@ async fn main() -> Result<()> {
             if let Some(v) = memory_percent {
                 limits.memory_percent = v;
             }
+            if let Some(v) = ai {
+                limits.ai = v.into();
+            }
             if changed {
                 limits.save(&cli.home)?;
             }
             let cpus = hardware::detect_capabilities(false).logical_cpus;
             println!(
                 "cpu {}%  gpu {}%  memory {}%
+ai: {}
 workers when running: {} of {} logical CPUs
 stored at: {}",
                 limits.cpu_percent,
                 limits.gpu_percent,
                 limits.memory_percent,
+                describe_ai_sharing(&limits),
                 limits.effective_workers(cpus),
                 cpus,
                 ResourceLimits::path(&cli.home).display()
@@ -1521,6 +1540,39 @@ fn load_set(path: &str) -> Result<ValidatorSet> {
             .context("parsing validator set")?;
     validate_validator_set(&set)?;
     Ok(set)
+}
+
+/// Whether this node runs other people's inference.
+///
+/// `Auto` is not the same as `Off`: it means the operator has not said, and the
+/// node falls back to "offer it when a GPU is lent", which is what every node
+/// did before there was a flag. Keeping it distinct is what lets an upgrade
+/// leave existing machines exactly where they were.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum AiSharing {
+    On,
+    Off,
+    Auto,
+}
+
+impl From<AiSharing> for Option<bool> {
+    fn from(value: AiSharing) -> Self {
+        match value {
+            AiSharing::On => Some(true),
+            AiSharing::Off => Some(false),
+            AiSharing::Auto => None,
+        }
+    }
+}
+
+/// How `limits` reports the AI share, spelling out what the fallback resolves to.
+fn describe_ai_sharing(limits: &ResourceLimits) -> String {
+    match limits.ai {
+        Some(true) => "on".to_string(),
+        Some(false) => "off".to_string(),
+        None if limits.offers_gpu() => "auto (on: a GPU is lent)".to_string(),
+        None => "auto (off: no GPU is lent -- use --ai on to offer CPU inference)".to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]

@@ -99,6 +99,78 @@ pub fn apply_limits(caps: &mut NodeCapabilities, limits: &ResourceLimits) {
     }
 }
 
+/// Identifier for the shared CPU slice when it is advertised as a device.
+///
+/// Real accelerators are named by the tool that discovered them, so this is
+/// also how a later pass recognises the one device this crate invented.
+pub const SHARED_CPU_DEVICE_ID: &str = "cpu-0";
+
+/// Settle whether this node offers inference to the hocmesh, and on what.
+///
+/// Call this *after* [`apply_limits`], which is what decides whether any
+/// accelerator is still advertised.
+///
+/// Two things have to be true. The node must be able to run inference at all,
+/// which is `runtime_available`; and the operator must have agreed to run it
+/// for other people, which is [`ResourceLimits::offers_ai`]. Installing a
+/// runtime is not consent -- an operator may want `hocmesh infer` for
+/// themselves and nothing else -- so the two are kept apart.
+///
+/// A node that agrees but has no accelerator left to agree *with* advertises
+/// its shared CPU slice as a device. The scheduler places work on devices, so
+/// a node with none is a node it cannot reach; that is what used to make a
+/// CPU-only machine unable to serve the hocmesh however willing its operator
+/// was. The device is not a fiction: `--gpu-layers 0` against llama.cpp's CPU
+/// backend is how the AI worker already runs, and it is what `runtime-install`
+/// installs.
+pub fn apply_ai_readiness(
+    caps: &mut NodeCapabilities,
+    limits: &ResourceLimits,
+    runtime_available: bool,
+) {
+    // Drop a slice this function added on an earlier pass before deciding, so
+    // that re-applying lands where applying once did instead of stacking
+    // devices and reading its own output back as "an accelerator is shared".
+    caps.gpus
+        .retain(|device| device.stable_id != SHARED_CPU_DEVICE_ID);
+    let accelerator_shared = !caps.gpus.is_empty();
+    caps.ai_runtime_ready = runtime_available && limits.offers_ai(accelerator_shared);
+    if caps.ai_runtime_ready && !accelerator_shared {
+        let device = shared_cpu_device(caps);
+        caps.gpus.push(device);
+    }
+}
+
+/// The lent CPU slice, described the way the scheduler describes a device.
+fn shared_cpu_device(caps: &NodeCapabilities) -> GpuCapability {
+    GpuCapability {
+        stable_id: SHARED_CPU_DEVICE_ID.into(),
+        vendor: std::env::consts::ARCH.to_string(),
+        name: caps.cpu_brand.clone(),
+        // The coordinator already maps this backend onto `BackendKind::Cpu`,
+        // and a request that genuinely needs CUDA still names it in
+        // `required_backends` and so still refuses to land here.
+        backend: "cpu".into(),
+        // The lent slice, not the machine. `--memory-percent` therefore
+        // governs which models may be placed on this node, which is the whole
+        // reason the operator was asked for a percentage.
+        memory_mb: Some(caps.shared_memory_bytes / (1024 * 1024)),
+        driver_version: None,
+        compute_version: None,
+        // llama.cpp's CPU backend reads f16, bf16 and the integer quants
+        // rather than refusing them -- slowly, but it reads them. Claiming
+        // otherwise would decline work this node can genuinely do.
+        supports_fp16: true,
+        supports_bf16: true,
+        supports_int8: true,
+        // Left unmeasured rather than guessed: these are memory-bandwidth
+        // numbers from `benchmark_memory`, and inventing one would put a
+        // fabricated figure in front of the scheduler.
+        benchmark_bytes_per_second: None,
+        benchmark_p95_micros: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +214,7 @@ mod tests {
                 cpu_percent: 25,
                 gpu_percent: 60,
                 memory_percent: 50,
+                ai: None,
             },
         );
 
@@ -167,6 +240,7 @@ mod tests {
                 cpu_percent: 50,
                 gpu_percent: 0,
                 memory_percent: 50,
+                ai: None,
             },
         );
 
@@ -182,6 +256,115 @@ mod tests {
         assert_eq!(caps.shared_logical_cpus, 8, "the CPU share is unaffected");
     }
 
+    #[test]
+    fn an_unstated_operator_gets_exactly_the_old_rule() {
+        // Sharing a GPU offered inference before this function existed, and
+        // still does.
+        let with_gpu = ResourceLimits {
+            gpu_percent: 50,
+            ..Default::default()
+        };
+        let mut sharing = a_machine();
+        apply_limits(&mut sharing, &with_gpu);
+        apply_ai_readiness(&mut sharing, &with_gpu, true);
+        assert!(sharing.ai_runtime_ready);
+        assert_eq!(
+            sharing.gpus.len(),
+            1,
+            "no invented device alongside a real one"
+        );
+        assert_eq!(sharing.gpus[0].stable_id, "gpu-0");
+
+        // Not sharing one did not, and still does not.
+        let no_gpu = ResourceLimits {
+            gpu_percent: 0,
+            ..Default::default()
+        };
+        let mut declining = a_machine();
+        apply_limits(&mut declining, &no_gpu);
+        apply_ai_readiness(&mut declining, &no_gpu, true);
+        assert!(
+            !declining.ai_runtime_ready,
+            "an operator who never said yes must not be volunteered by an upgrade"
+        );
+        assert!(declining.gpus.is_empty());
+    }
+
+    #[test]
+    fn a_cpu_only_node_that_opts_in_advertises_its_shared_cpu_slice() {
+        let limits = ResourceLimits {
+            memory_percent: 50,
+            ai: Some(true),
+            ..Default::default()
+        };
+        let mut caps = a_machine();
+        caps.gpus.clear();
+        apply_limits(&mut caps, &limits);
+        apply_ai_readiness(&mut caps, &limits, true);
+
+        assert!(caps.ai_runtime_ready);
+        let device = caps
+            .gpus
+            .first()
+            .expect("a node the scheduler can reach has at least one device");
+        assert_eq!(device.backend, "cpu");
+        // The lent half of 32 GB, not the whole machine.
+        assert_eq!(device.memory_mb, Some(16_000_000_000 / (1024 * 1024)));
+    }
+
+    #[test]
+    fn opting_in_without_a_runtime_offers_nothing() {
+        // Willingness is not capability. Advertising readiness here would draw
+        // work this node would then fail.
+        let limits = ResourceLimits {
+            ai: Some(true),
+            ..Default::default()
+        };
+        let mut caps = a_machine();
+        caps.gpus.clear();
+        apply_limits(&mut caps, &limits);
+        apply_ai_readiness(&mut caps, &limits, false);
+        assert!(!caps.ai_runtime_ready);
+        assert!(caps.gpus.is_empty());
+    }
+
+    #[test]
+    fn opting_out_declines_even_with_a_gpu_and_a_runtime() {
+        let limits = ResourceLimits {
+            gpu_percent: 100,
+            ai: Some(false),
+            ..Default::default()
+        };
+        let mut caps = a_machine();
+        apply_limits(&mut caps, &limits);
+        apply_ai_readiness(&mut caps, &limits, true);
+        assert!(!caps.ai_runtime_ready);
+        assert!(
+            !caps.gpus.is_empty(),
+            "the GPU is still lent for everything else; only inference was declined"
+        );
+    }
+
+    #[test]
+    fn readiness_does_not_stack_cpu_devices_across_restarts() {
+        // A daemon re-detects and re-applies on every start, and an operator
+        // may toggle limits between them. Applying twice must land where
+        // applying once did.
+        let limits = ResourceLimits {
+            ai: Some(true),
+            ..Default::default()
+        };
+        let mut caps = a_machine();
+        caps.gpus.clear();
+        apply_limits(&mut caps, &limits);
+        apply_ai_readiness(&mut caps, &limits, true);
+        let once = caps.gpus.clone();
+
+        apply_limits(&mut caps, &limits);
+        apply_ai_readiness(&mut caps, &limits, true);
+        assert_eq!(caps.gpus, once);
+    }
+
     /// `hocmesh init` and the daemon both apply limits to a freshly detected
     /// machine, and an operator may change them and restart. Applying twice
     /// must land in the same place, or the share would ratchet downwards.
@@ -191,6 +374,7 @@ mod tests {
             cpu_percent: 30,
             gpu_percent: 40,
             memory_percent: 30,
+            ai: None,
         };
         let mut once = a_machine();
         apply_limits(&mut once, &limits);
@@ -212,6 +396,7 @@ mod tests {
                     cpu_percent,
                     gpu_percent: 50,
                     memory_percent: 50,
+                    ai: None,
                 },
             );
             assert_eq!(
