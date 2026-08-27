@@ -214,6 +214,11 @@ enum Command {
         job_id: String,
     },
     Network,
+    /// Show what the coordinator and the ledger still disagree about.
+    ///
+    /// Intents the coordinator persisted but has not managed to settle, plus
+    /// the work it parked waiting on funding that nothing is chasing any more.
+    Reconciliation,
     Id,
     /// Ask validators directly for a quorum-agreed head and this node's signed balance proof.
     LedgerStatus {
@@ -916,6 +921,29 @@ stored at: {}",
                 n.completed_assignments,
                 n.total_available_mcu as f64 / 1000.0
             );
+        }
+        Command::Reconciliation => {
+            let r = client.reconciliation().await?;
+            if r.unsettled.is_empty() {
+                println!("Nothing unsettled: every persisted intent reached the chain.");
+            }
+            for i in &r.unsettled {
+                println!(
+                    "{:<14} {:<12} {} attempts={} {}",
+                    i.status, i.intent_kind, i.object_id, i.attempts, i.claim_key
+                );
+                if let Some(why) = &i.last_error {
+                    println!("               last error: {why}");
+                }
+            }
+            // Reported and not repaired: a coordinator that closed this gap on
+            // its own would be minting CU, so an operator has to look.
+            if r.orphaned_objects > 0 {
+                println!(
+                    "{} job(s) or assignment(s) are waiting on funding no intent covers.",
+                    r.orphaned_objects
+                );
+            }
         }
         Command::Id => {
             println!(

@@ -13,9 +13,10 @@ use hocmesh_ledger::{
 };
 use hocmesh_protocol::{
     AuthProof, BalanceResponse, ErrorResponse, JobStatusResponse, NodeCapabilities, PollRequest,
-    PollResponse, RegisterRequest, ResultRequest, SubmitJobRequest, SubmitJobResponse,
-    WorkAssignment, WorkResult, WorkSpec, canonical_auth_message, empty_body_hash,
-    job_id_from_auth, now_unix, register_body_hash, result_body_hash, submit_body_hash,
+    PollResponse, ReconciliationResponse, RegisterRequest, ResultRequest, SubmitJobRequest,
+    SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, canonical_auth_message,
+    empty_body_hash, job_id_from_auth, now_unix, register_body_hash, result_body_hash,
+    submit_body_hash,
 };
 use reqwest::Client;
 use serde_json::json;
@@ -744,6 +745,25 @@ async fn coordinator_recovers_community_reservation_after_intent_persisted() -> 
         );
     }
 
+    // A structurally broken intent: its claim key does not derive from its own
+    // transaction, so it can never settle under that key. Queued ahead of the
+    // real one on purpose -- before this was fault-isolated, one row like this
+    // stopped every intent behind it on every pass, forever.
+    let poisoned = "claim_poisoned_for_reconciliation";
+    {
+        let conn = rusqlite::Connection::open(&coordinator_db)?;
+        conn.execute(
+            "INSERT INTO ledger_intents(claim_key,intent_kind,object_id,transaction_json,status,created_at,updated_at) \
+             VALUES(?1,?2,?3,?4,'pending',0,0)",
+            rusqlite::params![
+                poisoned,
+                "community_reserve",
+                "job_that_never_existed",
+                serde_json::to_string(&community_mint(&node_bin, &validator_homes, &validators_path, "job_that_never_existed")?)?,
+            ],
+        )?;
+    }
+
     run_ok(
         Command::new(&coordinator_bin)
             .arg("recover")
@@ -762,6 +782,34 @@ async fn coordinator_recovers_community_reservation_after_intent_persisted() -> 
             .arg(&validators_path),
         "repeat recovery idempotently",
     )?;
+
+    // The pass must have finished the healthy intent and parked the broken one,
+    // rather than dying on the broken one and never reaching the healthy one.
+    {
+        let conn = rusqlite::Connection::open(&coordinator_db)?;
+        let (status, last_error): (String, Option<String>) = conn.query_row(
+            "SELECT status,last_error FROM ledger_intents WHERE claim_key=?1",
+            rusqlite::params![poisoned],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(
+            status, "unrecoverable",
+            "an intent whose claim key cannot derive from its own transaction has to stop being retried"
+        );
+        assert!(
+            last_error.is_some_and(|e| e.contains("claim mismatch")),
+            "a parked intent has to say why it was parked"
+        );
+        let healthy: String = conn.query_row(
+            "SELECT status FROM ledger_intents WHERE object_id=?1",
+            rusqlite::params![seed_job],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            healthy, "certified",
+            "the intent queued behind the broken one still had to settle"
+        );
+    }
 
     let coordinator_port = free_port()?;
     let _coordinator = ProcessGuard::spawn(
@@ -786,6 +834,30 @@ async fn coordinator_recovers_community_reservation_after_intent_persisted() -> 
     );
     complete_assignment(&http, &coordinator, &node, &assignment).await?;
     assert!(balance(&http, &coordinator, &node).await?.balance_mcu > 0);
+
+    // The same picture over HTTP: the parked intent is visible to an operator,
+    // and there is no endpoint to push it through -- that would be the
+    // coordinator ruling on CU, which it is never allowed to do.
+    let view: ReconciliationResponse =
+        get_json(&http, &coordinator, "/v1/ledger/reconciliation").await?;
+    let parked = view
+        .unsettled
+        .iter()
+        .find(|i| i.claim_key == poisoned)
+        .context("the parked intent has to show up in the reconciliation view")?;
+    assert_eq!(parked.status, "unrecoverable");
+    assert!(
+        !view.unsettled.iter().any(|i| i.object_id == seed_job),
+        "a settled intent is not unfinished business"
+    );
+    let printed = run_capture(
+        Command::new(&node_bin)
+            .arg("--coordinator")
+            .arg(&coordinator)
+            .arg("reconciliation"),
+        "operator view of stuck intents",
+    )?;
+    assert!(printed.contains(poisoned), "{printed}");
 
     drop(validators);
     Ok(())

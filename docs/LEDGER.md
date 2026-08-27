@@ -483,6 +483,12 @@ After a restart, `hocmesh-coordinator recover` or automatic startup recovery ask
 
 The proposal client also serialises rounds within one process, so a single coordinator batches rather than races itself. Independent processes are handled by ballots rather than by that lock; see "How a contested height is resolved".
 
+Recovery runs on a timer as well as at startup -- every fifteen seconds while the coordinator is serving -- and every intent is judged on its own. A pass never stops early. The intent that fails is rarely the one that matters most, and the ones queued behind it have done nothing wrong; before this was isolated, one row the daemon could not process stopped every later row on every pass, forever.
+
+Two kinds of failure are distinguished. A transient one -- no quorum yet, a validator unreachable, the local write briefly blocked -- costs that intent one tick and nothing else. A structural one cannot settle under its own claim key no matter how long anyone waits: the transaction no longer derives the key it is filed under, or names a kind the coordinator does not issue. Those are parked as `unrecoverable` with the reason attached, and a transient fault that has not cleared after `MAX_INTENT_ATTEMPTS` passes is parked the same way, because a fault that never clears is indistinguishable from a permanent one and an intent retried forever is an intent nobody ever reads.
+
+Parking is bookkeeping and nothing else. No ledger entry is written, none is withdrawn, and no CU moves -- the coordinator has no standing to do any of that. The same pass also counts the other half of a partial failure: work still parked in `funding` or `settling` that no pending intent covers any more. That gap is reported and deliberately not repaired, because filling it locally would be the coordinator deciding on its own that CU exists. Both are readable at `GET /v1/ledger/reconciliation` and through `hocmesh reconciliation`, and neither has a companion that forces an intent through.
+
 ## Requester cannot pay itself
 
 For member-funded jobs, the certified reservation records the requester identity. Provider-reward validation rejects a reward when `provider_node_id == requester_node_id`. The same invariant is replayed by offline client audit, so a malicious scheduler cannot bypass it without producing an invalid ledger.

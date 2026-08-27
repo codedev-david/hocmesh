@@ -674,6 +674,21 @@ cursor the previous page printed. Pages run newest first and never stop inside
 one entry's postings, because the cursor is a sequence: a page that split an
 entry would leave postings the next page could never ask for.
 
+See what the coordinator and the ledger still disagree about:
+
+```bash
+hocmesh --coordinator http://127.0.0.1:8080 reconciliation
+```
+
+Intents the coordinator wrote down but has not settled, with the attempt count
+and the last failure attached, plus a count of work left waiting on funding
+that nothing is chasing any more. A background pass retries the settleable ones
+every 15 seconds and once at startup; one that can never settle under its own
+claim key is parked with the reason rather than retried forever, and never
+blocks the intents behind it. Nothing here moves CU: the orphan count is a
+report, because closing that gap locally would be the coordinator deciding CU
+into existence.
+
 Audit it later without trusting the coordinator:
 
 ```bash

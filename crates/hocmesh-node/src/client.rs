@@ -13,10 +13,10 @@ use hocmesh_model::ModelManifest;
 use hocmesh_protocol::{
     BalanceResponse, ErrorResponse, HeartbeatRequest, JobStatusResponse, NetworkStatsResponse,
     NodeCapabilities, NodeStatusResponse, PeerSampleResponse, PollRequest, PollResponse,
-    RefundRequest, RefundResponse, RegisterRequest, RegisterResponse, ResultRequest,
-    ResultResponse, SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec,
-    empty_body_hash, heartbeat_body_hash, refund_body_hash, register_body_hash, result_body_hash,
-    submit_body_hash,
+    ReconciliationResponse, RefundRequest, RefundResponse, RegisterRequest, RegisterResponse,
+    ResultRequest, ResultResponse, SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkResult,
+    WorkSpec, empty_body_hash, heartbeat_body_hash, refund_body_hash, register_body_hash,
+    result_body_hash, submit_body_hash,
 };
 use reqwest::{Client, Response};
 use serde::de::DeserializeOwned;
@@ -149,6 +149,11 @@ impl HocMeshClient {
 
     pub async fn network_stats(&self) -> Result<NetworkStatsResponse> {
         self.get("/v1/network/stats").await
+    }
+
+    /// What the coordinator and the ledger still disagree about.
+    pub async fn reconciliation(&self) -> Result<ReconciliationResponse> {
+        self.get("/v1/ledger/reconciliation").await
     }
 
     pub async fn register_model(&self, manifest: &ModelManifest) -> Result<RegisterModelResponse> {

@@ -118,7 +118,9 @@ async fn main() -> Result<()> {
         }
         Command::Recover { db, validators } => {
             let net = load_network(&validators)?;
-            recover_pending(&db, &net).await
+            let report = recover_pending(&db, &net).await?;
+            println!("{report}");
+            Ok(())
         }
         Command::Rebuild {
             db,
@@ -223,10 +225,12 @@ async fn serve(listen: &str, db_path: &str, validators: Option<&str>) -> Result<
         Some(p) => Some(load_network(p)?),
         None => None,
     };
+    // A first pass before the door opens, so an operator sees what the previous
+    // process left behind rather than discovering it a tick later.
     if let Some(net) = &ledger
         && let Err(e) = recover_pending(db_path, net).await
     {
-        tracing::warn!(error=%e,"coordinator recovery incomplete; serving with unresolved intents blocked")
+        tracing::warn!(error=%e,"startup reconciliation could not read the coordinator database")
     }
     if let Some(net) = ledger.clone() {
         let recovery_db = db_path.to_string();
@@ -245,8 +249,10 @@ async fn serve(listen: &str, db_path: &str, validators: Option<&str>) -> Result<
                     Ok(false) => {}
                     Err(e) => tracing::warn!(error=%e, "validator set refresh failed"),
                 }
+                // Only an unusable database gets here now: individual intents
+                // are judged, logged, and left behind by the pass itself.
                 if let Err(e) = recover_pending(&recovery_db, &net).await {
-                    tracing::warn!(error=%e,"background ledger intent recovery incomplete")
+                    tracing::warn!(error=%e,"reconciliation pass could not read the coordinator database")
                 }
             }
         });
@@ -272,7 +278,111 @@ async fn serve(listen: &str, db_path: &str, validators: Option<&str>) -> Result<
     Ok(())
 }
 
-async fn recover_pending(db_path: &str, net: &LedgerNetwork) -> Result<()> {
+/// What one reconciliation pass did.
+///
+/// Returned rather than only logged so the startup path, the tests, and the
+/// operator view all read the same numbers. A pass that touched nothing and a
+/// pass where everything is wedged look identical in a log line; they do not
+/// look identical here.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ReconcileReport {
+    recovered: usize,
+    deferred: usize,
+    abandoned: usize,
+    /// Coordinator work waiting on funding that no pending intent covers.
+    ///
+    /// Counted, never repaired: closing this gap locally would mean the
+    /// coordinator deciding CU exists, which it has no standing to do.
+    orphaned: usize,
+}
+
+impl std::fmt::Display for ReconcileReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "reconciled: {} settled, {} deferred, {} parked, {} orphaned",
+            self.recovered, self.deferred, self.abandoned, self.orphaned
+        )
+    }
+}
+
+/// Why one intent did not settle on this pass.
+///
+/// The distinction is the whole point of the daemon: a transient fault costs
+/// one intent one tick, while a structural one would otherwise cost every
+/// intent behind it, every tick, forever.
+enum IntentFault {
+    /// The network or the quorum was not ready. Nothing is wrong with the
+    /// intent; it just needs another pass.
+    Transient(String),
+    /// The intent cannot settle under its own claim key no matter how long
+    /// anyone waits.
+    Terminal(String),
+}
+
+/// Settle one persisted intent, or say why it could not be settled.
+///
+/// Split out of the pass so that one broken intent costs exactly itself:
+/// every early return here is one intent's verdict, not the daemon's.
+async fn recover_one(
+    conn: &mut rusqlite::Connection,
+    net: &LedgerNetwork,
+    ck: &str,
+    kind: &str,
+    object_id: &str,
+    tx_json: &str,
+) -> Result<String, IntentFault> {
+    let tx: LedgerTransaction = serde_json::from_str(tx_json)
+        .map_err(|e| IntentFault::Terminal(format!("persisted transaction is unreadable: {e}")))?;
+    if claim_key(&tx) != ck {
+        // The claim key is derived from the transaction, so a mismatch means the
+        // two stopped describing the same thing. Retrying cannot make them agree
+        // again, and settling anyway would file the CU under a key nobody looks
+        // for.
+        return Err(IntentFault::Terminal(format!(
+            "persisted intent claim mismatch for {ck}"
+        )));
+    }
+    if !matches!(
+        kind,
+        "job_reserve" | "community_reserve" | "provider_reward"
+    ) {
+        return Err(IntentFault::Terminal(format!(
+            "unknown ledger intent kind {kind}"
+        )));
+    }
+    let existing = net
+        .claim_quorum(ck)
+        .await
+        .map_err(|e| IntentFault::Transient(format!("claim not confirmable yet: {e}")))?;
+    let entry_hash = match existing.entry_hash {
+        Some(hash) => hash,
+        None => {
+            net.transact(tx)
+                .await
+                .map_err(|e| IntentFault::Transient(format!("settlement did not go through: {e}")))?
+                .entry
+                .entry_hash
+        }
+    };
+    // The entry exists on the chain by now either way, so a local write that
+    // will not apply -- the assignment was pruned, say -- must not send us back
+    // to propose it a second time. Retry the bookkeeping, not the settlement.
+    let recorded = match kind {
+        "provider_reward" => finalize_reward_db(conn, object_id, ck, &entry_hash),
+        _ => finalize_reservation_db(conn, object_id, ck, &entry_hash),
+    };
+    recorded.map_err(|e| IntentFault::Transient(format!("settled but not recorded: {e}")))?;
+    Ok(entry_hash)
+}
+
+/// One reconciliation pass over everything the coordinator has not settled.
+///
+/// Every intent is judged on its own. A pass never stops early, because the
+/// intent that fails is rarely the intent that matters most, and the ones
+/// queued behind it have done nothing wrong. Only a database the daemon
+/// cannot read at all ends the pass.
+async fn recover_pending(db_path: &str, net: &LedgerNetwork) -> Result<ReconcileReport> {
     let mut conn = db::open(db_path)?;
     let intents = {
         let mut st=conn.prepare("SELECT claim_key,intent_kind,object_id,transaction_json FROM ledger_intents WHERE status='pending' ORDER BY created_at,claim_key")?;
@@ -290,27 +400,43 @@ async fn recover_pending(db_path: &str, net: &LedgerNetwork) -> Result<()> {
         }
         v
     };
+    let mut report = ReconcileReport::default();
     for (ck, kind, object_id, tx_json) in intents {
-        let tx: LedgerTransaction = serde_json::from_str(&tx_json)?;
-        if claim_key(&tx) != ck {
-            bail!("persisted intent claim mismatch for {ck}")
-        }
-        let existing = net.claim_quorum(&ck).await?;
-        let entry_hash = if let Some(hash) = existing.entry_hash {
-            hash
-        } else {
-            net.transact(tx).await?.entry.entry_hash
-        };
-        match kind.as_str() {
-            "job_reserve" | "community_reserve" => {
-                finalize_reservation_db(&mut conn, &object_id, &ck, &entry_hash)?
+        match recover_one(&mut conn, net, &ck, &kind, &object_id, &tx_json).await {
+            Ok(entry_hash) => {
+                report.recovered += 1;
+                println!("Recovered {kind} {object_id} at ledger entry {entry_hash}");
             }
-            "provider_reward" => finalize_reward_db(&mut conn, &object_id, &ck, &entry_hash)?,
-            other => bail!("unknown ledger intent kind {other}"),
+            Err(IntentFault::Transient(why)) => {
+                // Deferring forever is its own kind of stuck, so a fault that
+                // never clears eventually gets parked like a structural one.
+                let attempts = db::defer_ledger_intent(&conn, &ck, &why)?;
+                if attempts >= db::MAX_INTENT_ATTEMPTS {
+                    let why = format!("gave up after {attempts} attempts: {why}");
+                    db::abandon_ledger_intent(&conn, &ck, &why)?;
+                    report.abandoned += 1;
+                    tracing::error!(claim=%ck, kind=%kind, object=%object_id, reason=%why, "ledger intent parked after repeated failures");
+                } else {
+                    report.deferred += 1;
+                    tracing::debug!(claim=%ck, kind=%kind, attempts, reason=%why, "ledger intent deferred to a later pass");
+                }
+            }
+            Err(IntentFault::Terminal(why)) => {
+                db::abandon_ledger_intent(&conn, &ck, &why)?;
+                report.abandoned += 1;
+                tracing::error!(claim=%ck, kind=%kind, object=%object_id, reason=%why, "ledger intent cannot settle and was parked for an operator");
+            }
         }
-        println!("Recovered {kind} {object_id} at ledger entry {entry_hash}");
     }
-    Ok(())
+    report.orphaned = db::orphaned_funding_objects(&conn)? as usize;
+    if report.abandoned > 0 || report.orphaned > 0 {
+        tracing::warn!(
+            abandoned = report.abandoned,
+            orphaned = report.orphaned,
+            "coordinator and ledger disagree; run `hocmesh reconciliation` for the detail"
+        );
+    }
+    Ok(report)
 }
 
 fn finalize_reservation_db(

@@ -91,7 +91,14 @@ GET  /v1/nodes/{id}/balance
 GET  /v1/nodes/{id}
 GET  /v1/network/stats
 GET  /v1/network/peers
+GET  /v1/ledger/reconciliation
 ```
+
+`GET /v1/ledger/reconciliation` reports what the coordinator and the ledger
+still disagree about: intents the coordinator persisted but has not managed to
+settle, and work it parked waiting on funding that no intent covers any more.
+It is read-only, and deliberately has no companion that forces an intent
+through or writes one off -- either would be the coordinator ruling on CU.
 
 `GET /v1/network/peers` is deliberately unauthenticated and returns a small
 random sample of nodes that have opted into serving latency probes. It is a

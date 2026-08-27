@@ -373,6 +373,35 @@ pub struct NetworkStatsResponse {
     pub total_available_mcu: i64,
     pub ledger_mode: String,
 }
+/// One intent the coordinator persisted but has not finished settling.
+///
+/// Reported, never acted on by a reader: the coordinator is not the authority
+/// for CU, so this view exists to say what is stuck and why, not to let anyone
+/// nudge it along out of band.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerIntentState {
+    pub claim_key: String,
+    pub intent_kind: String,
+    pub object_id: String,
+    pub status: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub entry_hash: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// What the coordinator still owes the ledger, or the ledger still owes it.
+///
+/// `orphaned_objects` is the half no daemon can repair: work the coordinator
+/// parked waiting on funding that no pending intent covers any more. Settling
+/// it would mean the coordinator writing CU into existence on its own say-so,
+/// which it is never permitted to do, so it is surfaced and left alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationResponse {
+    pub unsettled: Vec<LedgerIntentState>,
+    pub orphaned_objects: u64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,

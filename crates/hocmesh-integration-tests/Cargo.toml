@@ -14,6 +14,7 @@ hocmesh-gpu = { path = "../hocmesh-gpu" }
 hocmesh-model = { path = "../hocmesh-model" }
 hocmesh-ledger = { path = "../hocmesh-ledger" }
 hocmesh-protocol = { path = "../hocmesh-protocol" }
+rusqlite.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

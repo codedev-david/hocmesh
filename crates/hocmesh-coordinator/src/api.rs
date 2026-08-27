@@ -34,11 +34,12 @@ use hocmesh_model::ModelManifest;
 use hocmesh_protocol::{
     BalanceResponse, CollatzPeakTotal, DEFAULT_LEASE_SECONDS, HeartbeatRequest, JobStatusResponse,
     NetworkCoordinate, NetworkStatsResponse, NodeCapabilities, NodeStatusResponse, PeerSample,
-    PeerSampleResponse, PollRequest, PollResponse, PricedBatch, RefundRequest, RefundResponse,
-    RefundableShard, RegisterRequest, RegisterResponse, ResultRequest, ResultResponse,
-    SETTLEMENT_WINDOW_SECS, SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkResult,
-    WorkSpec, empty_body_hash, heartbeat_body_hash, job_id_from_auth, now_unix, refund_body_hash,
-    register_body_hash, result_body_hash, submit_body_hash, verify_auth,
+    PeerSampleResponse, PollRequest, PollResponse, PricedBatch, ReconciliationResponse,
+    RefundRequest, RefundResponse, RefundableShard, RegisterRequest, RegisterResponse,
+    ResultRequest, ResultResponse, SETTLEMENT_WINDOW_SECS, SubmitJobRequest, SubmitJobResponse,
+    WorkAssignment, WorkResult, WorkSpec, empty_body_hash, heartbeat_body_hash, job_id_from_auth,
+    now_unix, refund_body_hash, register_body_hash, result_body_hash, submit_body_hash,
+    verify_auth,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Arc;
@@ -82,11 +83,28 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/ai/work/poll", post(poll_inference))
         .route("/v1/ai/work/result", post(report_inference))
         .route("/v1/ai/work/fail", post(fail_inference))
+        .route("/v1/ledger/reconciliation", get(reconciliation))
         .with_state(state)
 }
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// What the coordinator and the ledger still disagree about.
+///
+/// Read-only on purpose. There is no companion endpoint to force an intent
+/// through or write one off, because either would be the coordinator ruling on
+/// CU, and the whole design turns on it never doing that. The daemon settles
+/// what can be settled; this says what is left.
+async fn reconciliation(
+    State(state): State<AppState>,
+) -> Result<Json<ReconciliationResponse>, ApiError> {
+    let conn = state.db.get().map_err(ApiError::internal)?;
+    Ok(Json(ReconciliationResponse {
+        unsettled: crate::db::unsettled_ledger_intents(&conn).map_err(ApiError::internal)?,
+        orphaned_objects: crate::db::orphaned_funding_objects(&conn).map_err(ApiError::internal)?,
+    }))
 }
 
 async fn register_model(

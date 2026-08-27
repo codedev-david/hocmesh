@@ -884,6 +884,7 @@ dependencies = [
  "hocmesh-model",
  "hocmesh-protocol",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

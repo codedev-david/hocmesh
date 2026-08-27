@@ -26,6 +26,7 @@
 - Portable signed snapshots, so a newcomer adopts a quorum-signed state and syncs from there instead of replaying the chain from genesis.
 - Out-of-band checkpoint distribution, because that snapshot proves itself against a validator set the reader already trusts and so can travel by any untrusted route.
 - Indexed account history, so an operator reconciling a bill can page back through the postings behind a balance -- served by validators, readable from a local mirror, and keyed so a page is a seek rather than a scan.
+- Reconciliation of partial coordinator/ledger failures, on a timer and at startup: every persisted intent is judged on its own, so a broken one no longer blocks the ones queued behind it, and one that can never settle under its own claim key is parked with the reason attached instead of retried forever. Work left waiting on funding that no intent covers is reported and not repaired -- filling that gap locally would be the coordinator ruling on CU. Readable at `/v1/ledger/reconciliation` and via `hocmesh reconciliation`.
 
 ## Priority 0 — handoff validation
 
@@ -39,7 +40,6 @@
 
 ## Priority 1 — production ledger hardening
 
-- Reconciliation daemon for partial coordinator/ledger failures.
 - Sweeping stale inference holding accounts to the commons once the settlement window closes, so a requester that takes delivery and never gives a verdict cannot strand CU indefinitely.
 - Property tests for conservation and replay invariants. Covered in `hocmesh-ledger`: a settled reward survives no single edit to its postings, evidence, or signature; the community ceiling is never crossed by any sequence of mints; and a chain replayed into two databases leaves them identical, refuses every certificate a second time, and sums to exactly zero.
 - Byzantine/fault-injection tests. Network faults are covered: the quorum flow suite runs a fault-injecting relay for WAN latency, minority and majority partitions, and clock skew. Two Byzantine cases are covered too: an equivocating quorum that signs two entries at one height cannot get both onto the chain, and a full quorum of strangers certifies nothing. What is left is the rest of adversarial *behaviour* - a validator that equivocates while its peers are partitioned, a coordinator that lies about scheduling rather than about payment - and a real multi-host run.

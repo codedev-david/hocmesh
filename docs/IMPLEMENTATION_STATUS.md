@@ -10,6 +10,7 @@
 | Contribution-first CU accounting | Implemented | Reservation/escrow/reward invariants |
 | Replicated validator ledger | Implemented | Hash-linked entries and quorum certificates |
 | Crash-safe settlement intents | Implemented | Recovery integration test |
+| Reconciliation of partial coordinator/ledger failures | Implemented | A pass at startup and every 15s judges each persisted intent on its own, so a broken one never blocks the ones behind it; transient faults retry, structural ones are parked `unrecoverable` with the reason; work waiting on funding no intent covers is counted, never repaired. Read at `/v1/ledger/reconciliation` or `hocmesh reconciliation` |
 | Coordinator rebuild from the chain | Implemented | `rebuild` replays certified entries into an empty database; shard ids are derived, so a replacement finishes a half-done job without re-offering or re-paying a settled shard |
 | Client mirror and offline audit | Implemented | Validator quorum sync/audit commands |
 | Snapshot bootstrap and out-of-band checkpoints | Implemented | `snapshot`/`ledger-restore` write and adopt a quorum-signed state file; it is refused unless certificate, checkpoint and state hash all agree against the operator's own validator set, and refused again over a store that already holds a chain |
