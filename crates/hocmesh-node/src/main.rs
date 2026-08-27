@@ -1,5 +1,6 @@
 mod client;
 mod daemon;
+mod install;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -49,8 +50,14 @@ enum Command {
         workers: Option<usize>,
         #[arg(long, default_value_t = 750)]
         poll_ms: u64,
+        /// Path to a llama.cpp executable. Defaults to the runtime installed
+        /// by `hocmesh runtime-install`; without either, this node advertises
+        /// no AI capability and simply never claims inference work.
         #[arg(long)]
         ai_runtime: Option<PathBuf>,
+        /// Do not offer AI work even when a runtime is installed.
+        #[arg(long)]
+        no_ai: bool,
         #[arg(long, default_value_t = 999)]
         gpu_layers: u32,
         #[arg(long)]
@@ -109,13 +116,68 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8090")]
         listen: String,
     },
+    /// Download a model, verify its digest, and import it into the chunk store.
+    ///
+    /// Give a catalogue id (`hocmesh model-catalog` lists them), or point at any
+    /// Hugging Face repository with --repository, or at a file with --url. The
+    /// bytes are checked against a SHA-256 before anything is imported.
+    ModelPull {
+        /// A catalogue id. Omit when using --repository or --url.
+        id: Option<String>,
+        /// Any Hugging Face repository holding GGUF weights, as owner/name.
+        #[arg(long, conflicts_with_all = ["id", "url"])]
+        repository: Option<String>,
+        /// A direct URL to a .gguf file. Requires --sha256.
+        #[arg(long, conflicts_with_all = ["id", "repository"])]
+        url: Option<String>,
+        /// Which quantisation to prefer, e.g. q4_k_m. Ignored with --url.
+        #[arg(long)]
+        quantisation: Option<String>,
+        /// Branch, tag or commit in the repository.
+        #[arg(long)]
+        revision: Option<String>,
+        /// Pin the expected digest yourself. Overrides the repository's, and is
+        /// required with --url.
+        #[arg(long)]
+        sha256: Option<String>,
+        /// Register under this id instead of the derived one.
+        #[arg(long)]
+        model_id: Option<String>,
+        /// Override the architecture; by default it is read from the GGUF header.
+        #[arg(long)]
+        architecture: Option<String>,
+        #[arg(long, default_value_t = hocmesh_model::DEFAULT_CHUNK_SIZE)]
+        chunk_size: usize,
+        /// Keep the downloaded file. Off by default: the chunk store already
+        /// holds the bytes, so it would be a second copy.
+        #[arg(long)]
+        keep_download: bool,
+    },
+    /// List the models `model-pull` knows by name.
+    ModelCatalog,
+    /// Download the pinned llama.cpp build for this machine.
+    ///
+    /// The archive must match a SHA-256 compiled into this binary before any of
+    /// it is unpacked. No flag can widen what is acceptable.
+    RuntimeInstall {
+        /// Reinstall even if a runtime is already present.
+        #[arg(long)]
+        force: bool,
+        /// Keep the downloaded archive after unpacking it.
+        #[arg(long)]
+        keep_download: bool,
+    },
+    /// Show which inference runtime this node would use, and what it expects.
+    RuntimeStatus,
     Infer {
         #[arg(long)]
         model_id: String,
         #[arg(long, default_value = "main")]
         revision: String,
+        /// Path to a llama.cpp executable. Defaults to the runtime installed
+        /// by `hocmesh runtime-install`.
         #[arg(long)]
-        runtime: PathBuf,
+        runtime: Option<PathBuf>,
         #[arg(long)]
         prompt: String,
         #[arg(long, default_value_t = 128)]
@@ -374,6 +436,7 @@ async fn main() -> Result<()> {
             workers,
             poll_ms,
             ai_runtime,
+            no_ai,
             gpu_layers,
             model_seed_listen,
             model_seed_url,
@@ -391,7 +454,25 @@ async fn main() -> Result<()> {
             );
             let limits = ResourceLimits::load_or_default(&cli.home)?;
             hardware::apply_limits(&mut caps, &limits);
+            // An installed runtime is used without having to be named, so
+            // `runtime-install` followed by `daemon` is enough. --ai-runtime
+            // still overrides it; --no-ai declines the work entirely.
+            let ai_runtime = if no_ai {
+                None
+            } else {
+                ai_runtime.or_else(|| hocmesh_gpu::runtime::installed_runtime(&cli.home))
+            };
+            // Offering AI work stays gated on sharing a GPU, because that is
+            // where the operator's consent to it was recorded: `limits
+            // --gpu-percent 0` clears `caps.gpus` above, and this line must not
+            // put back what that cleared.
             caps.ai_runtime_ready = ai_runtime.is_some() && !caps.gpus.is_empty();
+            if ai_runtime.is_some() && !caps.ai_runtime_ready {
+                println!(
+                    "An inference runtime is installed but no GPU is shared, so this node will \
+                     not claim AI work. Raise --gpu-percent with `hocmesh limits` to offer it."
+                );
+            }
             caps.probe_endpoint = probe_listen.as_ref().map(|listen| probe_url(listen));
             // --workers may lower the ceiling the operator set, never raise it.
             let workers = limits.clamp_requested_workers(workers, caps.logical_cpus);
@@ -597,6 +678,161 @@ stored at: {}",
             println!("Serving verified model chunks on http://{listen}");
             axum::serve(listener, seed_router(state)).await?;
         }
+        Command::ModelCatalog => {
+            println!(
+                "{:<24} {:>8} {:>9}  {:<10} REPOSITORY",
+                "ID", "PARAMS", "SIZE", "LICENCE"
+            );
+            for entry in hocmesh_model::catalog::CATALOG {
+                println!(
+                    "{:<24} {:>8} {:>9}  {:<10} {}",
+                    entry.id,
+                    entry.parameters,
+                    install::human_bytes(entry.approx_bytes),
+                    entry.license,
+                    entry.repository
+                );
+                println!("{:<24} {}", "", entry.summary);
+            }
+            println!(
+                "\nPull one with `hocmesh model-pull <id>`. Sizes are approximate, and the \
+                 exact file and its digest are resolved from the repository at pull time."
+            );
+        }
+        Command::ModelPull {
+            id,
+            repository,
+            url,
+            quantisation,
+            revision,
+            sha256,
+            model_id,
+            architecture,
+            chunk_size,
+            keep_download,
+        } => {
+            let source = match (id, repository, url) {
+                (Some(id), None, None) => {
+                    let entry = hocmesh_model::catalog::lookup(&id).with_context(|| {
+                        let close = hocmesh_model::catalog::suggestions(&id);
+                        if close.is_empty() {
+                            format!(
+                                "{id} is not in the catalogue. Run `hocmesh model-catalog` to \
+                                 see it, or pass --repository owner/name for anything else"
+                            )
+                        } else {
+                            format!(
+                                "{id} is not in the catalogue. Did you mean: {}",
+                                close.join(", ")
+                            )
+                        }
+                    })?;
+                    install::PullSource::Catalogued(entry)
+                }
+                (None, Some(repository), None) => install::PullSource::Repository {
+                    repository,
+                    quantisation,
+                },
+                (None, None, Some(url)) => install::PullSource::Url(url),
+                _ => {
+                    bail!("give exactly one of: a catalogue id, --repository owner/name, or --url")
+                }
+            };
+            let pulled = install::pull_model(
+                &cli.home,
+                install::PullRequest {
+                    source,
+                    revision,
+                    sha256,
+                    model_id,
+                    architecture,
+                    chunk_size,
+                    keep_download,
+                },
+            )
+            .await?;
+            if !pulled.downloaded {
+                println!("Already downloaded and verified; re-importing.");
+            }
+            println!(
+                "Imported {}@{}: {} ({} bytes) in {} chunks, {} architecture, manifest {}",
+                pulled.model_id,
+                pulled.revision,
+                install::human_bytes(pulled.size_bytes),
+                pulled.size_bytes,
+                pulled.chunks,
+                pulled.architecture,
+                pulled.manifest_digest
+            );
+            println!("sha256 {}", pulled.sha256);
+            println!("from   {}", pulled.source_url);
+            println!(
+                "Run it with `hocmesh infer --model-id {} --prompt \"...\"`.",
+                pulled.model_id
+            );
+        }
+        Command::RuntimeInstall {
+            force,
+            keep_download,
+        } => {
+            let installed = install::install_runtime(&cli.home, force, keep_download).await?;
+            if installed.installed_now {
+                println!(
+                    "Installed llama.cpp {} ({})",
+                    installed.build, installed.asset
+                );
+                println!("sha256 {} (verified)", installed.sha256);
+            } else {
+                println!(
+                    "llama.cpp {} is already installed; pass --force to reinstall.",
+                    installed.build
+                );
+            }
+            println!("runtime {}", installed.executable.display());
+            println!("`hocmesh infer` and `hocmesh daemon` now use it without a --runtime flag.");
+        }
+        Command::RuntimeStatus => {
+            match hocmesh_gpu::runtime::asset_for_host() {
+                Ok(asset) => {
+                    println!(
+                        "Pinned  llama.cpp {} for {}/{}",
+                        hocmesh_gpu::runtime::PINNED_BUILD,
+                        asset.os,
+                        asset.arch
+                    );
+                    println!(
+                        "Asset   {} ({})",
+                        asset.asset,
+                        install::human_bytes(asset.size_bytes)
+                    );
+                    println!("Expects sha256 {}", asset.sha256);
+                    println!("URL     {}", asset.url());
+                }
+                Err(error) => println!("Pinned  {error}"),
+            }
+            match hocmesh_gpu::runtime::installed_runtime(&cli.home) {
+                Some(path) => println!("Runtime {}", path.display()),
+                None => println!(
+                    "Runtime not installed. Run `hocmesh runtime-install`, or point --runtime \
+                     at a llama.cpp build you already have."
+                ),
+            }
+            let devices = hocmesh_gpu::discover_devices();
+            if devices.is_empty() {
+                println!("Devices none detected; inference will run on the CPU.");
+            } else {
+                for device in devices {
+                    let memory = match device.memory_bytes {
+                        Some(bytes) => install::human_bytes(bytes),
+                        None => "unknown memory".to_string(),
+                    };
+                    println!(
+                        "Device  {} ({:?}, {memory})",
+                        device.stable_id, device.backend
+                    );
+                }
+            }
+        }
         Command::Infer {
             model_id,
             revision,
@@ -636,6 +872,10 @@ stored at: {}",
                     supports_bf16: false,
                     supports_int8: true,
                 });
+            let runtime = match runtime {
+                Some(explicit) => explicit,
+                None => hocmesh_gpu::runtime::require_runtime(&cli.home)?,
+            };
             let backend = LlamaCppBackend::new(runtime, device, gpu_layers)?;
             let output = backend.infer(
                 &materialized,

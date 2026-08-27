@@ -1,9 +1,11 @@
+pub mod catalog;
+pub mod gguf;
+
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -50,7 +52,6 @@ impl ModelManifest {
             "architecture is empty"
         );
         ensure!(!self.chunks.is_empty(), "manifest has no chunks");
-        let mut hashes = BTreeSet::new();
         let mut total = 0_u64;
         for (expected, chunk) in self.chunks.iter().enumerate() {
             ensure!(
@@ -59,7 +60,13 @@ impl ModelManifest {
             );
             ensure!(is_sha256(&chunk.sha256), "invalid chunk digest");
             ensure!(chunk.size_bytes > 0, "empty chunks are not permitted");
-            ensure!(hashes.insert(&chunk.sha256), "duplicate chunk digest");
+            // Two chunks may legitimately share a digest: a model file with the
+            // same 4 MiB twice in it is a file that stores one chunk and
+            // references it twice, which is the whole point of addressing chunks
+            // by content. `index` is checked above, so order is still pinned,
+            // and `materialize` reads by digest per index. Refusing duplicates
+            // would make such a file unimportable for no security gain -- every
+            // chunk still has to hash to its stated digest.
             total = total
                 .checked_add(chunk.size_bytes)
                 .context("model size overflow")?;
@@ -354,6 +361,42 @@ mod tests {
             metadata: Default::default(),
         };
         assert!(manifest.validate().is_err());
+    }
+
+    /// A file that contains the same chunk-sized run of bytes twice is a
+    /// perfectly ordinary file, and a content-addressed store is exactly the
+    /// thing that should store it once and reference it twice. Refusing the
+    /// manifest would make the file unimportable and buy nothing: each chunk is
+    /// still checked against its own digest on the way in and on the way out.
+    #[test]
+    fn a_repeated_chunk_is_stored_once_and_referenced_twice() {
+        let root = temp_dir();
+        let store = ChunkStore::open(root.join("chunks")).unwrap();
+        let path = root.join("repeats.bin");
+        let block = vec![7_u8; 32];
+        let mut body = block.clone();
+        body.extend_from_slice(&block);
+        body.extend_from_slice(&block);
+        fs::write(&path, &body).unwrap();
+
+        let manifest = manifest_for_file(
+            &store,
+            &path,
+            "repeats",
+            "v1",
+            ModelFormat::Gguf,
+            "llama",
+            32,
+        )
+        .expect("a file with repeated blocks is importable");
+
+        assert_eq!(manifest.chunks.len(), 3);
+        assert_eq!(manifest.chunks[0].sha256, manifest.chunks[2].sha256);
+        assert_eq!(manifest.total_size_bytes, body.len() as u64);
+
+        let restored = root.join("restored.bin");
+        store.materialize(&manifest, &restored).unwrap();
+        assert_eq!(fs::read(&restored).unwrap(), body);
     }
 
     #[test]

@@ -11,6 +11,10 @@
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="hocMESH">
+        <!-- All three binaries ship together. A machine that has `hocmesh`
+             but not `hocmesh-coordinator` cannot start a mesh, only join one
+             that somebody else already started, which makes the installer a
+             half-install that looks complete. -->
         <Component Id="HocMeshClient" Guid="*" Bitness="always64">
           <File Id="HocMeshExecutable" Source="$(HocMeshExe)" KeyPath="yes" />
           <Environment
@@ -21,11 +25,19 @@
             Part="last"
             System="yes" />
         </Component>
+        <Component Id="HocMeshCoordinator" Guid="*" Bitness="always64">
+          <File Id="HocMeshCoordinatorExecutable" Source="$(HocMeshCoordinatorExe)" KeyPath="yes" />
+        </Component>
+        <Component Id="HocMeshValidator" Guid="*" Bitness="always64">
+          <File Id="HocMeshValidatorExecutable" Source="$(HocMeshValidatorExe)" KeyPath="yes" />
+        </Component>
       </Directory>
     </StandardDirectory>
 
     <Feature Id="MainFeature" Title="hocMESH Compute Client" Level="1">
       <ComponentRef Id="HocMeshClient" />
+      <ComponentRef Id="HocMeshCoordinator" />
+      <ComponentRef Id="HocMeshValidator" />
     </Feature>
   </Package>
 </Wix>

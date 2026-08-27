@@ -28,6 +28,7 @@ Implemented architecture:
 - GPU detection for NVIDIA/CUDA and Apple/Metal-capable systems where detectable by the current hardware adapter.
 - Declarative allow-listed work instead of arbitrary remote binaries.
 - Deterministic prime-range workload as the first safe distributed workload.
+- One-command inference setup: `runtime-install` fetches a llama.cpp build pinned by SHA-256, `model-pull` fetches and verifies GGUF weights. Neither trusts a name.
 - Multi-worker task parallelism.
 - Work leasing and lease expiration/requeue.
 - Requesters cannot execute their own paid shards; both scheduler and validators enforce this.
@@ -64,7 +65,7 @@ Implemented architecture:
 
 ## Runtime boundary
 
-hocMESH v0.3 executes independent distributed inference batches through a user-supplied, backend-enabled llama.cpp runtime. Pipeline and tensor/model plans and transport are implemented; actual partial-layer kernels require a compatible runtime plugin because stock llama.cpp does not expose them.
+hocMESH v0.3 executes independent distributed inference batches through an external llama.cpp runtime. `hocmesh runtime-install` will fetch a pinned build for the host platform and verify it against a SHA-256 compiled into the binary, so no separate llama.cpp setup is required; `--runtime` still accepts a build you compiled yourself, which is the path to take for CUDA or ROCm acceleration. Pipeline and tensor/model plans and transport are implemented; actual partial-layer kernels require a compatible runtime plugin because stock llama.cpp does not expose them.
 
 The current executable workload is deterministic CPU prime-range computation. The architecture deliberately proves the harder control-plane primitives first:
 
@@ -77,7 +78,7 @@ The current executable workload is deterministic CPU prime-range computation. Th
 7. verification,
 8. fault recovery.
 
-See `docs/HOCMESH_AI.md` for commands, interfaces, validation, and hardware/runtime boundaries.
+See `docs/HOCMESH_AI.md` for commands, interfaces, validation, and hardware/runtime boundaries, and `docs/DEPLOYMENT.md` for the runbook that takes this onto two or more real machines.
 
 See `docs/FULL_ORIGINAL_SPEC.md` and `docs/ROADMAP.md`.
 
@@ -301,6 +302,52 @@ Start-Process msiexec.exe -Wait -ArgumentList '/i', '.\hocmesh-0.3.0-x86_64.msi'
 The script creates `dist/` containing the three native binaries plus the documentation/config files required to deploy them.
 
 For a participant-only machine, only `hocmesh` is required.
+
+---
+
+# Run a local model
+
+Two commands, no separate llama.cpp setup and no manual weight downloads.
+
+```bash
+hocmesh runtime-install                        # pinned llama.cpp, verified by digest
+hocmesh model-pull qwen2.5-0.5b-instruct       # GGUF weights, verified by digest
+hocmesh infer --model-id qwen2.5-0.5b-instruct --prompt "hello"
+```
+
+`runtime-install` downloads the llama.cpp release pinned in
+`crates/hocmesh-gpu/src/runtime.rs` for this OS and architecture and checks it
+against a SHA-256 compiled into the binary. It is pinned by digest rather than
+resolved by name on purpose: hocMESH's safety property is that a node executes
+allow-listed work and never a binary somebody sent it, and "fetch the latest
+build" would quietly hand that away. Mismatched bytes are discarded, not
+installed. `hocmesh runtime-status` shows what is pinned and what is installed
+without downloading anything.
+
+`model-pull` resolves the file on Hugging Face, downloads it with resume,
+verifies the SHA-256 the Hub published for it, reads the architecture out of the
+GGUF header instead of asking you to assert it, chunks it into the
+content-addressed store, and registers it.
+
+```bash
+hocmesh model-catalog                                        # ids known by name
+hocmesh model-pull --repository Qwen/Qwen2.5-7B-Instruct-GGUF --quantisation q4_k_m
+hocmesh model-pull --url https://example.org/m.gguf --sha256 <64 hex>
+```
+
+The catalogue maps a memorable id to a repository and a preferred quantisation.
+It deliberately carries no digests: those are resolved per pull and checked
+against the bytes that arrive, because a digest shipped in the binary that
+nobody could re-verify would look like a guarantee it is not. `--sha256` is
+optional when the source publishes a digest and required with `--url`.
+
+Once installed, `infer` and `daemon` find the runtime without a flag.
+`--runtime` / `--ai-runtime` still override it, and `daemon --no-ai` declines AI
+work outright. A daemon only advertises AI readiness when the operator has also
+lent GPU — installing a runtime is not by itself consent to run other people's
+inference.
+
+`docs/DEPLOYMENT.md` has the full two-machine runbook.
 
 ---
 
@@ -982,7 +1029,7 @@ This repository intentionally documents the remaining work instead of disguising
 2. Consensus is a quorum-certified linear log, not a complete BFT view-change protocol.
 3. The coordinator is still the centralized scheduler, although accounting is independently replicated.
 4. Public TLS is expected to be provided by a reverse proxy rather than the binaries directly.
-5. CUDA, ROCm, and Metal execution delegates to a configured llama.cpp-compatible process; native in-process kernels are not bundled.
+5. CUDA, ROCm, and Metal execution delegates to an external llama.cpp-compatible process; native in-process kernels are not bundled. `runtime-install` fetches a CPU build pinned by digest, which is enough to run inference but not to accelerate it.
 6. Work verification currently recomputes deterministic CPU work.
 7. Community issuance authorization is bounded by validator policy but does not yet require a separate governance key/proposal process.
 8. Key storage is file-based rather than OS hardware-backed.

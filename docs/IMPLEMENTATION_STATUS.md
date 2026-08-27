@@ -39,6 +39,8 @@
 | CUDA backend | Implemented adapter | NVIDIA discovery; feature-gated llama.cpp adapter; requires a CUDA llama.cpp build |
 | ROCm backend | Implemented adapter | ROCm discovery; feature-gated llama.cpp adapter; requires a HIP/ROCm llama.cpp build |
 | Metal backend | Implemented adapter | Metal discovery; feature-gated llama.cpp adapter; requires macOS and a Metal llama.cpp build |
+| Runtime acquisition | Implemented | `runtime-install` fetches a llama.cpp release pinned by SHA-256 per OS/arch; refuses anything that does not match |
+| Model acquisition | Implemented | `model-pull` resolves a GGUF on the Hub or a `--url`, verifies its digest, resumes interrupted transfers, derives the architecture from the GGUF header |
 | GGUF manifests | Implemented | Schema and magic-header validation |
 | Safetensors manifests | Implemented | Schema and header-length validation |
 | GPU capability benchmark | Implemented | Capability report, host-transfer baseline, real-model `llama-bench` adapter |

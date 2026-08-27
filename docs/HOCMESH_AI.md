@@ -13,6 +13,29 @@ hocMESH AI is split into four libraries and two executable integration points:
 
 No model can supply an executable or shell command. Runtime paths are local operator configuration, and the adapter passes a fixed argument allow-list.
 
+## Getting a runtime and weights
+
+```powershell
+hocmesh runtime-install                      # pinned llama.cpp, verified by SHA-256
+hocmesh runtime-status                       # what is pinned, what is installed
+hocmesh model-catalog                        # ids model-pull understands
+hocmesh model-pull qwen2.5-0.5b-instruct     # resolve, verify, chunk, register
+```
+
+`runtime-install` fetches the llama.cpp release pinned in
+`crates/hocmesh-gpu/src/runtime.rs` for the host OS and architecture and checks
+it against a digest compiled into the binary. Pinning by digest rather than
+resolving by name is the point: a node executes allow-listed work and never a
+binary somebody sent it, and "fetch the latest build" would give that away. It
+installs a CPU build, which runs inference but does not accelerate it; for CUDA
+or ROCm, build llama.cpp for the local backend and pass `--ai-runtime`.
+
+`model-pull` resolves a GGUF on Hugging Face, downloads it with resume, verifies
+the digest the Hub published for the file, reads `general.architecture` out of
+the GGUF header rather than trusting an operator's `--architecture`, and imports
+it through the same chunk store as `model-import`. `--url` requires `--sha256`,
+because there is otherwise nothing to check the bytes against.
+
 ## Model lifecycle
 
 ```powershell
@@ -32,7 +55,18 @@ Chunks are written atomically beneath `.hocmesh/model-cache/chunks/<prefix>/<sha
 
 ## Worker daemon
 
-Use a llama.cpp binary built for the local backend:
+An installed runtime is used without being named, so after `runtime-install`
+this is enough:
+
+```powershell
+hocmesh daemon `
+  --model-seed-listen 0.0.0.0:8090 `
+  --model-seed-url http://public-host:8090
+```
+
+`--ai-runtime` overrides it with a llama.cpp built for the local backend, which
+is what to use for CUDA or ROCm. `--no-ai` declines AI work outright even when a
+runtime is installed.
 
 ```powershell
 hocmesh daemon `
@@ -41,7 +75,7 @@ hocmesh daemon `
   --model-seed-url http://public-host:8090
 ```
 
-The node advertises AI readiness only when a runtime was configured and a supported accelerator was detected. The coordinator will not place AI work on CPU-only or unconfigured nodes.
+The node advertises AI readiness only when a runtime is available and a supported accelerator was detected *and* the operator has lent GPU. The coordinator will not place AI work on CPU-only or unconfigured nodes. Installing a runtime is not by itself consent to run other people's inference: `limits --gpu-percent 0` keeps the node a CPU worker no matter what is installed.
 
 ## Scheduling and execution
 
