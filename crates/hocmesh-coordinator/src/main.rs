@@ -1,6 +1,7 @@
 mod api;
 mod db;
 mod error;
+mod rebuild;
 
 use anyhow::{Context, Result, bail};
 use api::AppState;
@@ -62,6 +63,19 @@ enum Command {
         #[arg(long)]
         job_id: Option<String>,
     },
+    /// Rebuild scheduling state from the chain into a fresh database.
+    ///
+    /// This is how a coordinator is replaced. Nothing here is authoritative:
+    /// the reservations, rewards and refunds on the ledger already say what
+    /// every job is and which of its shards are settled.
+    Rebuild {
+        #[arg(long, default_value = "hocmesh.db")]
+        db: String,
+        #[arg(long)]
+        validators: String,
+        #[arg(long, default_value_t = 256)]
+        batch: u64,
+    },
     Recover {
         #[arg(long, default_value = "hocmesh.db")]
         db: String,
@@ -105,6 +119,20 @@ async fn main() -> Result<()> {
         Command::Recover { db, validators } => {
             let net = load_network(&validators)?;
             recover_pending(&db, &net).await
+        }
+        Command::Rebuild {
+            db,
+            validators,
+            batch,
+        } => {
+            let net = load_network(&validators)?;
+            let mut conn = db::open(&db)?;
+            let report = rebuild::rebuild_from_ledger(&mut conn, &net, batch).await?;
+            println!(
+                "Replayed {} entries: {} jobs, {} shards already settled, {} still open",
+                report.entries, report.jobs, report.settled_shards, report.open_shards
+            );
+            Ok(())
         }
     }
 }

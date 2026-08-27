@@ -10,6 +10,7 @@
 | Contribution-first CU accounting | Implemented | Reservation/escrow/reward invariants |
 | Replicated validator ledger | Implemented | Hash-linked entries and quorum certificates |
 | Crash-safe settlement intents | Implemented | Recovery integration test |
+| Coordinator rebuild from the chain | Implemented | `rebuild` replays certified entries into an empty database; shard ids are derived, so a replacement finishes a half-done job without re-offering or re-paying a settled shard |
 | Client mirror and offline audit | Implemented | Validator quorum sync/audit commands |
 | Operator resource limits | Implemented | Persisted share of CPU/memory/GPU; advertised capacity is the share, not the machine |
 | Network coordinates | Implemented | Vivaldi fit from measured probes, persisted across restarts, advertised only once fitted |

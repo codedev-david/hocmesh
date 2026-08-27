@@ -50,6 +50,7 @@ Implemented architecture:
 - Offline audit from genesis.
 - Direct validator balance/head verification independent of the coordinator.
 - Crash-safe coordinator ledger intents with startup/manual recovery.
+- Coordinator rebuild from the chain, so a lost scheduling database is not a lost job.
 - Signed validator claim proofs for reservation/reward reconciliation.
 - Per-process ledger proposal serialization to reduce same-height races.
 - SQLite-backed network model registry.
@@ -679,6 +680,16 @@ hocmesh-coordinator recover --db hocmesh.db --validators validators.json
 
 Recovery asks independent validators for a signed quorum claim proof. If the claim is already certified, it finalizes local state. If it is not yet certified, it retries the **same persisted transaction** so existing validator vote locks remain compatible.
 
+# Rebuilding a lost coordinator
+
+`recover` assumes the coordinator's database survived. If it did not - the disk is gone, or the host is - a replacement can be rebuilt from the chain, because the coordinator caches scheduling state over facts the ledger already keeps:
+
+```bash
+hocmesh-coordinator rebuild --db new.db --validators validators.json
+```
+
+It verifies every certificate, refuses a gap in the sequence, follows membership changes forward, and turns each settled transaction back into job and shard rows. Shard ids are derived from the job id rather than remembered, so a replacement reconstructs the same ids the dead coordinator issued and finishes a half-done job without re-offering a settled shard. Balances are not replayed: in quorum mode the validators answer those. Running it twice is safe.
+
 # Validator recovery
 
 A validator that was offline can catch up from peers:
@@ -876,7 +887,7 @@ This repository intentionally documents the remaining work instead of disguising
 8. Key storage is file-based rather than OS hardware-backed.
 9. Installers are unsigned until platform signing identities are configured in the release environment.
 10. P2P model seeding uses authenticated HTTP peers; NAT traversal and peer discovery remain deployment concerns.
-11. Coordinator crash recovery for certified reservations/rewards is implemented through durable ledger intents and `hocmesh-coordinator recover`; a full multi-coordinator BFT view-change protocol remains a production blocker.
+11. Coordinator crash recovery is implemented through durable ledger intents and `hocmesh-coordinator recover`, and a coordinator whose database is lost entirely can be rebuilt from the chain with `hocmesh-coordinator rebuild`. Both are operator-initiated: automatic failover between competing coordinators, and a full multi-coordinator BFT view-change protocol, remain production blockers.
 
 These are specifically called out in `CODEX_HANDOFF.md` as next engineering targets.
 

@@ -64,6 +64,11 @@ The coordinator owns ephemeral scheduling state:
 
 In quorum mode it does **not** own authoritative CU state.
 
+Because all of it is derived from certified ledger entries, none of it is
+irreplaceable: `hocmesh-coordinator rebuild` reconstructs the whole table set
+from the chain, so a destroyed coordinator costs availability, not work and
+not CU. See `docs/CRASH_RECOVERY.md`.
+
 ## Validator responsibilities
 
 Validators own replicated accounting state:

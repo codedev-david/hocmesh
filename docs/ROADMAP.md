@@ -47,7 +47,7 @@
 ## Priority 2 — scheduler federation
 
 - Regional coordinators.
-- Coordinator health/failover.
+- Coordinator health/failover. Standing a replacement up from the chain works today (`hocmesh-coordinator rebuild`); what is missing is doing it automatically, without an operator having to notice the old one died.
 - Shared/federated job state.
 - Resource graph.
 - Scheduling by hardware, network, reliability, and cache locality.

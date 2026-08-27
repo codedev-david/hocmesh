@@ -46,6 +46,8 @@ Validators independently verify ledger transactions and keep separate replicas.
 
 A compromised coordinator can still attack availability and scheduling quality. Scheduler federation and signed scheduler assignments are future hardening work.
 
+Losing one, however, is survivable. Because the coordinator is a cache over facts the ledger already holds, `hocmesh-coordinator rebuild` replays certified entries into an empty database and stands a replacement up. Shard ids are derived from the job id rather than remembered, so the replacement reconstructs exactly the ids the dead coordinator issued, and the `reward:<assignment>` claim key means a rebuild that got its bookkeeping wrong would have the duplicate reward refused by the validators. The worst a bad rebuild costs is repeated compute. See `docs/CRASH_RECOVERY.md`.
+
 ## Validator compromise
 
 Security depends on threshold assumptions.

@@ -174,9 +174,9 @@ pub enum AuditClass {
 impl WorkSpec {
     /// What a validator can check about this workload on its own.
     ///
-    /// Both current workloads answer in a few dozen integers, so both are
-    /// self-contained. The match is exhaustive on purpose: adding a workload
-    /// forces the author to state which side of the line it falls on.
+    /// Every current workload answers in a few dozen integers, so all three
+    /// are self-contained. The match is exhaustive on purpose: adding a
+    /// workload forces the author to state which side of the line it falls on.
     pub fn audit_class(&self) -> AuditClass {
         match self {
             WorkSpec::PrimeCount { .. }
@@ -618,6 +618,16 @@ pub fn node_id_from_public_key(public_key: &[u8; 32]) -> String {
     let d = Sha256::digest(public_key);
     format!("hocmesh_{}", hex_lower(&d[..16]))
 }
+/// The node id behind a base64 public key, or `None` if it is not one.
+///
+/// Callers that hold a key as it appears on the wire or in ledger evidence
+/// should not have to know the encoding or repeat the length check.
+pub fn node_id_from_public_key_b64(public_key_b64: &str) -> Option<String> {
+    let raw = STANDARD_NO_PAD.decode(public_key_b64).ok()?;
+    let key: [u8; 32] = raw.try_into().ok()?;
+    Some(node_id_from_public_key(&key))
+}
+
 pub fn job_id_from_auth(proof: &AuthProof) -> String {
     format!("job_{}", &hash_bytes(proof.nonce_b64.as_bytes())[..32])
 }

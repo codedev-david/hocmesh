@@ -12,9 +12,9 @@ use hocmesh_ledger::{
 };
 use hocmesh_protocol::{
     BalanceResponse, ErrorResponse, JobStatusResponse, NodeCapabilities, PollRequest, PollResponse,
-    RegisterRequest, ResultRequest, SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkSpec,
-    empty_body_hash, job_id_from_auth, now_unix, register_body_hash, result_body_hash,
-    submit_body_hash,
+    RegisterRequest, ResultRequest, SubmitJobRequest, SubmitJobResponse, WorkAssignment,
+    WorkResult, WorkSpec, empty_body_hash, job_id_from_auth, now_unix, register_body_hash,
+    result_body_hash, submit_body_hash,
 };
 use reqwest::Client;
 use serde_json::json;
@@ -655,6 +655,243 @@ async fn coordinator_recovers_community_reservation_after_intent_persisted() -> 
     );
     complete_assignment(&http, &coordinator, &node, &assignment).await?;
     assert!(balance(&http, &coordinator, &node).await?.balance_mcu > 0);
+
+    drop(validators);
+    Ok(())
+}
+
+/// A coordinator is a cache, so losing one must not lose a job.
+///
+/// Every fact a scheduler needs is already on the chain: a reservation names
+/// the job, its spec and its shard count, and a reward names the shard it
+/// settled. What this proves is the part that matters for CU -- the shard
+/// that was already paid is never handed out a second time, and the job
+/// finishes on a database that was empty when the old coordinator died.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_coordinator_rebuilds_from_the_chain_and_finishes_the_job() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let coordinator_bin = bin_dir.join(exe("hocmesh-coordinator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = Client::new();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let (validators_path, validator_homes, validator_dbs, _set) =
+        create_validator_set(&tmp, &validator_bin, &validator_ports)?;
+
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    let original_db = tmp.path.join("coordinator-original.db");
+    let seed_job = "job_rebuild_seed";
+    let seed_sponsors = sponsors_file(
+        &tmp.path,
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        seed_job,
+        (2, 200000, 4),
+    )?;
+    run_ok(
+        Command::new(&coordinator_bin)
+            .arg("seed")
+            .arg("--job-id")
+            .arg(seed_job)
+            .arg("--sponsors")
+            .arg(&seed_sponsors)
+            .arg("--db")
+            .arg(&original_db)
+            .arg("--validators")
+            .arg(&validators_path)
+            .arg("--start")
+            .arg("2")
+            .arg("--end")
+            .arg("200000")
+            .arg("--shards")
+            .arg("4"),
+        "seed community work so the requester can pay",
+    )?;
+
+    let first_port = free_port()?;
+    let first = ProcessGuard::spawn(
+        Command::new(&coordinator_bin)
+            .arg("serve")
+            .arg("--db")
+            .arg(&original_db)
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{first_port}"))
+            .arg("--validators")
+            .arg(&validators_path),
+    )?;
+    wait_health(&http, first_port).await?;
+    let first_url = format!("http://127.0.0.1:{first_port}");
+
+    let requester = TestNode::new(&tmp.path.join("rebuild-requester"))?;
+    let worker = TestNode::new(&tmp.path.join("rebuild-worker"))?;
+    register(&http, &first_url, &requester).await?;
+    register(&http, &first_url, &worker).await?;
+
+    let community = poll_until_assignment(&http, &first_url, &requester, Some(seed_job)).await?;
+    complete_assignment(&http, &first_url, &requester, &community).await?;
+    let funded = balance(&http, &first_url, &requester).await?;
+    assert!(
+        funded.balance_mcu > 0,
+        "the requester has to earn before it can spend"
+    );
+
+    let work = WorkSpec::PrimeCount {
+        start: 2,
+        end: 20_000,
+    };
+    let paid = submit(&http, &first_url, &requester, work.clone(), 3).await?;
+    assert!(paid.reserved_mcu > 0);
+
+    let settled = complete_next_for_job(&http, &first_url, &worker, &paid.job_id)
+        .await?
+        .context("one shard should finish before the coordinator dies")?;
+    let paid_once = balance(&http, &first_url, &worker).await?.balance_mcu;
+    assert!(
+        paid_once > 0,
+        "the finished shard should have been rewarded"
+    );
+
+    // The coordinator dies with the job half done, and its database dies with
+    // it. Nothing below reads that file again.
+    drop(first);
+
+    let rebuilt_db = tmp.path.join("coordinator-rebuilt.db");
+    run_ok(
+        Command::new(&coordinator_bin)
+            .arg("rebuild")
+            .arg("--db")
+            .arg(&rebuilt_db)
+            .arg("--validators")
+            .arg(&validators_path),
+        "rebuild scheduling state from the chain",
+    )?;
+    run_ok(
+        Command::new(&coordinator_bin)
+            .arg("rebuild")
+            .arg("--db")
+            .arg(&rebuilt_db)
+            .arg("--validators")
+            .arg(&validators_path),
+        "repeat the rebuild idempotently",
+    )?;
+
+    let second_port = free_port()?;
+    let _second = ProcessGuard::spawn(
+        Command::new(&coordinator_bin)
+            .arg("serve")
+            .arg("--db")
+            .arg(&rebuilt_db)
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{second_port}"))
+            .arg("--validators")
+            .arg(&validators_path),
+    )?;
+    wait_health(&http, second_port).await?;
+    let second_url = format!("http://127.0.0.1:{second_port}");
+
+    // A rebuilt node row is a placeholder the scheduler ignores, so workers
+    // have to come back and say what they can actually do.
+    register(&http, &second_url, &requester).await?;
+    register(&http, &second_url, &worker).await?;
+
+    let recovered = job_status(&http, &second_url, &paid.job_id).await?;
+    assert_eq!(
+        recovered.requester_node_id.as_deref(),
+        Some(requester.identity.node_id().as_str())
+    );
+    assert!(!recovered.system_funded, "a paid job must not become free");
+    assert_eq!(recovered.reserved_mcu, paid.reserved_mcu);
+    assert_eq!(recovered.total_assignments, 3);
+    assert_eq!(
+        recovered.completed_assignments, 1,
+        "the replacement must already know one shard is settled"
+    );
+
+    // Re-delivering a shard the chain already paid for is refused, and refused
+    // on a database that never saw the original delivery: the rebuild carried
+    // the settled status forward, so the second claim has nothing to earn.
+    let replay_hash = result_body_hash(
+        &settled.assignment_id,
+        &settled.job_id,
+        settled.shard_index,
+        &settled.work,
+        settled.reward_mcu,
+        settled.system_funded,
+        &settled.result,
+    )?;
+    let replay = ResultRequest {
+        auth: worker.identity.auth("result", &replay_hash),
+        ..settled.clone()
+    };
+    let refused = post_result_raw(&http, &second_url, &replay).await;
+    assert!(
+        refused.is_err(),
+        "the replacement must refuse a shard the chain already settled"
+    );
+    assert_eq!(
+        balance(&http, &second_url, &worker).await?.balance_mcu,
+        paid_once,
+        "a rebuild must not let the same shard be paid twice"
+    );
+
+    let mut finished = vec![settled.shard_index];
+    for _ in 0..2 {
+        let next = complete_next_for_job(&http, &second_url, &worker, &paid.job_id)
+            .await?
+            .context("the replacement should hand out the shards nobody finished")?;
+        assert_ne!(
+            next.assignment_id, settled.assignment_id,
+            "a shard the chain already paid for must never be offered again"
+        );
+        finished.push(next.shard_index);
+    }
+    finished.sort_unstable();
+    assert_eq!(
+        finished,
+        vec![0, 1, 2],
+        "the rebuilt schedule should cover the job exactly once"
+    );
+
+    let done = job_status(&http, &second_url, &paid.job_id).await?;
+    assert_eq!(done.status, "completed");
+    assert_eq!(done.completed_assignments, 3);
+    let expected = match execute_work(&work) {
+        WorkResult::PrimeCount { count, .. } => count,
+        other => bail!("prime work returned {other:?}"),
+    };
+    assert_eq!(
+        done.prime_count_total,
+        Some(expected),
+        "a job finished across two coordinators must still be the right answer"
+    );
+
+    // The chain, not the coordinator, is where payment lives: the worker was
+    // paid once for the shard it finished before the crash and twice more
+    // after, and no rebuild added a fourth.
+    let ledger_paid = balance(&http, &second_url, &worker).await?.balance_mcu;
+    assert!(
+        ledger_paid > paid_once,
+        "the shards finished after the rebuild should have been paid"
+    );
 
     drop(validators);
     Ok(())
