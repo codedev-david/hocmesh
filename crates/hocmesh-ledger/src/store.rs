@@ -8,6 +8,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use hocmesh_protocol::{InferenceBilling, PricedBatch};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct LedgerStore {
@@ -24,12 +25,17 @@ type InferenceRecord = (InferenceBilling, Vec<PricedBatch>, String, i64);
 /// Balances and settled claims are the obvious part; the open reservations
 /// matter just as much, because a reward or a refund is only valid against
 /// the reservation it draws on.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LedgerState {
     pub balances: BTreeMap<String, i64>,
     pub claims: BTreeSet<String>,
     pub reservations: BTreeMap<String, ReservationRecord>,
     pub inference: BTreeMap<String, InferenceRecord>,
+    /// Lifetime earned and spent, per account, which validators compare when
+    /// they answer a balance query. It lives in the state because two nodes
+    /// that agree on every balance can still disagree here — a node that
+    /// started from a snapshot has no postings below it to add up.
+    pub activity: BTreeMap<String, (i64, i64)>,
 }
 
 impl LedgerState {
@@ -51,13 +57,60 @@ impl LedgerState {
             .iter()
             .map(|(k, v)| Ok((k, serde_json::to_string(v)?)))
             .collect::<Result<Vec<_>>>()?;
+        let activity: Vec<(&String, &(i64, i64))> = self
+            .activity
+            .iter()
+            .filter(|(_, (e, s))| *e != 0 || *s != 0)
+            .collect();
         Ok(hocmesh_protocol::hash_json(&(
-            "hocmesh-state-v1",
+            "hocmesh-state-v2",
             &balances,
             &self.claims,
             &reservations,
             &inference,
+            &activity,
         ))?)
+    }
+}
+
+/// A ledger a newcomer can adopt without replaying the chain that produced it.
+///
+/// Nothing in the file is taken on trust. The certificate proves the head
+/// entry was agreed; the checkpoint proves a quorum signed that head together
+/// with a hash of the state it left behind; and the state has to hash to
+/// exactly that. A file failing any of the three is refused, which is what
+/// lets one travel by any route at all — a web server, a mirror, a USB stick
+/// — without the route having to be trusted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerSnapshot {
+    /// The entry the state stops at, so a bootstrapped store has a head to
+    /// extend and peers have something to chain their next entry onto.
+    pub certificate: QuorumCertificate,
+    pub checkpoint: LedgerCheckpoint,
+    pub state: LedgerState,
+}
+impl LedgerSnapshot {
+    /// Checks the file against a validator set the reader already trusts.
+    ///
+    /// The set is supplied by the operator, not read out of the snapshot: a
+    /// file that carried its own list of who to believe would prove nothing.
+    pub fn verify(&self, set: &ValidatorSet) -> Result<()> {
+        verify_certificate(&self.certificate, set)?;
+        verify_checkpoint(&self.checkpoint, set)?;
+        let entry = &self.certificate.entry;
+        if entry.sequence != self.checkpoint.head.sequence
+            || entry.entry_hash != self.checkpoint.head.entry_hash
+        {
+            bail!("snapshot certificate is for a different entry than its checkpoint")
+        }
+        let hash = self.state.digest()?;
+        if hash != self.checkpoint.state_hash {
+            bail!(
+                "snapshot state hashes to {hash}, but the quorum signed {}",
+                self.checkpoint.state_hash
+            )
+        }
+        Ok(())
     }
 }
 
@@ -87,6 +140,11 @@ impl LedgerStore {
             CREATE TABLE IF NOT EXISTS claims(
                 claim_key TEXT PRIMARY KEY,
                 sequence INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS activity_baseline(
+                account_id TEXT PRIMARY KEY,
+                earned_mcu INTEGER NOT NULL,
+                spent_mcu INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS checkpoints(
                 sequence INTEGER PRIMARY KEY,
@@ -366,14 +424,28 @@ impl LedgerStore {
             .transpose()
     }
     pub fn activity(&self, a: &str) -> Result<(i64, i64)> {
-        let (earned, spent) = self.conn.query_row(
+        let (earned, spent): (i64, i64) = self.conn.query_row(
             "SELECT COALESCE(SUM(CASE WHEN delta_mcu > 0 THEN delta_mcu ELSE 0 END),0),
                     COALESCE(SUM(CASE WHEN delta_mcu < 0 THEN -delta_mcu ELSE 0 END),0)
              FROM account_activity WHERE account_id=?1",
             params![a],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        Ok((earned, spent))
+        let (base_e, base_s) = self.activity_baseline(a)?;
+        Ok((earned + base_e, spent + base_s))
+    }
+    /// What a snapshot carried in for this account before the first posting
+    /// this store holds. Zero for anyone who replayed the chain from genesis.
+    fn activity_baseline(&self, a: &str) -> Result<(i64, i64)> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT earned_mcu,spent_mcu FROM activity_baseline WHERE account_id=?1",
+                params![a],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0, 0)))
     }
     pub fn balance(&self, a: &str) -> Result<i64> {
         Ok(self
@@ -621,6 +693,41 @@ impl LedgerStore {
                 ),
             );
         }
+        let mut q = self.conn.prepare(
+            "SELECT account_id,
+                    COALESCE(SUM(CASE WHEN delta_mcu>0 THEN delta_mcu ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN delta_mcu<0 THEN -delta_mcu ELSE 0 END),0)
+             FROM account_activity GROUP BY account_id",
+        )?;
+        for row in q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (a, e, s) = row?;
+            state.activity.insert(a, (e, s));
+        }
+        // Whatever a snapshot handed over sits underneath the postings this
+        // store actually holds, so it has to be added in here too or a
+        // bootstrapped node would disagree with its peers about the same
+        // account and split every balance quorum it took part in.
+        let mut q = self
+            .conn
+            .prepare("SELECT account_id,earned_mcu,spent_mcu FROM activity_baseline")?;
+        for row in q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (a, e, s) = row?;
+            let slot = state.activity.entry(a).or_default();
+            slot.0 += e;
+            slot.1 += s;
+        }
         Ok(state)
     }
     /// The state as it stood at `sequence`, undone from the state held now.
@@ -635,6 +742,12 @@ impl LedgerStore {
                 state.claims.remove(&claim_key(t));
                 for p in &t.postings {
                     *state.balances.entry(p.account_id.clone()).or_default() -= p.delta_mcu;
+                    let a = state.activity.entry(p.account_id.clone()).or_default();
+                    if p.delta_mcu > 0 {
+                        a.0 -= p.delta_mcu;
+                    } else {
+                        a.1 += p.delta_mcu;
+                    }
                 }
             }
         }
@@ -685,6 +798,113 @@ impl LedgerStore {
             )
             .optional()?;
         json.map(|j| Ok(serde_json::from_str(&j)?)).transpose()
+    }
+    /// Packages the highest checkpoint this store holds, with the state it
+    /// vouches for, into something another operator can start from.
+    ///
+    /// The state is rewound to the checkpoint rather than taken as it stands,
+    /// so a store that has kept running past its last checkpoint still exports
+    /// exactly what the quorum put its name to and nothing after it.
+    pub fn snapshot(&self, set: &ValidatorSet) -> Result<LedgerSnapshot> {
+        let Some(checkpoint) = self.latest_checkpoint()? else {
+            bail!("no checkpoint to build a snapshot from")
+        };
+        let Some(certificate) = self.certificate_at(checkpoint.head.sequence)? else {
+            bail!(
+                "the certificate for checkpoint height {} is not held here",
+                checkpoint.head.sequence
+            )
+        };
+        let state = self.rewind_to(checkpoint.head.sequence)?;
+        let snapshot = LedgerSnapshot {
+            certificate,
+            checkpoint,
+            state,
+        };
+        // Refusing to hand out a file that would not survive being read is
+        // cheaper than every reader discovering it separately.
+        snapshot.verify(set)?;
+        Ok(snapshot)
+    }
+    /// Adopts a verified snapshot into a store that has no chain of its own.
+    ///
+    /// This is deliberately not a merge. A store that already holds entries
+    /// has its own head and its own history, and quietly replacing either
+    /// would turn a bootstrap tool into a way of rewriting a ledger, so it is
+    /// refused instead.
+    pub fn install_snapshot(&mut self, snap: &LedgerSnapshot, set: &ValidatorSet) -> Result<()> {
+        snap.verify(set)?;
+        let held = self.head(set)?;
+        if held.sequence != 0 {
+            bail!(
+                "this store already holds a chain up to height {}; a snapshot is for a store with none",
+                held.sequence
+            )
+        }
+        let at = sqlite_sequence(snap.checkpoint.head.sequence)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO certificates(sequence,entry_hash,certificate_json) VALUES(?1,?2,?3)",
+            params![
+                at,
+                snap.certificate.entry.entry_hash,
+                serde_json::to_string(&snap.certificate)?
+            ],
+        )?;
+        for (account, balance) in &snap.state.balances {
+            tx.execute(
+                "INSERT OR REPLACE INTO balances(account_id,balance_mcu) VALUES(?1,?2)",
+                params![account, balance],
+            )?;
+        }
+        for claim in &snap.state.claims {
+            tx.execute(
+                "INSERT OR REPLACE INTO claims(claim_key,sequence) VALUES(?1,?2)",
+                params![claim, at],
+            )?;
+        }
+        for (account, (earned, spent)) in &snap.state.activity {
+            tx.execute(
+                "INSERT OR REPLACE INTO activity_baseline(account_id,earned_mcu,spent_mcu)
+                 VALUES(?1,?2,?3)",
+                params![account, earned, spent],
+            )?;
+        }
+        for (job, (work, shards, funded, requester, at_ms)) in &snap.state.reservations {
+            tx.execute(
+                "INSERT OR REPLACE INTO job_reservations(job_id,sequence,work_json,shards,system_funded,requester_node_id,reserved_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    job,
+                    at,
+                    serde_json::to_string(work)?,
+                    shards,
+                    *funded as i64,
+                    requester,
+                    at_ms
+                ],
+            )?;
+        }
+        for (job, (billing, batches, requester, at_ms)) in &snap.state.inference {
+            tx.execute(
+                "INSERT OR REPLACE INTO inference_reservations(job_id,sequence,billing_json,batches_json,requester_node_id,reserved_at)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    job,
+                    at,
+                    serde_json::to_string(billing)?,
+                    serde_json::to_string(batches)?,
+                    requester,
+                    at_ms
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO checkpoints(sequence,checkpoint_json) VALUES(?1,?2)",
+            params![at, serde_json::to_string(&snap.checkpoint)?],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
     /// Discards the certificates a checkpoint has made unnecessary.
     ///
@@ -754,6 +974,7 @@ impl LedgerStore {
             claims,
             reservations,
             inference,
+            activity,
         } = &mut state;
         let mut active = set.clone();
         for c in certs {
@@ -1011,6 +1232,15 @@ impl LedgerStore {
                         )
                     };
                     balances.insert(p.account_id.clone(), next);
+                    // Lifetime totals are part of the signed state, so an
+                    // audit has to carry them forward with the balances or it
+                    // would land on a different hash than the store it checks.
+                    let seen = activity.entry(p.account_id.clone()).or_default();
+                    if p.delta_mcu > 0 {
+                        seen.0 += p.delta_mcu;
+                    } else {
+                        seen.1 -= p.delta_mcu;
+                    }
                 }
             }
             seq = c.entry.sequence;

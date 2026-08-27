@@ -12,6 +12,7 @@
 | Crash-safe settlement intents | Implemented | Recovery integration test |
 | Coordinator rebuild from the chain | Implemented | `rebuild` replays certified entries into an empty database; shard ids are derived, so a replacement finishes a half-done job without re-offering or re-paying a settled shard |
 | Client mirror and offline audit | Implemented | Validator quorum sync/audit commands |
+| Snapshot bootstrap and out-of-band checkpoints | Implemented | `snapshot`/`ledger-restore` write and adopt a quorum-signed state file; it is refused unless certificate, checkpoint and state hash all agree against the operator's own validator set, and refused again over a store that already holds a chain |
 | Operator resource limits | Implemented | Persisted share of CPU/memory/GPU; advertised capacity is the share, not the machine |
 | Network coordinates | Implemented | Vivaldi fit from measured probes, persisted across restarts, advertised only once fitted |
 | Contested-height recovery | Implemented | Ballot-ordered proposals: any client can take a height, and one that finds an entry already half-signed there is obliged to finish it |

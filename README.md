@@ -48,6 +48,7 @@ Implemented architecture:
 - Validator catch-up/synchronization.
 - Ordinary client full-ledger mirroring.
 - Offline audit from genesis.
+- Quorum-signed portable snapshots, so a new replica adopts a verified state and syncs from there rather than replaying the chain from genesis.
 - Direct validator balance/head verification independent of the coordinator.
 - Crash-safe coordinator ledger intents with startup/manual recovery.
 - Coordinator rebuild from the chain, so a lost scheduling database is not a lost job.
@@ -641,6 +642,22 @@ hocmesh --home .hocmesh-a ledger-sync \
   --validators validators.json \
   --db .hocmesh-a/ledger-mirror.db
 ```
+
+Or start from a snapshot instead, so a new mirror does not replay the whole
+chain to get to today:
+
+```bash
+hocmesh --home .hocmesh-a ledger-restore \
+  --validators validators.json \
+  --db .hocmesh-a/ledger-mirror.db \
+  --snapshot ledger-snapshot.json
+```
+
+A validator produces that file with `hocmesh-validator snapshot`. Nothing in
+it is trusted: it is refused unless the certificate and the checkpoint both
+carry a quorum from `validators.json`, name the same entry, and the state
+inside hashes to the digest that quorum signed. So it can be published
+anywhere, and a restore over a store that already holds a chain is refused.
 
 Audit it later without trusting the coordinator:
 

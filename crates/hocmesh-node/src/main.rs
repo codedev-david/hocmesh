@@ -10,7 +10,7 @@ use hocmesh_core::{hardware, identity::NodeIdentity, limits::ResourceLimits, pro
 use hocmesh_gpu::{InferenceBackend, InferenceRequest, LlamaCppBackend};
 use hocmesh_ledger::{
     network::LedgerNetwork,
-    store::LedgerStore,
+    store::{LedgerSnapshot, LedgerStore},
     types::{
         LedgerTransaction, MembershipAction, MembershipChangeEvidence, TransactionEvidence,
         TransactionKind, ValidatorMember, ValidatorSet, ValidatorSignature,
@@ -256,6 +256,25 @@ enum Command {
         validators: String,
         #[arg(long, default_value = ".hocmesh/ledger-mirror.db")]
         db: String,
+    },
+    /// Write the newest stored checkpoint, and the state it vouches for, to a
+    /// file another operator can start a node from.
+    LedgerSnapshot {
+        #[arg(long)]
+        validators: String,
+        #[arg(long, default_value = ".hocmesh/ledger-mirror.db")]
+        db: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Start an empty mirror from a snapshot rather than from genesis.
+    LedgerRestore {
+        #[arg(long)]
+        validators: String,
+        #[arg(long, default_value = ".hocmesh/ledger-mirror.db")]
+        db: String,
+        #[arg(long)]
+        snapshot: PathBuf,
     },
     /// Sign a sponsorship for a community-funded job.
     ///
@@ -917,7 +936,17 @@ stored at: {}",
                 net.refresh_set().await?;
                 let remote = net.head_quorum().await?;
                 if local.sequence >= remote.sequence {
-                    let audited = store.audit(&load_set(&validators)?)?;
+                    // A mirror that was pruned, or that started from a
+                    // snapshot, holds no history below its checkpoint, so
+                    // demanding a genesis replay here would make sync
+                    // impossible for the very nodes bootstrap exists for.
+                    let from = store.latest_checkpoint()?;
+                    let genesis = load_set(&validators)?;
+                    let audit_set = match &from {
+                        Some(cp) => store.set_at(cp.head.sequence)?.unwrap_or(genesis),
+                        None => genesis,
+                    };
+                    let audited = store.audit_from(&audit_set, from.as_ref())?;
                     println!(
                         "Ledger mirror synchronized and audited: height={} head={}",
                         audited.sequence, audited.entry_hash
@@ -986,6 +1015,41 @@ stored at: {}",
             let set = store.current_set()?.unwrap_or(load_set(&validators)?);
             let removed = store.prune_below_checkpoint(&set)?;
             println!("PRUNED {removed} certificates already covered by a checkpoint");
+        }
+        Command::LedgerSnapshot {
+            validators,
+            db,
+            out,
+        } => {
+            let store = LedgerStore::open(&db)?;
+            let set = store.current_set()?.unwrap_or(load_set(&validators)?);
+            let snap = store.snapshot(&set)?;
+            fs::write(&out, serde_json::to_string_pretty(&snap)?)?;
+            println!(
+                "SNAPSHOT WRITTEN: {} height={} state={} accounts={}",
+                out.display(),
+                snap.checkpoint.head.sequence,
+                snap.checkpoint.state_hash,
+                snap.state.balances.len()
+            );
+        }
+        Command::LedgerRestore {
+            validators,
+            db,
+            snapshot,
+        } => {
+            let set = load_set(&validators)?;
+            let snap: LedgerSnapshot = serde_json::from_str(
+                &fs::read_to_string(&snapshot)
+                    .with_context(|| format!("reading {}", snapshot.display()))?,
+            )?;
+            let mut store = LedgerStore::open(&db)?;
+            store.install_snapshot(&snap, &set)?;
+            let head = store.audit_from(&set, Some(&snap.checkpoint))?;
+            println!(
+                "RESTORED: height={} head={} — sync from here rather than genesis",
+                head.sequence, head.entry_hash
+            );
         }
         Command::CommunityVouch {
             validators,

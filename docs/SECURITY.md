@@ -139,6 +139,12 @@ resuming from a checkpoint asks the store for `set_at(checkpoint_height)`,
 because a checkpoint has to be verified against the seats that signed it rather
 than whoever holds them today.
 
+A snapshot is verified against the set the reading operator already holds, not
+one carried inside the file. It has to prove three things at once: the head
+certificate carries a quorum, the checkpoint carries a quorum over that same
+head, and the state hashes to the digest that quorum signed. Failing any of
+them the file is refused, so the route it travelled never has to be trusted.
+
 ## Double-vote protection
 
 Validators persist a ballot lock before signing a ledger entry, and it survives restart.

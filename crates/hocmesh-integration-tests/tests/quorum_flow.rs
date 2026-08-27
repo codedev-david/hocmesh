@@ -551,6 +551,73 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
         "a pruned ledger must refuse to claim it audited from genesis"
     );
 
+    // And the checkpoint has to be portable, because the reason to have one is
+    // that somebody else can start from it. Write it out, hand the file to an
+    // empty database, and that database has to end up somewhere it could never
+    // have reached on its own: this mirror no longer holds the history below
+    // the checkpoint, so nothing here could have replayed it.
+    let snapshot = tmp.path.join("ledger-snapshot.json");
+    run_ok(
+        Command::new(&node_bin)
+            .arg("ledger-snapshot")
+            .arg("--db")
+            .arg(&mirror)
+            .arg("--validators")
+            .arg(&validators_path)
+            .arg("--out")
+            .arg(&snapshot),
+        "write a snapshot of the checkpointed ledger",
+    )?;
+
+    let newcomer = tmp.path.join("newcomer.db");
+    let newcomer = newcomer.to_string_lossy().to_string();
+    run_ok(
+        Command::new(&node_bin)
+            .arg("ledger-restore")
+            .arg("--db")
+            .arg(&newcomer)
+            .arg("--validators")
+            .arg(&validators_path)
+            .arg("--snapshot")
+            .arg(&snapshot),
+        "start an empty ledger from the snapshot",
+    )?;
+
+    for (cmd, label) in [
+        ("ledger-sync", "catch the newcomer up from the checkpoint"),
+        ("ledger-audit", "audit the newcomer from its checkpoint"),
+    ] {
+        run_ok(
+            Command::new(&node_bin)
+                .arg(cmd)
+                .arg("--db")
+                .arg(&newcomer)
+                .arg("--validators")
+                .arg(&validators_path),
+            label,
+        )?;
+    }
+
+    // A restore is for a database with nothing in it. Pointed at one that is
+    // already carrying a ledger it has to refuse, or the same command that
+    // bootstraps a newcomer would also be the one that rewrites an operator's
+    // history out from under them.
+    assert!(
+        run_ok(
+            Command::new(&node_bin)
+                .arg("ledger-restore")
+                .arg("--db")
+                .arg(&newcomer)
+                .arg("--validators")
+                .arg(&validators_path)
+                .arg("--snapshot")
+                .arg(&snapshot),
+            "restore over a populated ledger",
+        )
+        .is_err(),
+        "a ledger that already had a chain was overwritten by a snapshot"
+    );
+
     Ok(())
 }
 

@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use hocmesh_core::identity::NodeIdentity;
 use hocmesh_ledger::{
     network::LedgerNetwork,
-    store::LedgerStore,
+    store::{LedgerSnapshot, LedgerStore},
     types::*,
     validate::{
         build_entry, checkpoint_signing_message, claim_key, ledger_entry_signing_message,
@@ -62,6 +62,38 @@ enum Cmd {
         validators: String,
         #[arg(long, default_value_t = 500)]
         batch: u64,
+    },
+    /// Ask the sitting set for a signed statement of the whole state and keep
+    /// it, so audits and snapshots have a starting point later.
+    Checkpoint {
+        #[arg(long, default_value = "validator.db")]
+        db: String,
+        #[arg(long)]
+        validators: String,
+    },
+    /// Writes the latest checkpoint and the state it vouches for to a file.
+    ///
+    /// The file is self-checking against the validator set, so it can be
+    /// published anywhere without the route being part of the trust.
+    Snapshot {
+        #[arg(long, default_value = "validator.db")]
+        db: String,
+        #[arg(long)]
+        validators: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Starts a fresh database from a snapshot instead of from genesis.
+    ///
+    /// `sync` then has only the entries above the checkpoint left to fetch,
+    /// which is what keeps joining a long-running network affordable.
+    Restore {
+        #[arg(long, default_value = "validator.db")]
+        db: String,
+        #[arg(long)]
+        validators: String,
+        #[arg(long)]
+        snapshot: PathBuf,
     },
 }
 #[derive(Clone)]
@@ -118,6 +150,63 @@ async fn main() -> Result<()> {
             validators,
             batch,
         } => sync(&db, &validators, batch).await,
+        Cmd::Checkpoint { db, validators } => {
+            let net = LedgerNetwork::new(load_set(&validators)?)?;
+            // Against the set that is sitting now, not the one in the file:
+            // a checkpoint signed by yesterday's membership proves nothing.
+            net.refresh_set().await?;
+            let store = LedgerStore::open(&db)?;
+            let cp = net.checkpoint_quorum().await?;
+            store.store_checkpoint(&cp, &net.set())?;
+            println!(
+                "CHECKPOINT OK height={} head={} state={} signatures={}",
+                cp.head.sequence,
+                cp.head.entry_hash,
+                cp.state_hash,
+                cp.signatures.len()
+            );
+            Ok(())
+        }
+        Cmd::Snapshot {
+            db,
+            validators,
+            out,
+        } => {
+            let set = load_set(&validators)?;
+            let store = LedgerStore::open(&db)?;
+            let snap = store.snapshot(&set)?;
+            fs::write(&out, serde_json::to_string_pretty(&snap)?)?;
+            println!(
+                "SNAPSHOT OK height={} head={} state={} accounts={}",
+                snap.checkpoint.head.sequence,
+                snap.checkpoint.head.entry_hash,
+                snap.checkpoint.state_hash,
+                snap.state.balances.len()
+            );
+            Ok(())
+        }
+        Cmd::Restore {
+            db,
+            validators,
+            snapshot,
+        } => {
+            let set = load_set(&validators)?;
+            let snap: LedgerSnapshot = serde_json::from_str(
+                &fs::read_to_string(&snapshot)
+                    .with_context(|| format!("reading {}", snapshot.display()))?,
+            )?;
+            let mut store = LedgerStore::open(&db)?;
+            store.install_snapshot(&snap, &set)?;
+            // Proving it lands where the signatures say costs one audit of
+            // nothing, and it is the difference between a restore that worked
+            // and a restore that only appeared to.
+            let head = store.audit_from(&set, Some(&snap.checkpoint))?;
+            println!(
+                "RESTORE OK height={} head={}",
+                head.sequence, head.entry_hash
+            );
+            Ok(())
+        }
     }
 }
 fn load_set(path: &str) -> Result<ValidatorSet> {

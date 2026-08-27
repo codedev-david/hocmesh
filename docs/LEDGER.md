@@ -339,6 +339,43 @@ height it is really at, and it keeps `account_activity`: earned and spent
 totals are part of the balance proofs validators have to agree on, and a node
 whose totals had been reset would disagree with every node that had not pruned.
 
+## Bootstrapping from a snapshot
+
+A checkpoint saves an existing replica work. It does nothing for a machine
+joining for the first time, which still has to fetch and replay every entry
+ever written. A snapshot is that checkpoint made portable:
+
+```bash
+hocmesh-validator snapshot --db ledger.db \
+  --validators validators.json --out ledger-snapshot.json
+hocmesh ledger-restore --validators validators.json \
+  --db .hocmesh/ledger-mirror.db --snapshot ledger-snapshot.json
+```
+
+The file holds three things: the certificate for the head entry, the
+checkpoint a quorum signed over that head, and the state itself. Reading one
+checks all three against a validator set the operator already trusts — the
+certificate has to carry a quorum, the checkpoint has to carry a quorum, the
+two have to name the same entry, and the state has to hash to exactly the
+digest the quorum signed. A file failing any of those is refused.
+
+The set is supplied by the operator and never read out of the file: a snapshot
+that carried its own list of who to believe would prove nothing. That is what
+makes the route irrelevant. The file can arrive over a web server, a mirror,
+or a USB stick, because a forged one is caught by the reader rather than by
+whoever handed it over.
+
+A restore refuses a store that already holds a chain, so a snapshot can never
+be used to overwrite history a node had already verified for itself. From
+there `ledger-sync` carries on from the snapshot's height rather than from
+genesis, and `ledger-audit` resumes from the checkpoint it arrived with.
+
+Snapshot state commits to lifetime earned and spent as well as to balances,
+because those totals are part of what validators compare when they answer a
+balance query. A restored node carries them in as a baseline underneath the
+postings it later collects, so it agrees with a node that replayed everything
+instead of splitting the quorum on every account it is asked about.
+
 ## What makes history difficult to fake
 
 An attacker attempting to rewrite history must contend with:

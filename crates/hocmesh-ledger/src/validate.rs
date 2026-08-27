@@ -3983,4 +3983,242 @@ mod tests {
         );
         assert_eq!(store.balance(&escrow_account("job-forged")).unwrap(), 0);
     }
+
+    /// Builds a checkpoint over a store's real head and real state, which is
+    /// what a quorum would have signed had it been asked at that moment.
+    fn checkpoint_over(
+        validators: &TestValidatorSet,
+        store: &crate::store::LedgerStore,
+    ) -> LedgerCheckpoint {
+        let head = store.head(&validators.set).unwrap();
+        let state_hash = store.state().unwrap().digest().unwrap();
+        let message = checkpoint_signing_message(
+            &head.membership_hash,
+            head.sequence,
+            &head.entry_hash,
+            &state_hash,
+        );
+        LedgerCheckpoint {
+            head,
+            state_hash,
+            signatures: validators
+                .identities
+                .iter()
+                .map(|i| ValidatorSignature {
+                    validator_id: i.node_id(),
+                    signature_b64: i.sign_bytes_b64(message.as_bytes()),
+                })
+                .collect(),
+        }
+    }
+
+    /// A chain with money in it: each round mints into escrow and then pays a
+    /// provider out of it, so balances, claims and lifetime totals are all
+    /// non-trivial by the end.
+    fn funded_chain(validators: &TestValidatorSet, rounds: u64) -> Vec<QuorumCertificate> {
+        let provider = test_identity("snapshot-provider");
+        let work = WorkSpec::PrimeCount { start: 2, end: 20 };
+        let mut certs = Vec::new();
+        let mut previous = "GENESIS".to_string();
+        for round in 0..rounds {
+            let job = format!("job-snapshot-{round}");
+            let reserve = certified_community_reserve(validators, &job, 2 * round + 1, &previous);
+            previous = reserve.entry.entry_hash.clone();
+            certs.push(reserve);
+            let reward = signed_reward(&job, 0, &provider, &work, true);
+            let pay = certify(validators, reward, 2 * round + 2, &previous);
+            previous = pay.entry.entry_hash.clone();
+            certs.push(pay);
+        }
+        certs
+    }
+
+    /// The point of the whole exercise: a node that never saw the history is
+    /// afterwards indistinguishable from one that replayed all of it, on
+    /// every value the quorum protocol compares between peers.
+    #[test]
+    fn a_restored_node_matches_one_that_replayed_the_whole_chain() {
+        use crate::store::LedgerStore;
+        let validators = validator_set("snapshot-roundtrip");
+        let certs = funded_chain(&validators, 6);
+        let mut origin = LedgerStore::open(":memory:").unwrap();
+        for cert in &certs {
+            origin.apply(cert, &validators.set).unwrap();
+        }
+        let cp = checkpoint_over(&validators, &origin);
+        origin.store_checkpoint(&cp, &validators.set).unwrap();
+        let snap = origin.snapshot(&validators.set).unwrap();
+        // Through a file, because that is how one actually travels.
+        let wire = serde_json::to_string(&snap).unwrap();
+        let arrived: crate::store::LedgerSnapshot = serde_json::from_str(&wire).unwrap();
+        let mut restored = LedgerStore::open(":memory:").unwrap();
+        restored
+            .install_snapshot(&arrived, &validators.set)
+            .unwrap();
+        assert_eq!(
+            restored.head(&validators.set).unwrap().entry_hash,
+            origin.head(&validators.set).unwrap().entry_hash,
+            "a restored node has to be able to extend the same head"
+        );
+        assert_eq!(
+            restored.state().unwrap().digest().unwrap(),
+            origin.state().unwrap().digest().unwrap(),
+            "the restored state must hash to what the quorum signed"
+        );
+        let accounts = origin.state().unwrap().balances;
+        assert!(
+            accounts.len() > 2,
+            "a chain this short should still have touched several accounts"
+        );
+        let mut moved = false;
+        for account in accounts.keys() {
+            assert_eq!(
+                restored.balance(account).unwrap(),
+                origin.balance(account).unwrap(),
+                "{account} came out of the snapshot with the wrong balance"
+            );
+            // Lifetime totals are compared between validators when they answer
+            // a balance query, so a restored node that got these wrong would
+            // split the quorum on every account it was asked about.
+            let (e, s) = origin.activity(account).unwrap();
+            assert_eq!(
+                restored.activity(account).unwrap(),
+                (e, s),
+                "{account} lost its earned/spent history in the snapshot"
+            );
+            moved |= e != 0 || s != 0;
+        }
+        assert!(
+            moved,
+            "no account earned or spent anything, so this proved nothing"
+        );
+    }
+
+    /// A bootstrap is only useful if the node can carry on from it, so the
+    /// restored store has to accept the entries the snapshot stopped short of
+    /// and end up holding exactly what the full replayer holds.
+    #[test]
+    fn a_restored_node_keeps_syncing_from_where_the_snapshot_stopped() {
+        use crate::store::LedgerStore;
+        let validators = validator_set("snapshot-forward");
+        let certs = funded_chain(&validators, 8);
+        let cut = 6;
+        // The snapshot is taken part-way, so there is real history left over
+        // for the restored node to catch up on.
+        let mut early = LedgerStore::open(":memory:").unwrap();
+        for cert in certs.iter().take(cut) {
+            early.apply(cert, &validators.set).unwrap();
+        }
+        let cp = checkpoint_over(&validators, &early);
+        early.store_checkpoint(&cp, &validators.set).unwrap();
+        let snap = early.snapshot(&validators.set).unwrap();
+        let mut restored = LedgerStore::open(":memory:").unwrap();
+        restored.install_snapshot(&snap, &validators.set).unwrap();
+        for cert in certs.iter().skip(cut) {
+            restored.apply(cert, &validators.set).unwrap();
+        }
+        let mut full = LedgerStore::open(":memory:").unwrap();
+        for cert in &certs {
+            full.apply(cert, &validators.set).unwrap();
+        }
+        assert_eq!(
+            restored.state().unwrap().digest().unwrap(),
+            full.state().unwrap().digest().unwrap(),
+            "catching up from a snapshot has to land on the same state"
+        );
+        assert_eq!(
+            restored.head(&validators.set).unwrap().sequence,
+            full.head(&validators.set).unwrap().sequence
+        );
+        // Replaying what it already carried in must still be refused: the
+        // snapshot brought the claim keys with it, not just the balances.
+        for cert in certs.iter().take(cut) {
+            assert!(
+                restored.apply(cert, &validators.set).is_err(),
+                "sequence {} settled twice after a restore",
+                cert.entry.sequence
+            );
+        }
+    }
+
+    /// A snapshot travels by whatever route is convenient, so the route gets
+    /// no say in what is believed. Everything below is a way of arriving with
+    /// a file that is not what the quorum signed.
+    #[test]
+    fn a_snapshot_that_was_not_signed_as_it_stands_is_refused() {
+        use crate::store::LedgerStore;
+        let validators = validator_set("snapshot-tamper");
+        let certs = funded_chain(&validators, 4);
+        let mut origin = LedgerStore::open(":memory:").unwrap();
+        for cert in &certs {
+            origin.apply(cert, &validators.set).unwrap();
+        }
+        let cp = checkpoint_over(&validators, &origin);
+        origin.store_checkpoint(&cp, &validators.set).unwrap();
+        let honest = origin.snapshot(&validators.set).unwrap();
+        assert!(honest.verify(&validators.set).is_ok());
+
+        // Somebody pays themselves on the way over.
+        let mut enriched = honest.clone();
+        *enriched
+            .state
+            .balances
+            .entry("node_thief".into())
+            .or_default() += 1_000_000;
+        assert!(enriched.verify(&validators.set).is_err());
+
+        // Or inflates what an account is owed for, which is not a balance and
+        // so would be missed by anything that only hashed the balances.
+        let mut boasted = honest.clone();
+        let who = honest.state.balances.keys().next().unwrap().clone();
+        boasted.state.activity.entry(who).or_default().0 += 5;
+        assert!(boasted.verify(&validators.set).is_err());
+
+        // Or claims a state the quorum never put its name to.
+        let mut relabelled = honest.clone();
+        relabelled.checkpoint.state_hash = "some-other-state".into();
+        assert!(relabelled.verify(&validators.set).is_err());
+
+        // Or drops signatures until it can sign the rest itself.
+        let mut thin = honest.clone();
+        thin.checkpoint.signatures.truncate(1);
+        assert!(thin.verify(&validators.set).is_err());
+
+        // Or swaps in a certificate for some other height, so a reader who
+        // only checked the checkpoint would take the wrong head.
+        let mut mismatched = honest.clone();
+        mismatched.certificate = certs[0].clone();
+        assert!(mismatched.verify(&validators.set).is_err());
+
+        // And a quorum of strangers signing a perfectly consistent file still
+        // proves nothing to somebody who never agreed to listen to them.
+        let strangers = validator_set("snapshot-strangers");
+        assert!(honest.verify(&strangers.set).is_err());
+    }
+
+    /// Bootstrapping a fresh node and rewriting a running one look the same
+    /// from the outside, so the store refuses the second outright.
+    #[test]
+    fn a_snapshot_cannot_be_installed_over_a_store_that_has_a_chain() {
+        use crate::store::LedgerStore;
+        let validators = validator_set("snapshot-overwrite");
+        let certs = funded_chain(&validators, 4);
+        let mut origin = LedgerStore::open(":memory:").unwrap();
+        for cert in &certs {
+            origin.apply(cert, &validators.set).unwrap();
+        }
+        let cp = checkpoint_over(&validators, &origin);
+        origin.store_checkpoint(&cp, &validators.set).unwrap();
+        let snap = origin.snapshot(&validators.set).unwrap();
+        let mut running = LedgerStore::open(":memory:").unwrap();
+        running.apply(&certs[0], &validators.set).unwrap();
+        let before = running.state().unwrap().digest().unwrap();
+        let refused = running.install_snapshot(&snap, &validators.set);
+        assert!(refused.is_err(), "a live ledger was overwritten wholesale");
+        assert_eq!(
+            running.state().unwrap().digest().unwrap(),
+            before,
+            "a refused restore still moved the ledger"
+        );
+    }
 }

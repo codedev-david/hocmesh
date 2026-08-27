@@ -1,0 +1,8 @@
+# Windows gives the main thread a 1 MB stack where Linux and macOS give 8 MB,
+# and an unoptimised clap build assembles the whole subcommand tree in one
+# frame. The node's tree crossed that line the day a subcommand was added, and
+# the binary then overflowed on every invocation including `--version`. Ask the
+# MSVC linker for the same 8 MB everyone else already has, so adding a
+# subcommand stays a matter of taste rather than of stack arithmetic.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/STACK:8388608"]

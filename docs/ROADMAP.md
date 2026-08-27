@@ -23,6 +23,8 @@
 - Operator resource limits, so a contributor shares a slice rather than the machine.
 - Measured network coordinates, so scheduling uses requester-to-worker distance.
 - Two-stage inference settlement, so generated text is paid for by a signed exchange rather than by trusting whoever produced it.
+- Portable signed snapshots, so a newcomer adopts a quorum-signed state and syncs from there instead of replaying the chain from genesis.
+- Out-of-band checkpoint distribution, because that snapshot proves itself against a validator set the reader already trusts and so can travel by any untrusted route.
 
 ## Priority 0 — handoff validation
 
@@ -36,10 +38,8 @@
 
 ## Priority 1 — production ledger hardening
 
-- Snapshot/checkpoint format.
 - Efficient indexed transaction/account history.
 - Reconciliation daemon for partial coordinator/ledger failures.
-- Signed checkpoints distributed out-of-band.
 - Sweeping stale inference holding accounts to the commons once the settlement window closes, so a requester that takes delivery and never gives a verdict cannot strand CU indefinitely.
 - Property tests for conservation and replay invariants. Covered in `hocmesh-ledger`: a settled reward survives no single edit to its postings, evidence, or signature; the community ceiling is never crossed by any sequence of mints; and a chain replayed into two databases leaves them identical, refuses every certificate a second time, and sums to exactly zero.
 - Byzantine/fault-injection tests. Network faults are covered: the quorum flow suite runs a fault-injecting relay for WAN latency, minority and majority partitions, and clock skew. Two Byzantine cases are covered too: an equivocating quorum that signs two entries at one height cannot get both onto the chain, and a full quorum of strangers certifies nothing. What is left is the rest of adversarial *behaviour* - a validator that equivocates while its peers are partitioned, a coordinator that lies about scheduling rather than about payment - and a real multi-host run.
