@@ -39,7 +39,7 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
     let coordinator_bin = bin_dir.join(exe("hocmesh-coordinator"));
 
     let tmp = TestDir::new()?;
-    let http = Client::new();
+    let http = test_client();
 
     let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
     let mut members = Vec::new();
@@ -563,7 +563,7 @@ async fn coordinator_recovers_community_reservation_after_intent_persisted() -> 
     let coordinator_bin = bin_dir.join(exe("hocmesh-coordinator"));
 
     let tmp = TestDir::new()?;
-    let http = Client::new();
+    let http = test_client();
     let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
     let (validators_path, validator_homes, validator_dbs, _set) =
         create_validator_set(&tmp, &validator_bin, &validator_ports)?;
@@ -681,7 +681,7 @@ async fn a_replacement_coordinator_rebuilds_from_the_chain_and_finishes_the_job(
     let node_bin = bin_dir.join(exe("hocmesh"));
 
     let tmp = TestDir::new()?;
-    let http = Client::new();
+    let http = test_client();
     let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
     let (validators_path, validator_homes, validator_dbs, _set) =
         create_validator_set(&tmp, &validator_bin, &validator_ports)?;
@@ -1375,7 +1375,7 @@ async fn concurrent_settlements_share_ledger_entries() -> Result<()> {
     let validator_bin = bin_dir.join(exe("hocmesh-validator"));
 
     let tmp = TestDir::new()?;
-    let http = Client::new();
+    let http = test_client();
     let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
     let (validators_path, validator_homes, validator_dbs, set) =
         create_validator_set(&tmp, &validator_bin, &validator_ports)?;
@@ -1494,7 +1494,7 @@ async fn a_vouched_validator_joins_and_the_chain_carries_the_change() -> Result<
     let node_bin = bin_dir.join(exe("hocmesh"));
 
     let tmp = TestDir::new()?;
-    let http = Client::new();
+    let http = test_client();
     let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
     let (validators_path, validator_homes, validator_dbs, set) =
         create_validator_set(&tmp, &validator_bin, &validator_ports)?;
@@ -1818,7 +1818,7 @@ async fn a_split_proposal_does_not_wedge_the_height() -> Result<()> {
     let node_bin = bin_dir.join(exe("hocmesh"));
 
     let tmp = TestDir::new()?;
-    let http = Client::new();
+    let http = test_client();
     let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
     let (validators_path, validator_homes, validator_dbs, set) =
         create_validator_set(&tmp, &validator_bin, &validator_ports)?;
@@ -1920,7 +1920,7 @@ async fn two_independent_proposers_both_settle() -> Result<()> {
     let node_bin = bin_dir.join(exe("hocmesh"));
 
     let tmp = TestDir::new()?;
-    let http = Client::new();
+    let http = test_client();
     let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
     let (validators_path, validator_homes, validator_dbs, set) =
         create_validator_set(&tmp, &validator_bin, &validator_ports)?;
@@ -2012,7 +2012,7 @@ async fn settlement_survives_wan_latency_and_a_minority_partition() -> Result<()
     let node_bin = bin_dir.join(exe("hocmesh"));
 
     let tmp = TestDir::new()?;
-    let http = Client::new();
+    let http = test_client();
     let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
     let mut links = Vec::new();
     for port in validator_ports {
@@ -2175,7 +2175,7 @@ async fn a_majority_partition_stops_settlement_and_recovery_pays_once() -> Resul
     let node_bin = bin_dir.join(exe("hocmesh"));
 
     let tmp = TestDir::new()?;
-    let http = Client::new();
+    let http = test_client();
     let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
     let mut links = Vec::new();
     for port in validator_ports {
@@ -2317,7 +2317,7 @@ async fn a_drifting_clock_is_tolerated_up_to_the_window_and_refused_past_it() ->
     let node_bin = bin_dir.join(exe("hocmesh"));
 
     let tmp = TestDir::new()?;
-    let http = Client::new();
+    let http = test_client();
     let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
     let (validators_path, validator_homes, validator_dbs, _set) =
         create_validator_set(&tmp, &validator_bin, &validator_ports)?;
@@ -2565,4 +2565,14 @@ where
         writer.write_all(&buf[..n]).await?;
         writer.flush().await?;
     }
+}
+
+/// No request in these tests should ever take a minute. A test that hangs on a
+/// socket reports nothing; a test that fails on a timeout reports exactly what
+/// stopped answering.
+fn test_client() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .expect("an HTTP client with a timeout")
 }

@@ -63,6 +63,10 @@ enum Attempt {
 /// somebody. Still, a caller waiting on a reply deserves an answer eventually.
 const ROUND_ATTEMPTS: u32 = 6;
 
+/// A validator that stops answering must not be able to hold a proposer open
+/// forever. Without this a single hung socket blocks the round loop past every
+/// backoff it has, and the caller waits on a reply that is never coming.
+const VALIDATOR_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 impl RoundError {
     fn rejected(e: anyhow::Error) -> Self {
         Self::Rejected(e.to_string())
@@ -78,7 +82,9 @@ impl LedgerNetwork {
     pub fn new(set: ValidatorSet) -> Result<Self> {
         validate_validator_set(&set)?;
         Ok(Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(VALIDATOR_REQUEST_TIMEOUT)
+                .build()?,
             set: Arc::new(std::sync::RwLock::new(set)),
             set_sequence: Arc::default(),
             gate: Arc::new(Mutex::new(())),

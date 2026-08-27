@@ -9,6 +9,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+    timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -23,10 +24,11 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features --locked --exclude hocmesh-integration-tests
       - name: Integration tests
-        # Every one of these stands up a four-validator quorum and at least one
-        # coordinator. A two-core runner cannot host seven of those at once
-        # without starving the very timeouts under test.
-        run: cargo test -p hocmesh-integration-tests --all-features --locked -- --test-threads=2
+        # Every one of these stands up a four-validator quorum and at least
+        # one coordinator, and several of them are timing tests. Run them one
+        # at a time: a two-core runner that is hosting two such stacks starves
+        # the very timeouts under test.
+        run: cargo test -p hocmesh-integration-tests --all-features --locked -- --test-threads=1
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Proofs
@@ -35,6 +37,7 @@ jobs:
           cargo run --release --locked -p hocmesh-core --example float_witness_proof
 
   supply-chain:
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -72,6 +75,7 @@ jobs:
           if-no-files-found: error
 
   coverage:
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -101,6 +105,7 @@ jobs:
             feature: rocm
           - os: macos-latest
             feature: metal
+    timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -125,6 +130,7 @@ jobs:
           - os: macos-latest
             kind: pkg
             features: hocmesh-gpu/metal
+    timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
