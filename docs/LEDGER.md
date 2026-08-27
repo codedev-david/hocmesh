@@ -227,6 +227,49 @@ Future workloads should use appropriate mechanisms such as:
 - model-specific verification,
 - trusted execution evidence where useful.
 
+## Inference settlement
+
+Generated text cannot be recomputed by a validator, so inference does not settle
+in one step the way `PrimeCount` does. It settles in two, through a per-batch
+holding account:
+
+```text
+hocmesh:escrow:<job_id>            the requester's money, still the requester's
+hocmesh:holding:<assignment_id>    committed to this batch, owned by nobody
+```
+
+`InferenceReceipt` moves one batch's price from the job escrow into that batch's
+holding account. It is signed by the requester over the assignment, the batch
+range, the price and the outputs digest. Taking delivery is the requester's
+statement that it now owns the outcome of this batch, whatever the text turns
+out to say.
+
+`InferenceReward` moves the holding account to the provider. It carries two
+signatures: the provider's claim over the batch, and the requester's acceptance
+over the *same* digest.
+
+`InferenceDispute` moves the holding account to `hocmesh:community-issuance`. It
+is signed by the requester and carries a reason. It returns nothing to the
+requester, which is the point: a dispute costs the same as an acceptance, so
+neither party gains by lying about the quality of an answer.
+
+Validators pin the postings on all three. A receipt may only debit the job
+escrow and credit that batch's holding account; a dispute may only debit the
+holding account and credit the commons. A requester cannot point a dispute at
+its own account, and a provider cannot pay itself out of an escrow directly.
+
+The claim keys stage the two halves without any extra state:
+
+```text
+escrow:<job_id>:<start>:<end>    InferenceReceipt, InferenceRefund
+payout:<job_id>:<start>:<end>    InferenceReward, InferenceDispute
+```
+
+A batch is therefore either taken or reclaimed, never both, and either accepted
+or disputed, never both. Nothing needs to record that a receipt happened before
+a payout: the holding account is empty until the receipt lands, and the
+conservation rule refuses an overdraw.
+
 ## Validator storage
 
 Each validator SQLite database stores:

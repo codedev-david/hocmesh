@@ -112,11 +112,21 @@ validator can audit from the ledger entry alone. Nobody can re-run an LLM and
 get the same tokens back, so minting against inference would be minting against
 an unverifiable claim. Inference is bought with CU that already existed.
 
-**Same exactly-once machinery as CPU work.** A reservation claims
-`reserve:<job_id>`. A reward and a refund both claim `reward:<assignment_id>`,
-so a batch settles once and in one direction. The windows are disjoint: a
-reward is valid at or before `reserved_at + SETTLEMENT_WINDOW_SECS`, a refund
-only strictly after. Requester and provider can never race for the same escrow.
+**Same exactly-once machinery as CPU work, in two halves.** A reservation claims
+`reserve:<job_id>`. Getting a batch out of escrow claims
+`escrow:<job_id>:<start>:<end>`, so a batch is either taken by the requester or
+reclaimed by it, never both. Paying it out claims
+`payout:<job_id>:<start>:<end>`, so it is either accepted or disputed, never
+both. The windows stay disjoint: a settlement is valid at or before
+`reserved_at + SETTLEMENT_WINDOW_SECS`, a refund only strictly after. Requester
+and provider can never race for the same escrow.
+
+**A payout needs both sides to have signed.** A reward carries the provider's
+claim over the batch and the requester's acceptance over the same outputs
+digest, and it is paid out of that batch's holding account rather than out of
+the job escrow. A provider that swaps in different bytes and re-signs its own
+claim is refused, because the acceptance it was given no longer describes what
+it is delivering.
 
 **What a validator cannot check, and why that is survivable.** It cannot
 re-run the model, so it never rules on whether an answer was any good. It rules

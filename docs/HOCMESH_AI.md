@@ -53,6 +53,24 @@ hocmesh ai-job <job-id>
 
 The coordinator filters incompatible devices, scores candidates, creates a durable plan, and leases batch assignments. Workers seed missing chunks, materialize the verified model, invoke the configured runtime, hash outputs, and submit signed results. A reported device/runtime failure persistently excludes that node and rewrites the assignment for the replacement device.
 
+## Taking delivery and paying for it
+
+A finished batch is not paid for on report. `hocmesh ai-job <job-id>` lists every
+answered batch with its digest, its price and its size, and no text at all.
+
+```powershell
+hocmesh ai-receipt <job-id> <assignment-id>
+hocmesh ai-settle  <job-id> <assignment-id>
+hocmesh ai-settle  <job-id> <assignment-id> --dispute --reason "truncated"
+```
+
+`ai-receipt` moves that batch's escrow into a holding account and returns the
+text in exchange. `ai-settle` then says what it was worth: accepting pays the
+provider, disputing sends the same CU to the commons. A dispute is not a refund,
+which is what stops a requester from reading an answer and then declining to pay
+for it. See *Paying for an answer nobody can recompute* in
+[SECURITY.md](SECURITY.md).
+
 ## Parallelism
 
 - Batch plans divide prompt indexes without gaps or overlap and execute end-to-end.

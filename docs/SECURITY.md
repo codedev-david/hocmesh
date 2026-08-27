@@ -159,6 +159,70 @@ The earlier design locked a validator to the first entry hash it saw at a height
 - replicated history,
 - participant audit capability.
 
+## Paying for an answer nobody can recompute
+
+Every other workload on the mesh is settled by redoing it. A shard of
+`PrimeCount` or a row block of a matrix product is deterministic, so a second
+node - or the audit in [VERIFICATION.md](VERIFICATION.md) - can rerun it and
+compare. Generated text is not like that. Validators do not hold the weights,
+the llama.cpp adapter returns text and not logits, and the same prompt on two
+machines does not reproduce token for token. There is nothing for the ledger to
+recompute and nothing to compare it against.
+
+Slashing is not available either: CU is conserved exactly and never burned, so
+there is no stake to take away. What is left is the exchange itself. hocMESH
+settles inference in two signed stages, and the whole design is aimed at making
+every lie cost the liar exactly as much as telling the truth.
+
+**Stage 1 - receipt.** The coordinator holds a finished batch and publishes only
+its digest, its price, and its size. The requester sees that an answer exists
+and what it costs, and cannot read a word of it. To take delivery it signs an
+`InferenceReceipt`, which moves the batch's escrow out of the job and into a
+per-batch holding account (`hocmesh:holding:{assignment_id}`). Only then does
+the coordinator hand over the text. Receipting also closes the refund path for
+that batch: `escrow:{job}:{start}:{end}` is the claim key for both, so a batch
+cannot be both taken and reclaimed.
+
+**Stage 2 - verdict.** The requester reads the text and signs exactly one of
+two transactions, both keyed `payout:{job}:{start}:{end}` so only one can ever
+land:
+
+- `InferenceReward` pays the holding account to the provider. It now needs two
+  signatures - the provider's claim over the batch, and the requester's
+  acceptance over the *same* digest. A provider that swaps in different bytes
+  can re-sign its own claim perfectly well and still cannot be paid, because
+  the acceptance it holds is over a digest that no longer matches.
+- `InferenceDispute` pays the holding account to `hocmesh:community-issuance`.
+  It carries a signed reason and pays the requester nothing.
+
+The dispute is the part that does the work. Rejecting a batch costs the
+requester exactly what accepting it would, so refusing good work to get free
+compute buys nothing at all, and returning garbage earns nothing at all.
+Neither side profits by lying, which is the strongest property available when
+nobody can check the answer.
+
+The coordinator is the delivery agent and never the authority: it hands over
+text in exchange for a receipt it cannot forge, and every CU movement is a
+transaction the validators check independently. Both settlement transactions
+are validated live and on historical replay, and their postings are pinned -
+a receipt may only move escrow into that batch's holding account, and a dispute
+may only move holding into the commons, so a requester cannot redirect a
+dispute back to itself.
+
+### What this still does not fix
+
+- A requester that takes delivery and then never signs a verdict strands its
+  own CU in the holding account. Nobody gains it - not the provider, not the
+  commons - so this is a way to waste CU, not a way to steal it. Sweeping
+  stale holding accounts to the commons after the settlement window is on the
+  roadmap.
+- A requester that never takes delivery at all strands the provider's work. It
+  gets its escrow back through the ordinary refund path once the window closes,
+  and the provider is paid nothing for real compute it really performed. That
+  is a loss the provider carries; the mesh's answer is reputation, not CU.
+- Quality is the requester's opinion, and the protocol treats it as one. A
+  dispute is not evidence of a bad answer, only of an unpaid one.
+
 ## Community issuance
 
 Community bootstrap CU is not unrestricted.

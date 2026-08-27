@@ -397,6 +397,57 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
     assert!(settled.accepted);
     assert_eq!(settled.reward_mcu, inference_price);
 
+    // Delivery earns nothing on its own. The provider's signature says what it
+    // computed; only the requester's says the answer was worth paying for.
+    assert_eq!(
+        balance(&http, &coordinator, &gpu_node).await?.balance_mcu,
+        gpu_before,
+        "a delivered batch is not a paid batch"
+    );
+    let outputs_digest = hocmesh_protocol::hash_json(&report.outputs)?;
+    let receipt = hocmesh_ai::ReceiptInferenceRequest {
+        auth: node_a.identity.auth(
+            "receipt_inference",
+            &hocmesh_protocol::inference_receipt_body_hash(
+                &report.assignment_id,
+                &ai_job.job_id,
+                report.batch_start,
+                report.batch_end,
+                inference_price,
+                &outputs_digest,
+            )?,
+        ),
+        assignment_id: report.assignment_id.clone(),
+    };
+    let taken: hocmesh_ai::ReceiptInferenceResponse =
+        post_json(&http, &coordinator, "/v1/ai/jobs/receipt", &receipt).await?;
+    assert_eq!(taken.outputs, report.outputs);
+    assert_eq!(
+        balance(&http, &coordinator, &gpu_node).await?.balance_mcu,
+        gpu_before,
+        "taking delivery moves escrow into holding, not into a provider"
+    );
+    let accept = hocmesh_ai::SettleInferenceRequest {
+        auth: node_a.identity.auth(
+            "accept_inference",
+            &hocmesh_protocol::inference_verdict_body_hash(
+                true,
+                &report.assignment_id,
+                &ai_job.job_id,
+                report.batch_start,
+                report.batch_end,
+                inference_price,
+                &outputs_digest,
+            )?,
+        ),
+        assignment_id: report.assignment_id.clone(),
+        accepted: true,
+        reason: String::new(),
+    };
+    let paid: hocmesh_ai::SettleInferenceResponse =
+        post_json(&http, &coordinator, "/v1/ai/jobs/settle", &accept).await?;
+    assert_eq!(paid.paid_mcu, inference_price);
+
     // CPU work paid for GPU work, across the ledger, with nothing minted:
     // this is the trade the network is for, and it is now enforceable.
     let gpu_after = balance(&http, &coordinator, &gpu_node).await?.balance_mcu;

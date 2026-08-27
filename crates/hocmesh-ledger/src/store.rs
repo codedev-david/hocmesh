@@ -862,6 +862,48 @@ impl LedgerStore {
                             bail!("inference reward arrived after the settlement window")
                         }
                     }
+                    TransactionEvidence::InferenceReceipt(e) => {
+                        let Some((billing, batches, requester, reserved_at)) =
+                            inference.get(&e.job_id)
+                        else {
+                            bail!(
+                                "inference receipt references missing reservation: {}",
+                                e.job_id
+                            )
+                        };
+                        if requester != &e.requester_auth.node_id {
+                            bail!("inference receipt signed by someone other than the requester")
+                        }
+                        if !batches
+                            .iter()
+                            .any(|b| b.batch_start == e.batch_start && b.batch_end == e.batch_end)
+                        {
+                            bail!("inference receipt names a batch the job never reserved")
+                        }
+                        if inference_batch_price(billing, e.batch_start, e.batch_end) != e.price_mcu
+                        {
+                            bail!("inference receipt is not what the batch prices at")
+                        }
+                        // Delivery only counts while the escrow is still live.
+                        if txn.created_at > reserved_at + hocmesh_protocol::SETTLEMENT_WINDOW_SECS {
+                            bail!("inference receipt arrived after the settlement window")
+                        }
+                    }
+                    TransactionEvidence::InferenceDispute(e) => {
+                        let Some((billing, _, requester, _)) = inference.get(&e.job_id) else {
+                            bail!(
+                                "inference dispute references missing reservation: {}",
+                                e.job_id
+                            )
+                        };
+                        if requester != &e.requester_auth.node_id {
+                            bail!("inference dispute signed by someone other than the requester")
+                        }
+                        if inference_batch_price(billing, e.batch_start, e.batch_end) != e.price_mcu
+                        {
+                            bail!("inference dispute is not what the batch prices at")
+                        }
+                    }
                     TransactionEvidence::InferenceRefund(e) => {
                         let Some((billing, batches, requester, reserved_at)) =
                             inference.get(&e.job_id)
@@ -1089,6 +1131,11 @@ fn index_certificate(tx: &rusqlite::Transaction<'_>, cert: &QuorumCertificate) -
                     e.reward_mcu,
                 ],
             )?;
+            }
+            TransactionEvidence::InferenceReceipt(_) | TransactionEvidence::InferenceDispute(_) => {
+                // Neither pays a provider, so there is no reward to index. The
+                // claim keys already record that the batch was received and
+                // that it was settled away from the provider.
             }
             TransactionEvidence::InferenceRefund(_) => {
                 // Nothing to index, for the same reason a shard refund indexes

@@ -5,12 +5,14 @@ use axum::{
     routing::{get, post},
 };
 use hocmesh_ai::{
-    FailInferenceRequest, FailInferenceResponse, InferenceAssignment, InferenceJobStatus,
-    NodeProfile, PlanRequest, PlanResponse, PollInferenceRequest, PollInferenceResponse,
-    PromptOutput, RefundInferenceRequest, RefundInferenceResponse, RegisterModelRequest,
-    RegisterModelResponse, ReportInferenceRequest, ReportInferenceResponse, SubmitInferenceRequest,
-    SubmitInferenceResponse, fail_inference_body_hash, inference_settings_digest, plan_body_hash,
-    plan_parallelism, rank_candidates, refund_inference_body_hash, register_model_body_hash,
+    DeliveredBatchSummary, FailInferenceRequest, FailInferenceResponse, InferenceAssignment,
+    InferenceJobStatus, NodeProfile, PlanRequest, PlanResponse, PollInferenceRequest,
+    PollInferenceResponse, PromptOutput, ReceiptInferenceRequest, ReceiptInferenceResponse,
+    RefundInferenceRequest, RefundInferenceResponse, RegisterModelRequest, RegisterModelResponse,
+    ReportInferenceRequest, ReportInferenceResponse, SettleInferenceRequest,
+    SettleInferenceResponse, SubmitInferenceRequest, SubmitInferenceResponse,
+    fail_inference_body_hash, inference_settings_digest, plan_body_hash, plan_parallelism,
+    rank_candidates, refund_inference_body_hash, register_model_body_hash,
     report_inference_body_hash, submit_inference_body_hash,
 };
 use hocmesh_core::compute::{split_work, work_cost_mcu};
@@ -21,9 +23,10 @@ use hocmesh_gpu::{BackendKind, DeviceCapability};
 use hocmesh_ledger::{
     network::LedgerNetwork,
     types::{
-        COMMUNITY_ISSUANCE_ACCOUNT, InferenceRefundEvidence, InferenceReserveEvidence,
-        InferenceRewardEvidence, JobRefundEvidence, JobReserveEvidence, LedgerTransaction, Posting,
-        ProviderRewardEvidence, TransactionEvidence, TransactionKind, escrow_account,
+        COMMUNITY_ISSUANCE_ACCOUNT, InferenceDisputeEvidence, InferenceReceiptEvidence,
+        InferenceRefundEvidence, InferenceReserveEvidence, InferenceRewardEvidence,
+        JobRefundEvidence, JobReserveEvidence, LedgerTransaction, Posting, ProviderRewardEvidence,
+        TransactionEvidence, TransactionKind, escrow_account, inference_holding_account,
     },
     validate::claim_key,
 };
@@ -73,6 +76,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/ai/plan", post(plan_ai))
         .route("/v1/ai/jobs/submit", post(submit_inference))
         .route("/v1/ai/jobs/refund", post(refund_inference))
+        .route("/v1/ai/jobs/receipt", post(receipt_inference))
+        .route("/v1/ai/jobs/settle", post(settle_inference))
         .route("/v1/ai/jobs/{id}", get(inference_status))
         .route("/v1/ai/work/poll", post(poll_inference))
         .route("/v1/ai/work/result", post(report_inference))
@@ -543,7 +548,7 @@ async fn report_inference(
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
     }
     let body_hash = report_inference_body_hash(&req).map_err(ApiError::internal)?;
-    let (job_id, provider_pk) = {
+    let job_id = {
         let conn = state.db.get().map_err(ApiError::internal)?;
         authenticate_known_node(&conn, &req.auth, "report_inference", &body_hash)?;
         let row: Option<(String, String, String)> = conn.query_row(
@@ -602,70 +607,27 @@ async fn report_inference(
                 "requester cannot receive a reward from its own paid job",
             ));
         }
-        let provider_pk: String = conn
-            .query_row(
-                "SELECT public_key_b64 FROM nodes WHERE node_id=?1",
-                params![req.auth.node_id],
-                |r| r.get::<_, String>(0),
-            )
-            .map_err(ApiError::internal)?;
-        (job_id, provider_pk)
+        job_id
     };
-    // Only a digest of the answer reaches the ledger. Whether the answer was
-    // any good is the requester judgement, and the requester is the party out
-    // of pocket if it was not - but what the provider returned is still bound
-    // to what it was paid for.
+    // Delivery is not payment. The provider's signed claim is kept here until
+    // the requester takes the answer and says what it is worth; nothing moves
+    // on the ledger until then, so a provider that returns arbitrary bytes for
+    // a real assignment gets a row in a table and nothing else.
     let outputs_digest = hocmesh_protocol::hash_json(&req.outputs).map_err(ApiError::internal)?;
-    let ledger_tx = state.ledger.as_ref().map(|_| LedgerTransaction {
-        transaction_id: format!("reward_{}", req.assignment_id),
-        kind: TransactionKind::InferenceReward,
-        postings: vec![
-            Posting {
-                account_id: escrow_account(&job_id),
-                delta_mcu: -req.reward_mcu,
-            },
-            Posting {
-                account_id: req.auth.node_id.clone(),
-                delta_mcu: req.reward_mcu,
-            },
-        ],
-        evidence: TransactionEvidence::InferenceReward(InferenceRewardEvidence {
-            job_id: job_id.clone(),
-            assignment_id: req.assignment_id.clone(),
-            batch_start: req.batch_start,
-            batch_end: req.batch_end,
-            reward_mcu: req.reward_mcu,
-            outputs_digest,
-            provider_public_key_b64: provider_pk,
-            provider_auth: req.auth.clone(),
-        }),
-        created_at: now_unix(),
-    });
-    // The ledger decides before the coordinator writes anything down. A local
-    // row marked completed and then refused certification would strand a batch
-    // nobody can claim or reclaim.
-    if let (Some(ledger), Some(tx_record)) = (&state.ledger, ledger_tx) {
-        ledger.transact(tx_record).await.map_err(|e| {
-            ApiError::conflict(format!("inference reward rejected by the ledger: {e}"))
-        })?;
-    }
     let job_completed = {
         let mut conn = state.db.get().map_err(ApiError::internal)?;
         let transaction = conn.transaction().map_err(ApiError::internal)?;
         transaction.execute(
-        "UPDATE ai_assignments SET status=?4,outputs_json=?2,lease_until=NULL,completed_at=?3 WHERE assignment_id=?1",
-        params![req.assignment_id, serde_json::to_string(&req.outputs).map_err(ApiError::internal)?, now_unix(), "completed"],
+        "UPDATE ai_assignments SET status=?4,outputs_json=?2,lease_until=NULL,completed_at=?3,report_json=?5,outputs_digest=?6 WHERE assignment_id=?1",
+        params![
+            req.assignment_id,
+            serde_json::to_string(&req.outputs).map_err(ApiError::internal)?,
+            now_unix(),
+            "completed",
+            serde_json::to_string(&req).map_err(ApiError::internal)?,
+            outputs_digest,
+        ],
     ).map_err(ApiError::internal)?;
-        if state.ledger.is_none() {
-            apply_ledger_delta(
-                &transaction,
-                &req.auth.node_id,
-                req.reward_mcu,
-                "inference_reward",
-                Some(&job_id),
-                Some(&req.assignment_id),
-            )?;
-        }
         let remaining: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM ai_assignments WHERE job_id=?1 AND status!=?2",
@@ -690,6 +652,331 @@ async fn report_inference(
         accepted: true,
         reward_mcu: req.reward_mcu,
         balance_mcu: balance.balance_mcu,
+        job_completed,
+    }))
+}
+
+/// One delivered batch, as the coordinator remembers it between delivery and
+/// settlement.
+struct DeliveredBatch {
+    job_id: String,
+    requester: String,
+    report: ReportInferenceRequest,
+    outputs: Vec<PromptOutput>,
+    outputs_digest: String,
+    provider_pk: String,
+    requester_pk: String,
+    receipted: bool,
+    settled: Option<String>,
+}
+
+/// One row of the settlement view of an assignment: the job it belongs to, the
+/// provider's stored report and outputs, the digest they hash to, and how far
+/// the batch has got through delivery and settlement.
+type SettlementRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+);
+
+/// Reads back everything a settlement needs about one delivered batch.
+fn delivered_batch(conn: &Connection, assignment_id: &str) -> Result<DeliveredBatch, ApiError> {
+    let row: Option<SettlementRow> = conn
+        .query_row(
+            "SELECT job_id,report_json,outputs_json,outputs_digest,receipted,settled
+             FROM ai_assignments WHERE assignment_id=?1",
+            params![assignment_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    let Some((job_id, report_json, outputs_json, digest, receipted, settled)) = row else {
+        return Err(ApiError::not_found("AI assignment not found"));
+    };
+    let (Some(report_json), Some(outputs_json), Some(outputs_digest)) =
+        (report_json, outputs_json, digest)
+    else {
+        return Err(ApiError::conflict("this batch has not been delivered yet"));
+    };
+    let report: ReportInferenceRequest =
+        serde_json::from_str(&report_json).map_err(ApiError::internal)?;
+    let outputs: Vec<PromptOutput> =
+        serde_json::from_str(&outputs_json).map_err(ApiError::internal)?;
+    let requester: String = conn
+        .query_row(
+            "SELECT requester_node_id FROM ai_jobs WHERE job_id=?1",
+            params![job_id],
+            |r| r.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    let requester_pk: String = conn
+        .query_row(
+            "SELECT public_key_b64 FROM nodes WHERE node_id=?1",
+            params![requester],
+            |r| r.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    let provider_pk: String = conn
+        .query_row(
+            "SELECT public_key_b64 FROM nodes WHERE node_id=?1",
+            params![report.auth.node_id],
+            |r| r.get(0),
+        )
+        .map_err(ApiError::internal)?;
+    Ok(DeliveredBatch {
+        job_id,
+        requester,
+        report,
+        outputs,
+        outputs_digest,
+        provider_pk,
+        requester_pk,
+        receipted: receipted != 0,
+        settled,
+    })
+}
+
+/// A requester taking delivery of a batch.
+///
+/// The answer is handed over here and nowhere else, and only against a receipt
+/// that moves the batch's escrow into a holding account. That is what makes the
+/// exchange even: the requester cannot read the answer and then reclaim the CU,
+/// and the provider cannot be paid for bytes the requester never asked to see.
+async fn receipt_inference(
+    State(state): State<AppState>,
+    Json(req): Json<ReceiptInferenceRequest>,
+) -> Result<Json<ReceiptInferenceResponse>, ApiError> {
+    let batch = {
+        let conn = state.db.get().map_err(ApiError::internal)?;
+        let batch = delivered_batch(&conn, &req.assignment_id)?;
+        if batch.requester != req.auth.node_id {
+            return Err(ApiError::unauthorized(
+                "only the requester that funded a batch can take delivery of it",
+            ));
+        }
+        let body_hash = hocmesh_protocol::inference_receipt_body_hash(
+            &req.assignment_id,
+            &batch.job_id,
+            batch.report.batch_start,
+            batch.report.batch_end,
+            batch.report.reward_mcu,
+            &batch.outputs_digest,
+        )
+        .map_err(ApiError::internal)?;
+        authenticate_known_node(&conn, &req.auth, "receipt_inference", &body_hash)?;
+        batch
+    };
+    if !batch.receipted {
+        let ledger_tx = state.ledger.as_ref().map(|_| LedgerTransaction {
+            transaction_id: format!("receipt_{}", req.assignment_id),
+            kind: TransactionKind::InferenceReceipt,
+            postings: vec![
+                Posting {
+                    account_id: escrow_account(&batch.job_id),
+                    delta_mcu: -batch.report.reward_mcu,
+                },
+                Posting {
+                    account_id: inference_holding_account(&req.assignment_id),
+                    delta_mcu: batch.report.reward_mcu,
+                },
+            ],
+            evidence: TransactionEvidence::InferenceReceipt(InferenceReceiptEvidence {
+                job_id: batch.job_id.clone(),
+                assignment_id: req.assignment_id.clone(),
+                batch_start: batch.report.batch_start,
+                batch_end: batch.report.batch_end,
+                price_mcu: batch.report.reward_mcu,
+                outputs_digest: batch.outputs_digest.clone(),
+                requester_public_key_b64: batch.requester_pk.clone(),
+                requester_auth: req.auth.clone(),
+            }),
+            created_at: now_unix(),
+        });
+        if let (Some(ledger), Some(tx_record)) = (&state.ledger, ledger_tx) {
+            ledger.transact(tx_record).await.map_err(|e| {
+                ApiError::conflict(format!("inference receipt rejected by the ledger: {e}"))
+            })?;
+        }
+        let conn = state.db.get().map_err(ApiError::internal)?;
+        conn.execute(
+            "UPDATE ai_assignments SET receipted=1 WHERE assignment_id=?1",
+            params![req.assignment_id],
+        )
+        .map_err(ApiError::internal)?;
+    }
+    Ok(Json(ReceiptInferenceResponse {
+        assignment_id: req.assignment_id.clone(),
+        batch_start: batch.report.batch_start,
+        batch_end: batch.report.batch_end,
+        price_mcu: batch.report.reward_mcu,
+        outputs_digest: batch.outputs_digest,
+        outputs: batch.outputs,
+    }))
+}
+
+/// A requester saying what the answer it took was worth.
+///
+/// Accepting pays the provider out of the holding account. Disputing sends the
+/// same CU to the commons instead. Neither outcome returns it to the requester,
+/// so a dispute is a statement about the work rather than a way to get the
+/// money back, and there is nothing to gain by lying in either direction.
+async fn settle_inference(
+    State(state): State<AppState>,
+    Json(req): Json<SettleInferenceRequest>,
+) -> Result<Json<SettleInferenceResponse>, ApiError> {
+    let batch = {
+        let conn = state.db.get().map_err(ApiError::internal)?;
+        let batch = delivered_batch(&conn, &req.assignment_id)?;
+        if batch.requester != req.auth.node_id {
+            return Err(ApiError::unauthorized(
+                "only the requester that funded a batch can settle it",
+            ));
+        }
+        if !batch.receipted {
+            return Err(ApiError::conflict(
+                "take delivery of this batch before settling it",
+            ));
+        }
+        if let Some(settled) = &batch.settled {
+            return Err(ApiError::conflict(format!(
+                "this batch was already settled as {settled}"
+            )));
+        }
+        let body_hash = hocmesh_protocol::inference_verdict_body_hash(
+            req.accepted,
+            &req.assignment_id,
+            &batch.job_id,
+            batch.report.batch_start,
+            batch.report.batch_end,
+            batch.report.reward_mcu,
+            &batch.outputs_digest,
+        )
+        .map_err(ApiError::internal)?;
+        let action = if req.accepted {
+            "accept_inference"
+        } else {
+            "dispute_inference"
+        };
+        authenticate_known_node(&conn, &req.auth, action, &body_hash)?;
+        batch
+    };
+    let requester_pk = batch.requester_pk.clone();
+    let held = inference_holding_account(&req.assignment_id);
+    let price = batch.report.reward_mcu;
+    let (kind, credit, evidence) = if req.accepted {
+        (
+            TransactionKind::InferenceReward,
+            batch.report.auth.node_id.clone(),
+            TransactionEvidence::InferenceReward(InferenceRewardEvidence {
+                job_id: batch.job_id.clone(),
+                assignment_id: req.assignment_id.clone(),
+                batch_start: batch.report.batch_start,
+                batch_end: batch.report.batch_end,
+                reward_mcu: price,
+                outputs_digest: batch.outputs_digest.clone(),
+                provider_public_key_b64: batch.provider_pk.clone(),
+                provider_auth: batch.report.auth.clone(),
+                requester_public_key_b64: requester_pk,
+                requester_acceptance: req.auth.clone(),
+            }),
+        )
+    } else {
+        (
+            TransactionKind::InferenceDispute,
+            COMMUNITY_ISSUANCE_ACCOUNT.to_string(),
+            TransactionEvidence::InferenceDispute(InferenceDisputeEvidence {
+                job_id: batch.job_id.clone(),
+                assignment_id: req.assignment_id.clone(),
+                batch_start: batch.report.batch_start,
+                batch_end: batch.report.batch_end,
+                price_mcu: price,
+                outputs_digest: batch.outputs_digest.clone(),
+                reason: req.reason.clone(),
+                requester_public_key_b64: requester_pk,
+                requester_auth: req.auth.clone(),
+            }),
+        )
+    };
+    let ledger_tx = state.ledger.as_ref().map(|_| LedgerTransaction {
+        transaction_id: format!("settle_{}", req.assignment_id),
+        kind,
+        postings: vec![
+            Posting {
+                account_id: held,
+                delta_mcu: -price,
+            },
+            Posting {
+                account_id: credit.clone(),
+                delta_mcu: price,
+            },
+        ],
+        evidence,
+        created_at: now_unix(),
+    });
+    // Same order as every other settlement here: the ledger decides first, and
+    // only then does the coordinator write down what it decided.
+    if let (Some(ledger), Some(tx_record)) = (&state.ledger, ledger_tx) {
+        ledger.transact(tx_record).await.map_err(|e| {
+            ApiError::conflict(format!("inference settlement rejected by the ledger: {e}"))
+        })?;
+    }
+    let job_completed =
+        {
+            let mut conn = state.db.get().map_err(ApiError::internal)?;
+            let transaction = conn.transaction().map_err(ApiError::internal)?;
+            let updated = transaction
+            .execute(
+                "UPDATE ai_assignments SET settled=?2 WHERE assignment_id=?1 AND settled IS NULL",
+                params![req.assignment_id, if req.accepted { "paid" } else { "disputed" }],
+            )
+            .map_err(ApiError::internal)?;
+            if updated == 0 {
+                return Err(ApiError::conflict("this batch was already settled"));
+            }
+            // Without a ledger there are no escrow or holding accounts to move CU
+            // between, so the local mirror only records the half a node can see:
+            // a paid provider. A disputed batch simply never reaches anyone.
+            if state.ledger.is_none() && req.accepted {
+                apply_ledger_delta(
+                    &transaction,
+                    &credit,
+                    price,
+                    "inference_reward",
+                    Some(&batch.job_id),
+                    Some(&req.assignment_id),
+                )?;
+            }
+            let unsettled: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM ai_assignments
+                 WHERE job_id=?1 AND settled IS NULL AND status<>?2",
+                    params![batch.job_id, "refunded"],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            transaction.commit().map_err(ApiError::internal)?;
+            unsettled == 0
+        };
+    if req.accepted {
+        let balance = authoritative_balance(&state, &credit).await?;
+        cache_balance(&state, &credit, balance.balance_mcu)?;
+    }
+    Ok(Json(SettleInferenceResponse {
+        assignment_id: req.assignment_id,
+        accepted: req.accepted,
+        paid_mcu: price,
         job_completed,
     }))
 }
@@ -902,9 +1189,14 @@ async fn inference_status(
             |row| row.get(0),
         )
         .map_err(ApiError::internal)?;
+    // Only receipted batches read out here. This endpoint takes no
+    // authentication, so an ungated answer would be a way to read generated
+    // text without ever paying for it -- and, worse, a way for the requester
+    // itself to skip the receipt that makes the exchange fair.
     let mut statement = conn
         .prepare(
-            "SELECT outputs_json FROM ai_assignments WHERE job_id=?1 AND outputs_json IS NOT NULL",
+            "SELECT outputs_json FROM ai_assignments
+             WHERE job_id=?1 AND outputs_json IS NOT NULL AND receipted=1",
         )
         .map_err(ApiError::internal)?;
     let rows = statement
@@ -919,6 +1211,7 @@ async fn inference_status(
     }
     outputs.sort_by_key(|output| output.prompt_index);
     let refundable = refundable_batches(&conn, &job_id)?;
+    let delivered = delivered_batches(&conn, &job_id)?;
     Ok(Json(InferenceJobStatus {
         job_id,
         status,
@@ -926,7 +1219,55 @@ async fn inference_status(
         completed_assignments: completed as u32,
         outputs,
         refundable,
+        delivered,
     }))
+}
+
+/// Every batch of a job that has an answer waiting behind a receipt.
+///
+/// Listed for anyone, because none of it is the answer: an assignment id, the
+/// range it covers, what it costs and a digest. A requester reads this to
+/// decide what to take delivery of; a bystander learns only that work happened.
+fn delivered_batches(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<Vec<DeliveredBatchSummary>, ApiError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT assignment_id,report_json,outputs_digest,receipted,settled
+             FROM ai_assignments
+             WHERE job_id=?1 AND report_json IS NOT NULL AND outputs_digest IS NOT NULL
+             ORDER BY assignment_id",
+        )
+        .map_err(ApiError::internal)?;
+    let rows = statement
+        .query_map(params![job_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(ApiError::internal)?;
+    let mut delivered = Vec::new();
+    for row in rows {
+        let (assignment_id, report_json, outputs_digest, receipted, settled) =
+            row.map_err(ApiError::internal)?;
+        let report: ReportInferenceRequest =
+            serde_json::from_str(&report_json).map_err(ApiError::internal)?;
+        delivered.push(DeliveredBatchSummary {
+            assignment_id,
+            batch_start: report.batch_start,
+            batch_end: report.batch_end,
+            price_mcu: report.reward_mcu,
+            outputs_digest,
+            receipted: receipted != 0,
+            settled,
+        });
+    }
+    Ok(delivered)
 }
 
 /// Batches whose settlement window has closed with nothing delivered.
@@ -2272,7 +2613,7 @@ mod ai_api_tests {
             hocmesh_ai::assignment_claim(&assignment).unwrap();
         let mut report = ReportInferenceRequest {
             auth: worker_b.auth("unused", &empty_body_hash()),
-            assignment_id: assignment.assignment_id,
+            assignment_id: assignment.assignment_id.clone(),
             job_id: submitted.job_id.clone(),
             batch_start,
             batch_end,
@@ -2285,13 +2626,32 @@ mod ai_api_tests {
         );
         let accepted: ReportInferenceResponse = post(&base, "/v1/ai/work/result", &report).await;
         assert!(accepted.job_completed);
+
+        // Delivered but not yet taken: the job reads as complete and the text
+        // is still nobody's to read.
         let status: InferenceJobStatus =
-            reqwest::get(format!("{base}/v1/ai/jobs/{}", submitted.job_id))
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            get(&base, &format!("/v1/ai/jobs/{}", submitted.job_id)).await;
+        assert!(status.outputs.is_empty());
+        let receipt_req = ReceiptInferenceRequest {
+            auth: requester.auth(
+                "receipt_inference",
+                &hocmesh_protocol::inference_receipt_body_hash(
+                    &assignment.assignment_id,
+                    &submitted.job_id,
+                    batch_start,
+                    batch_end,
+                    reward_mcu,
+                    &hocmesh_protocol::hash_json(&vec![output.clone()]).unwrap(),
+                )
+                .unwrap(),
+            ),
+            assignment_id: assignment.assignment_id.clone(),
+        };
+        let taken: ReceiptInferenceResponse =
+            post(&base, "/v1/ai/jobs/receipt", &receipt_req).await;
+        assert_eq!(taken.outputs, vec![output.clone()]);
+        let status: InferenceJobStatus =
+            get(&base, &format!("/v1/ai/jobs/{}", submitted.job_id)).await;
         assert_eq!(status.outputs, vec![output]);
 
         server.abort();
@@ -2535,6 +2895,62 @@ mod ai_api_tests {
         let paid: ReportInferenceResponse = post(&base, "/v1/ai/work/result", &report).await;
         assert_eq!(paid.reward_mcu, price);
 
+        // Delivery is not payment. Until the requester takes the answer and
+        // says what it is worth, the provider has earned nothing at all.
+        assert_eq!(read_balance(&db_path, &provider.node_id()), 0);
+
+        // The status endpoint hands out digests, never text, before a receipt.
+        let pending: InferenceJobStatus =
+            get(&base, &format!("/v1/ai/jobs/{}", submitted.job_id)).await;
+        assert!(pending.outputs.is_empty());
+        assert_eq!(pending.delivered.len(), 1);
+        assert!(!pending.delivered[0].receipted);
+
+        // Taking delivery moves the escrow into holding and returns the text.
+        let receipt_req = ReceiptInferenceRequest {
+            auth: requester.auth(
+                "receipt_inference",
+                &hocmesh_protocol::inference_receipt_body_hash(
+                    &assignment.assignment_id,
+                    &submitted.job_id,
+                    batch_start,
+                    batch_end,
+                    price,
+                    &hocmesh_protocol::hash_json(&vec![output.clone()]).unwrap(),
+                )
+                .unwrap(),
+            ),
+            assignment_id: assignment.assignment_id.clone(),
+        };
+        let taken: ReceiptInferenceResponse =
+            post(&base, "/v1/ai/jobs/receipt", &receipt_req).await;
+        assert_eq!(taken.outputs, vec![output.clone()]);
+        assert_eq!(taken.price_mcu, price);
+        assert_eq!(read_balance(&db_path, &provider.node_id()), 0);
+
+        // Only the requester's signed acceptance pays the provider.
+        let settle_req = SettleInferenceRequest {
+            auth: requester.auth(
+                "accept_inference",
+                &hocmesh_protocol::inference_verdict_body_hash(
+                    true,
+                    &assignment.assignment_id,
+                    &submitted.job_id,
+                    batch_start,
+                    batch_end,
+                    price,
+                    &taken.outputs_digest,
+                )
+                .unwrap(),
+            ),
+            assignment_id: assignment.assignment_id.clone(),
+            accepted: true,
+            reason: String::new(),
+        };
+        let settled: SettleInferenceResponse = post(&base, "/v1/ai/jobs/settle", &settle_req).await;
+        assert_eq!(settled.paid_mcu, price);
+        assert!(settled.job_completed);
+
         // The GPU earned exactly what the requester spent. Nothing was minted
         // and nothing evaporated: this is the trade the whole network is for.
         let provider_balance = read_balance(&db_path, &provider.node_id());
@@ -2557,6 +2973,199 @@ mod ai_api_tests {
         let (status, body) = post_raw(&base, "/v1/ai/work/result", &report).await;
         assert_eq!(status, 409, "batch paid twice: {body}");
         assert_eq!(read_balance(&db_path, &provider.node_id()), price);
+
+        server.abort();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the exchange: a real assignment, arbitrary bytes, and
+    /// a requester that refuses to pay for them.
+    #[tokio::test]
+    async fn a_disputed_answer_pays_the_provider_nothing() {
+        let root = std::env::temp_dir().join(format!("hocmesh-ai-dispute-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("coordinator.db");
+        let state = AppState {
+            db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
+            ledger: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let base = format!("http://{address}");
+        let requester = NodeIdentity::load_or_create(&root.join("requester")).unwrap();
+        let provider = NodeIdentity::load_or_create(&root.join("provider")).unwrap();
+        register_test_node(&base, &requester, test_capabilities(false, 0)).await;
+        register_test_node(&base, &provider, test_capabilities(true, 1_000)).await;
+
+        // A 7B model is not cheap: one prompt runs into six figures of CU.
+        let opening_mcu = 1_000_000_000i64;
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE balances SET balance_mcu=?2 WHERE node_id=?1",
+                params![requester.node_id(), opening_mcu],
+            )
+            .unwrap();
+
+        let manifest = ModelManifest {
+            schema_version: 1,
+            model_id: "priced".into(),
+            revision: "v1".into(),
+            format: ModelFormat::Gguf,
+            architecture: "llama".into(),
+            parameter_count: Some(7_000_000_000),
+            tensor_dtype: Some("q4".into()),
+            total_size_bytes: 4_000_000_000,
+            chunks: vec![ChunkRef {
+                index: 0,
+                sha256: sha256(b"weights"),
+                size_bytes: 4_000_000_000,
+            }],
+            metadata: Default::default(),
+        };
+        let hash = register_model_body_hash(&manifest).unwrap();
+        let publish = RegisterModelRequest {
+            auth: requester.auth("register_model", &hash),
+            manifest: manifest.clone(),
+        };
+        let _: RegisterModelResponse = post(&base, "/v1/ai/models/register", &publish).await;
+
+        // The requester prices its own job from the published manifest.
+        let digest = manifest.digest().unwrap();
+        let prompts = vec!["explain compute units".to_string()];
+        let billing = hocmesh_ai::bill_for_prompts(
+            &digest,
+            manifest.parameter_count.unwrap(),
+            manifest.total_size_bytes,
+            &prompts,
+            64,
+        )
+        .unwrap();
+        let price = billing.max_cost_mcu;
+        assert!(price > 0, "a real model must cost real CU");
+
+        let mut submit = SubmitInferenceRequest {
+            auth: requester.auth("unused", &empty_body_hash()),
+            model_id: "priced".into(),
+            revision: "v1".into(),
+            prompts: prompts.clone(),
+            max_tokens: 64,
+            temperature_milli: 0,
+            seed: 7,
+            requirements: InferenceRequirements {
+                required_backends: [BackendKind::Cuda].into_iter().collect(),
+                minimum_memory_bytes: 1,
+                needs_fp16: true,
+                needs_bf16: false,
+                needs_int8: false,
+                batch_size: 1,
+                pipeline_stages: 1,
+                tensor_parallelism: 1,
+            },
+            layer_count: 2,
+            billing: billing.clone(),
+        };
+        submit.auth = requester.auth(
+            "submit_inference",
+            &submit_inference_body_hash(&submit).unwrap(),
+        );
+        let submitted: SubmitInferenceResponse = post(&base, "/v1/ai/jobs/submit", &submit).await;
+
+        // Escrow is funded out of the requester, to the exact number it signed.
+        let after_submit = read_balance(&db_path, &requester.node_id());
+        assert_eq!(after_submit, opening_mcu - price);
+
+        let poll = PollInferenceRequest {
+            auth: provider.auth("poll_inference", &empty_body_hash()),
+        };
+        let leased: PollInferenceResponse = post(&base, "/v1/ai/work/poll", &poll).await;
+        let assignment = leased.assignment.unwrap();
+        let (batch_start, batch_end, reward_mcu) =
+            hocmesh_ai::assignment_claim(&assignment).unwrap();
+
+        // One batch covers the whole job here, so it is worth the whole price:
+        // batch prices tile the job exactly, with nothing stranded in escrow.
+        assert_eq!(reward_mcu, price);
+
+        let output = PromptOutput {
+            prompt_index: 0,
+            text: "not an answer to anything".into(),
+            output_sha256: hocmesh_protocol::hash_bytes(b"not an answer to anything"),
+            duration_ms: 1,
+        };
+        let mut report = ReportInferenceRequest {
+            auth: provider.auth("unused", &empty_body_hash()),
+            assignment_id: assignment.assignment_id.clone(),
+            job_id: submitted.job_id.clone(),
+            batch_start,
+            batch_end,
+            reward_mcu,
+            outputs: vec![output.clone()],
+        };
+        report.auth = provider.auth(
+            "report_inference",
+            &report_inference_body_hash(&report).unwrap(),
+        );
+        let delivered: ReportInferenceResponse = post(&base, "/v1/ai/work/result", &report).await;
+        assert!(delivered.accepted);
+        assert_eq!(read_balance(&db_path, &provider.node_id()), 0);
+
+        // The requester takes delivery - it has to, to see what it bought -
+        // and finds the answer is nothing of the kind.
+        let receipt_req = ReceiptInferenceRequest {
+            auth: requester.auth(
+                "receipt_inference",
+                &hocmesh_protocol::inference_receipt_body_hash(
+                    &assignment.assignment_id,
+                    &submitted.job_id,
+                    batch_start,
+                    batch_end,
+                    price,
+                    &hocmesh_protocol::hash_json(&vec![output.clone()]).unwrap(),
+                )
+                .unwrap(),
+            ),
+            assignment_id: assignment.assignment_id.clone(),
+        };
+        let taken: ReceiptInferenceResponse =
+            post(&base, "/v1/ai/jobs/receipt", &receipt_req).await;
+        assert_eq!(taken.outputs, vec![output.clone()]);
+        let dispute = SettleInferenceRequest {
+            auth: requester.auth(
+                "dispute_inference",
+                &hocmesh_protocol::inference_verdict_body_hash(
+                    false,
+                    &assignment.assignment_id,
+                    &submitted.job_id,
+                    batch_start,
+                    batch_end,
+                    price,
+                    &taken.outputs_digest,
+                )
+                .unwrap(),
+            ),
+            assignment_id: assignment.assignment_id.clone(),
+            accepted: false,
+            reason: "the model was never run".into(),
+        };
+        let rejected: SettleInferenceResponse = post(&base, "/v1/ai/jobs/settle", &dispute).await;
+        assert!(!rejected.accepted);
+
+        // Returning junk earned nothing, and the requester is no better off for
+        // having said so: the CU left its account either way. Neither side can
+        // profit by lying about what the answer was worth.
+        assert_eq!(read_balance(&db_path, &provider.node_id()), 0);
+        assert_eq!(
+            read_balance(&db_path, &requester.node_id()),
+            opening_mcu - price
+        );
+
+        // One payout per batch: having disputed it, the requester cannot turn
+        // round and pay for it after all.
+        let (status, body) = post_raw(&base, "/v1/ai/jobs/settle", &dispute).await;
+        assert_eq!(status, 409, "a batch settled twice: {body}");
 
         server.abort();
         let _ = fs::remove_dir_all(&root);

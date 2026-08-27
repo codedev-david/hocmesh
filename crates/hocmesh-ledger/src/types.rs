@@ -6,6 +6,15 @@ pub fn escrow_account(job_id: &str) -> String {
     format!("hocmesh:escrow:{job_id}")
 }
 
+/// Where one delivered batch waits while the requester makes up its mind.
+///
+/// Escrow that has reached this account can no longer be refunded: the
+/// requester already holds the answer, so the only honest destinations left
+/// are the provider that produced it or the commons.
+pub fn inference_holding_account(assignment_id: &str) -> String {
+    format!("hocmesh:holding:{assignment_id}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Posting {
     pub account_id: String,
@@ -19,7 +28,9 @@ pub enum TransactionKind {
     ProviderReward,
     JobRefund,
     InferenceReserve,
+    InferenceReceipt,
     InferenceReward,
+    InferenceDispute,
     InferenceRefund,
     MembershipChange,
 }
@@ -70,7 +81,9 @@ pub enum TransactionEvidence {
     ProviderReward(ProviderRewardEvidence),
     JobRefund(JobRefundEvidence),
     InferenceReserve(InferenceReserveEvidence),
+    InferenceReceipt(InferenceReceiptEvidence),
     InferenceReward(InferenceRewardEvidence),
+    InferenceDispute(InferenceDisputeEvidence),
     InferenceRefund(InferenceRefundEvidence),
     MembershipChange(MembershipChangeEvidence),
 }
@@ -290,6 +303,26 @@ pub struct InferenceReservation {
     pub reserved_at: i64,
 }
 
+/// A requester admitting that one batch of generated output reached it.
+///
+/// This is the hinge of the whole exchange. Before it, the escrow is still the
+/// requester's and an undelivered batch can be reclaimed. After it, the money
+/// has left the job and can only reach the provider or the commons - so a
+/// requester cannot read an answer and then quietly take its CU back, and a
+/// provider cannot be paid for an answer nobody ever saw.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceReceiptEvidence {
+    pub job_id: String,
+    pub assignment_id: String,
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub price_mcu: i64,
+    /// Binds the receipt to the exact bytes that were handed over.
+    pub outputs_digest: String,
+    pub requester_public_key_b64: String,
+    pub requester_auth: AuthProof,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRewardEvidence {
     pub job_id: String,
@@ -300,6 +333,35 @@ pub struct InferenceRewardEvidence {
     pub outputs_digest: String,
     pub provider_public_key_b64: String,
     pub provider_auth: AuthProof,
+    /// The requester's signature over the same digest.
+    ///
+    /// Nothing a validator can do proves that a generated answer is the one
+    /// the model would have produced, so the ledger does not pretend to. What
+    /// it can insist on is that the party out of pocket said, on the record,
+    /// that this is the answer it is paying for. Without that a provider with
+    /// a real assignment could return any bytes at all and still be paid out
+    /// of somebody else's escrow.
+    pub requester_public_key_b64: String,
+    pub requester_acceptance: AuthProof,
+}
+
+/// A requester rejecting what it was given.
+///
+/// The escrow does not come home. Held CU goes back to community issuance, so
+/// rejecting costs the requester exactly what accepting would have - it buys
+/// nothing by disputing honest work - while a provider that fabricated an
+/// answer collects none of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceDisputeEvidence {
+    pub job_id: String,
+    pub assignment_id: String,
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub price_mcu: i64,
+    pub outputs_digest: String,
+    pub reason: String,
+    pub requester_public_key_b64: String,
+    pub requester_auth: AuthProof,
 }
 
 /// A requester taking back the escrow on a batch nobody delivered.

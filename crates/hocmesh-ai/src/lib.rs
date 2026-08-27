@@ -173,6 +173,7 @@ pub struct InferenceJobStatus {
     pub completed_assignments: u32,
     pub outputs: Vec<PromptOutput>,
     pub refundable: Vec<RefundableBatch>,
+    pub delivered: Vec<DeliveredBatchSummary>,
 }
 
 /// A batch nobody delivered, and what its escrow is worth back.
@@ -187,6 +188,22 @@ pub struct RefundableBatch {
     pub batch_start: u32,
     pub batch_end: u32,
     pub refund_mcu: i64,
+}
+
+/// A batch a provider has answered, seen from the requester's side.
+///
+/// The digest is here and the text is not. That is the whole point of the
+/// two-stage settlement: a requester can see that an answer exists, and what
+/// it will cost, before deciding to take delivery of it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveredBatchSummary {
+    pub assignment_id: String,
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub price_mcu: i64,
+    pub outputs_digest: String,
+    pub receipted: bool,
+    pub settled: Option<String>,
 }
 
 pub fn register_model_body_hash(manifest: &ModelManifest) -> Result<String, serde_json::Error> {
@@ -290,6 +307,50 @@ pub fn assignment_claim(assignment: &InferenceAssignment) -> Option<(u32, u32, i
         hocmesh_core::compute::inference_cost_mcu(&bytes, assignment.max_tokens, parameter_count);
     Some((first, last + 1, reward))
 }
+
+/// What a requester sends to take delivery of a batch it paid for.
+///
+/// Signing this is what moves the CU out of the job escrow and into a holding
+/// account it can never come back from, so the requester cannot read the
+/// answer and then quietly reclaim the money.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptInferenceRequest {
+    pub auth: AuthProof,
+    pub assignment_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptInferenceResponse {
+    pub assignment_id: String,
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub price_mcu: i64,
+    pub outputs_digest: String,
+    /// Handed over only now, in exchange for the receipt.
+    pub outputs: Vec<PromptOutput>,
+}
+
+/// What a requester sends once it has looked at what it was given.
+///
+/// Accepting pays the provider. Disputing does not pay the requester back: the
+/// CU goes to the commons instead, so refusing good work costs exactly what
+/// accepting it would have, and returning junk earns nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettleInferenceRequest {
+    pub auth: AuthProof,
+    pub assignment_id: String,
+    pub accepted: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettleInferenceResponse {
+    pub assignment_id: String,
+    pub accepted: bool,
+    pub paid_mcu: i64,
+    pub job_completed: bool,
+}
+
 /// What a provider signs to claim one batch.
 ///
 /// The coordinator only relays this. The provider signs the amount, the

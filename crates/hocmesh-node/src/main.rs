@@ -172,6 +172,23 @@ enum Command {
     AiReclaim {
         job_id: String,
     },
+    /// Take delivery of a finished batch: pay its escrow into holding and get
+    /// the text back. Nothing else on the network will hand it to you.
+    AiReceipt {
+        job_id: String,
+        assignment_id: String,
+    },
+    /// Say what a delivered batch was worth. Accepting pays the provider;
+    /// disputing returns the same CU to the commons, so neither answer is
+    /// cheaper than the other.
+    AiSettle {
+        job_id: String,
+        assignment_id: String,
+        #[arg(long)]
+        dispute: bool,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
     SubmitPrime {
         #[arg(long)]
         start: u64,
@@ -709,6 +726,57 @@ stored at: {}",
                 );
             }
         }
+        Command::AiReceipt {
+            job_id,
+            assignment_id,
+        } => {
+            let batch = find_delivered(&client, &job_id, &assignment_id).await?;
+            let taken = client.receipt_inference(&job_id, &batch).await?;
+            println!(
+                "Took delivery of {} ({} prompts) for {:.3} CU, held pending settlement.",
+                taken.assignment_id,
+                taken.outputs.len(),
+                taken.price_mcu as f64 / 1000.0
+            );
+            println!("{}", serde_json::to_string_pretty(&taken.outputs)?);
+            println!(
+                "Now say what it was worth: hocmesh ai-settle {job_id} {} [--dispute --reason ...]",
+                taken.assignment_id
+            );
+        }
+        Command::AiSettle {
+            job_id,
+            assignment_id,
+            dispute,
+            reason,
+        } => {
+            let batch = find_delivered(&client, &job_id, &assignment_id).await?;
+            let reason = if dispute && reason.trim().is_empty() {
+                "the answer was not usable".to_string()
+            } else {
+                reason
+            };
+            let settled = client
+                .settle_inference(&job_id, &batch, !dispute, &reason)
+                .await?;
+            if settled.accepted {
+                println!(
+                    "Paid {:.3} CU to the provider of {}.",
+                    settled.paid_mcu as f64 / 1000.0,
+                    settled.assignment_id
+                );
+            } else {
+                println!(
+                    "Disputed {}. The {:.3} CU went to the commons, not back to you.",
+                    settled.assignment_id,
+                    batch.price_mcu as f64 / 1000.0
+                );
+                println!("Reason recorded: {reason}");
+            }
+            if settled.job_completed {
+                println!("Every batch of {job_id} is now settled.");
+            }
+        }
         Command::SubmitPrime { start, end, shards } => {
             let r = client
                 .submit(WorkSpec::PrimeCount { start, end }, shards)
@@ -980,6 +1048,31 @@ stored at: {}",
         }
     }
     Ok(())
+}
+
+/// Resolves one batch of a job that a provider has answered but the requester
+/// has not yet taken delivery of.
+///
+/// The list comes from the coordinator's job status, which shows the digest and
+/// the price of every answered batch but never the text. That is the point: a
+/// requester decides whether to pay for delivery before it can read anything.
+async fn find_delivered(
+    client: &HocMeshClient,
+    job_id: &str,
+    assignment_id: &str,
+) -> Result<hocmesh_ai::DeliveredBatchSummary> {
+    let status = client.inference_status(job_id).await?;
+    let Some(batch) = status
+        .delivered
+        .into_iter()
+        .find(|b| b.assignment_id == assignment_id)
+    else {
+        anyhow::bail!("job {job_id} has no answered batch called {assignment_id}");
+    };
+    if let Some(verdict) = &batch.settled {
+        anyhow::bail!("batch {assignment_id} was already settled as {verdict}");
+    }
+    Ok(batch)
 }
 
 fn model_store(home: &std::path::Path) -> Result<ChunkStore> {

@@ -144,6 +144,22 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    // Added after v0.3.0: a delivered batch is no longer paid on arrival, so
+    // the coordinator has to remember the provider's signed report until the
+    // requester takes delivery and settles. Added by ALTER so an existing
+    // coordinator database picks the columns up without being rebuilt.
+    for column in [
+        "report_json TEXT",
+        "outputs_digest TEXT",
+        "receipted INTEGER NOT NULL DEFAULT 0",
+        "settled TEXT",
+    ] {
+        // Fails only when the column is already there, which is the steady state.
+        let _ = conn.execute(
+            &format!("ALTER TABLE ai_assignments ADD COLUMN {column}"),
+            [],
+        );
+    }
     Ok(())
 }
 

@@ -37,6 +37,7 @@
 | Model/tensor parallelism | Implemented control/data plane | Contiguous ranks and tensor transport; collective kernels require a runtime plugin |
 | Tensor transport | Implemented | Checksums, ordered delivery, replay/window checks, HTTP route failover |
 | Failure-aware rerouting | Implemented | Persistent failed-node exclusions and device-correct reassignment |
+| Inference settlement | Implemented | Two-stage receipt/verdict: escrow moves to a per-batch holding account on delivery, then to the provider on a signed acceptance or to the commons on a signed dispute |
 
 ## Distribution
 

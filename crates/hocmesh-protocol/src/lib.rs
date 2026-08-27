@@ -509,6 +509,62 @@ pub fn inference_refund_body_hash(
         refund_mcu,
     ))
 }
+/// What a requester signs to admit that a batch reached it.
+///
+/// A receipt is not approval. It says only that the requester now holds the
+/// bytes behind `outputs_digest`, and that is the moment its escrow stops
+/// being refundable: from here the batch settles either to the provider or
+/// back to the commons, but never quietly back to the party that already has
+/// the answer.
+pub fn inference_receipt_body_hash(
+    assignment_id: &str,
+    job_id: &str,
+    batch_start: u32,
+    batch_end: u32,
+    price_mcu: i64,
+    outputs_digest: &str,
+) -> Result<String, serde_json::Error> {
+    hash_json(&(
+        "inference_receipt",
+        assignment_id,
+        job_id,
+        batch_start,
+        batch_end,
+        price_mcu,
+        outputs_digest,
+    ))
+}
+
+/// What a requester signs to accept - or to reject - what it was delivered.
+///
+/// The verdict is the only judgement of an inference answer anybody can make,
+/// because no validator can re-run a model to see whether the answer was real.
+/// Both directions are signed over the same digest, so a requester cannot
+/// accept one set of bytes and dispute another, and the two hash differently
+/// so an acceptance can never be replayed as a rejection.
+pub fn inference_verdict_body_hash(
+    accepted: bool,
+    assignment_id: &str,
+    job_id: &str,
+    batch_start: u32,
+    batch_end: u32,
+    price_mcu: i64,
+    outputs_digest: &str,
+) -> Result<String, serde_json::Error> {
+    hash_json(&(
+        if accepted {
+            "inference_accept"
+        } else {
+            "inference_dispute"
+        },
+        assignment_id,
+        job_id,
+        batch_start,
+        batch_end,
+        price_mcu,
+        outputs_digest,
+    ))
+}
 
 pub fn hash_json<T: Serialize + ?Sized>(value: &T) -> Result<String, serde_json::Error> {
     Ok(hash_bytes(&serde_json::to_vec(value)?))

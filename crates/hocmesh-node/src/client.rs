@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, bail};
 use hocmesh_ai::{
-    FailInferenceRequest, FailInferenceResponse, InferenceJobStatus, PlanRequest, PlanResponse,
-    PollInferenceRequest, PollInferenceResponse, RefundInferenceRequest, RefundInferenceResponse,
-    RegisterModelRequest, RegisterModelResponse, ReportInferenceRequest, ReportInferenceResponse,
+    DeliveredBatchSummary, FailInferenceRequest, FailInferenceResponse, InferenceJobStatus,
+    PlanRequest, PlanResponse, PollInferenceRequest, PollInferenceResponse,
+    ReceiptInferenceRequest, ReceiptInferenceResponse, RefundInferenceRequest,
+    RefundInferenceResponse, RegisterModelRequest, RegisterModelResponse, ReportInferenceRequest,
+    ReportInferenceResponse, SettleInferenceRequest, SettleInferenceResponse,
     SubmitInferenceRequest, SubmitInferenceResponse, fail_inference_body_hash, plan_body_hash,
     register_model_body_hash, report_inference_body_hash, submit_inference_body_hash,
 };
@@ -239,6 +241,68 @@ impl HocMeshClient {
 
     pub async fn inference_status(&self, job_id: &str) -> Result<InferenceJobStatus> {
         self.get(&format!("/v1/ai/jobs/{job_id}")).await
+    }
+
+    /// Takes delivery of one finished batch.
+    ///
+    /// This is the only way to get the text: the coordinator hands it over
+    /// against a receipt that moves the batch's escrow into a holding account.
+    /// After it the CU can only reach the provider or the commons, which is
+    /// what stops a requester reading an answer and then reclaiming the money.
+    pub async fn receipt_inference(
+        &self,
+        job_id: &str,
+        batch: &DeliveredBatchSummary,
+    ) -> Result<ReceiptInferenceResponse> {
+        let body_hash = hocmesh_protocol::inference_receipt_body_hash(
+            &batch.assignment_id,
+            job_id,
+            batch.batch_start,
+            batch.batch_end,
+            batch.price_mcu,
+            &batch.outputs_digest,
+        )?;
+        let req = ReceiptInferenceRequest {
+            auth: self.identity.auth("receipt_inference", &body_hash),
+            assignment_id: batch.assignment_id.clone(),
+        };
+        self.post("/v1/ai/jobs/receipt", &req).await
+    }
+
+    /// Says what a delivered batch was worth.
+    ///
+    /// Accepting pays the provider out of holding; disputing sends the same CU
+    /// to the commons instead. The requester is out of pocket either way, which
+    /// is the point: rejecting good work buys nothing back, and returning junk
+    /// earns nothing.
+    pub async fn settle_inference(
+        &self,
+        job_id: &str,
+        batch: &DeliveredBatchSummary,
+        accepted: bool,
+        reason: &str,
+    ) -> Result<SettleInferenceResponse> {
+        let body_hash = hocmesh_protocol::inference_verdict_body_hash(
+            accepted,
+            &batch.assignment_id,
+            job_id,
+            batch.batch_start,
+            batch.batch_end,
+            batch.price_mcu,
+            &batch.outputs_digest,
+        )?;
+        let action = if accepted {
+            "accept_inference"
+        } else {
+            "dispute_inference"
+        };
+        let req = SettleInferenceRequest {
+            auth: self.identity.auth(action, &body_hash),
+            assignment_id: batch.assignment_id.clone(),
+            accepted,
+            reason: reason.to_string(),
+        };
+        self.post("/v1/ai/jobs/settle", &req).await
     }
 
     /// Takes back the escrow on every batch of an inference job the mesh let

@@ -22,6 +22,7 @@
 - Full replica sync/audit for validators and participants.
 - Operator resource limits, so a contributor shares a slice rather than the machine.
 - Measured network coordinates, so scheduling uses requester-to-worker distance.
+- Two-stage inference settlement, so generated text is paid for by a signed exchange rather than by trusting whoever produced it.
 
 ## Priority 0 — handoff validation
 
@@ -39,6 +40,7 @@
 - Efficient indexed transaction/account history.
 - Reconciliation daemon for partial coordinator/ledger failures.
 - Signed checkpoints distributed out-of-band.
+- Sweeping stale inference holding accounts to the commons once the settlement window closes, so a requester that takes delivery and never gives a verdict cannot strand CU indefinitely.
 - Property tests for conservation and replay invariants.
 - Byzantine/fault-injection tests.
 

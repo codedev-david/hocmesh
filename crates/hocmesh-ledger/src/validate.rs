@@ -5,7 +5,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hocmesh_core::compute::{split_work, work_cost_mcu};
 use hocmesh_core::verify::{self, AuditNonce};
 use hocmesh_protocol::{
-    PricedBatch, hash_json, refund_body_hash, result_body_hash, submit_body_hash,
+    AuthProof, PricedBatch, hash_json, refund_body_hash, result_body_hash, submit_body_hash,
     verify_auth_signature,
 };
 
@@ -78,7 +78,13 @@ pub fn claim_key(tx: &LedgerTransaction) -> String {
         TransactionEvidence::JobRefund(e) => format!("reward:{}", e.assignment_id),
         TransactionEvidence::InferenceReserve(e) => format!("reserve:{}", e.job_id),
         TransactionEvidence::InferenceReward(e) => {
+            inference_payout_key(&e.job_id, e.batch_start, e.batch_end)
+        }
+        TransactionEvidence::InferenceReceipt(e) => {
             inference_claim_key(&e.job_id, e.batch_start, e.batch_end)
+        }
+        TransactionEvidence::InferenceDispute(e) => {
+            inference_payout_key(&e.job_id, e.batch_start, e.batch_end)
         }
         TransactionEvidence::InferenceRefund(e) => {
             inference_claim_key(&e.job_id, e.batch_start, e.batch_end)
@@ -94,7 +100,15 @@ pub fn claim_key(tx: &LedgerTransaction) -> String {
 /// let the same batch be claimed twice under two names; the batch is the thing
 /// the requester actually paid for, so it is the thing that can only go once.
 fn inference_claim_key(job_id: &str, batch_start: u32, batch_end: u32) -> String {
-    format!("reward:{job_id}:{batch_start}:{batch_end}")
+    format!("escrow:{job_id}:{batch_start}:{batch_end}")
+}
+
+/// The second half of the same batch: where the CU goes once it is out of
+/// escrow. A batch is received once, and then it is paid or returned once.
+/// Keeping the two stages on separate keys is what lets a receipt close the
+/// refund path without also closing the payment it exists to enable.
+fn inference_payout_key(job_id: &str, batch_start: u32, batch_end: u32) -> String {
+    format!("payout:{job_id}:{batch_start}:{batch_end}")
 }
 
 /// What the ledger will remember about a job, read straight off the reserve.
@@ -246,6 +260,12 @@ pub fn validate_transaction(
         }
         (TransactionKind::InferenceReward, TransactionEvidence::InferenceReward(e)) => {
             validate_inference_reward(tx, e, reserved(&e.job_id)?.as_ref())?
+        }
+        (TransactionKind::InferenceReceipt, TransactionEvidence::InferenceReceipt(e)) => {
+            validate_inference_receipt(tx, e, reserved(&e.job_id)?.as_ref())?
+        }
+        (TransactionKind::InferenceDispute, TransactionEvidence::InferenceDispute(e)) => {
+            validate_inference_dispute(tx, e, reserved(&e.job_id)?.as_ref())?
         }
         (TransactionKind::InferenceRefund, TransactionEvidence::InferenceRefund(e)) => {
             validate_inference_refund(tx, e, reserved(&e.job_id)?.as_ref())?
@@ -413,18 +433,182 @@ fn validate_inference_reward(
     if r.requester == e.provider_auth.node_id {
         bail!("a requester cannot pay itself for its own inference batch")
     }
-    let escrow = escrow_account(&e.job_id);
+    requester_verdict(
+        true,
+        &e.requester_public_key_b64,
+        &e.requester_acceptance,
+        &r.requester,
+        &e.assignment_id,
+        &e.job_id,
+        e.batch_start,
+        e.batch_end,
+        e.reward_mcu,
+        &e.outputs_digest,
+    )?;
+    let held = inference_holding_account(&e.assignment_id);
     if tx.postings.len() != 2
         || !tx
             .postings
             .iter()
-            .any(|p| p.account_id == escrow && p.delta_mcu == -e.reward_mcu)
+            .any(|p| p.account_id == held && p.delta_mcu == -e.reward_mcu)
         || !tx
             .postings
             .iter()
             .any(|p| p.account_id == e.provider_auth.node_id && p.delta_mcu == e.reward_mcu)
     {
         bail!("inference reward postings do not match the claimed batch")
+    }
+    Ok(())
+}
+
+/// The requester's signature on what it was handed.
+///
+/// Accepting and disputing are the same statement with opposite signs, and
+/// they are domain separated so neither can ever be replayed as the other.
+#[allow(clippy::too_many_arguments)]
+fn requester_verdict(
+    accepted: bool,
+    public_key_b64: &str,
+    auth: &AuthProof,
+    requester: &str,
+    assignment_id: &str,
+    job_id: &str,
+    batch_start: u32,
+    batch_end: u32,
+    price_mcu: i64,
+    outputs_digest: &str,
+) -> Result<()> {
+    if auth.node_id != requester {
+        bail!("only {requester} can settle its own inference batch")
+    }
+    let bh = hocmesh_protocol::inference_verdict_body_hash(
+        accepted,
+        assignment_id,
+        job_id,
+        batch_start,
+        batch_end,
+        price_mcu,
+        outputs_digest,
+    )?;
+    let action = if accepted {
+        "accept_inference"
+    } else {
+        "dispute_inference"
+    };
+    verify_auth_signature(public_key_b64, auth, action, &bh).map_err(|e| {
+        anyhow::anyhow!(
+            "the requester did not {} this answer for this batch: {e}",
+            if accepted { "accept" } else { "dispute" }
+        )
+    })?;
+    Ok(())
+}
+
+/// A requester admitting a batch reached it.
+///
+/// This is the hinge of the whole exchange. Before a receipt the escrow is
+/// still the requester's to reclaim; after it, the CU sits in a holding
+/// account that can only pay the provider or return to the commons. That is
+/// what stops a requester collecting the answer and then quietly refunding
+/// itself, and it is what makes rejecting a bad answer a real option rather
+/// than a bluff: the requester pays either way, so it has nothing to gain by
+/// approving work it can see is junk.
+fn validate_inference_receipt(
+    tx: &LedgerTransaction,
+    e: &InferenceReceiptEvidence,
+    reserved: Option<&InferenceReservation>,
+) -> Result<()> {
+    let bh = hocmesh_protocol::inference_receipt_body_hash(
+        &e.assignment_id,
+        &e.job_id,
+        e.batch_start,
+        e.batch_end,
+        e.price_mcu,
+        &e.outputs_digest,
+    )?;
+    verify_auth_signature(
+        &e.requester_public_key_b64,
+        &e.requester_auth,
+        "receipt_inference",
+        &bh,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let Some(r) = reserved else {
+        bail!("an inference receipt has no reservation to move")
+    };
+    if r.requester != e.requester_auth.node_id {
+        bail!("only the requester that funded a batch can receipt it")
+    }
+    let (_, price) = reserved_batch(r, &e.assignment_id, e.batch_start, e.batch_end)?;
+    if e.price_mcu != price {
+        bail!("inference receipt does not carry the price the requester signed for the batch")
+    }
+    let escrow = escrow_account(&e.job_id);
+    let held = inference_holding_account(&e.assignment_id);
+    if tx.postings.len() != 2
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == escrow && p.delta_mcu == -price)
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == held && p.delta_mcu == price)
+    {
+        bail!("inference receipt postings do not move the batch out of escrow")
+    }
+    Ok(())
+}
+
+/// A requester rejecting what it was handed.
+///
+/// The escrow does not come back. A rejection costs the requester the same as
+/// an acceptance would have, so refusing good work buys nothing, while a
+/// provider that returned bytes the requester will not stand behind is paid
+/// nothing at all. The CU goes back to the commons rather than to either
+/// party, which is the only outcome neither of them can profit from.
+fn validate_inference_dispute(
+    tx: &LedgerTransaction,
+    e: &InferenceDisputeEvidence,
+    reserved: Option<&InferenceReservation>,
+) -> Result<()> {
+    let Some(r) = reserved else {
+        bail!("an inference dispute has no reservation to settle")
+    };
+    if r.requester != e.requester_auth.node_id {
+        bail!("only the requester that funded a batch can dispute it")
+    }
+    let (_, price) = reserved_batch(r, &e.assignment_id, e.batch_start, e.batch_end)?;
+    if e.price_mcu != price {
+        bail!("inference dispute does not carry the price the requester signed for the batch")
+    }
+    requester_verdict(
+        false,
+        &e.requester_public_key_b64,
+        &e.requester_auth,
+        &r.requester,
+        &e.assignment_id,
+        &e.job_id,
+        e.batch_start,
+        e.batch_end,
+        e.price_mcu,
+        &e.outputs_digest,
+    )?;
+    if e.reason.trim().is_empty() || e.reason.chars().count() > 512 {
+        bail!("an inference dispute has to say what was wrong, in 512 characters or fewer")
+    }
+    let held = inference_holding_account(&e.assignment_id);
+    if tx.postings.len() != 2
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == held && p.delta_mcu == -price)
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == COMMUNITY_ISSUANCE_ACCOUNT && p.delta_mcu == price)
+    {
+        bail!("inference dispute postings do not return the batch to the commons")
     }
     Ok(())
 }
@@ -804,7 +988,31 @@ pub fn validate_historical_transaction(
                 &bh,
             )
             .map_err(anyhow::Error::msg)?;
-            let source = escrow_account(&e.job_id);
+            // The requester's acceptance is the other half. A provider's own
+            // signature says only that it computed something; nothing about a
+            // generated answer can be recomputed by a validator, so what stands
+            // in for verification is the requester saying, on the record, that
+            // this is the answer it is paying for.
+            let vh = hocmesh_protocol::inference_verdict_body_hash(
+                true,
+                &e.assignment_id,
+                &e.job_id,
+                e.batch_start,
+                e.batch_end,
+                e.reward_mcu,
+                &e.outputs_digest,
+            )?;
+            hocmesh_protocol::verify_auth_signature(
+                &e.requester_public_key_b64,
+                &e.requester_acceptance,
+                "accept_inference",
+                &vh,
+            )
+            .map_err(anyhow::Error::msg)?;
+            // Paid out of the batch's holding account, which only a receipt
+            // can fill: the CU cannot reach a provider without the requester
+            // having first taken delivery of the answer.
+            let source = inference_holding_account(&e.assignment_id);
             if tx.postings.len() != 2
                 || !tx
                     .postings
@@ -849,6 +1057,88 @@ pub fn validate_historical_transaction(
                 })
             {
                 bail!("historical inference refund postings invalid")
+            }
+        }
+        (TransactionKind::InferenceReceipt, TransactionEvidence::InferenceReceipt(e)) => {
+            // Taking delivery. It pays nobody; it moves a batch's escrow into a
+            // holding account so the answer can be handed over against
+            // something the requester cannot take back.
+            if e.batch_end <= e.batch_start {
+                bail!("historical inference receipt covers an empty batch")
+            }
+            if e.price_mcu <= 0 {
+                bail!("historical inference receipt names a non-positive price")
+            }
+            let bh = hocmesh_protocol::inference_receipt_body_hash(
+                &e.assignment_id,
+                &e.job_id,
+                e.batch_start,
+                e.batch_end,
+                e.price_mcu,
+                &e.outputs_digest,
+            )?;
+            hocmesh_protocol::verify_auth_signature(
+                &e.requester_public_key_b64,
+                &e.requester_auth,
+                "receipt_inference",
+                &bh,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let source = escrow_account(&e.job_id);
+            let held = inference_holding_account(&e.assignment_id);
+            if tx.postings.len() != 2
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == source && p.delta_mcu == -e.price_mcu)
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == held && p.delta_mcu == e.price_mcu)
+            {
+                bail!("historical inference receipt postings invalid")
+            }
+        }
+        (TransactionKind::InferenceDispute, TransactionEvidence::InferenceDispute(e)) => {
+            // A rejection. It costs the requester exactly what accepting would
+            // have, and the provider gets none of it: refusing good work buys
+            // nothing, and returning junk earns nothing.
+            if e.batch_end <= e.batch_start {
+                bail!("historical inference dispute covers an empty batch")
+            }
+            if e.price_mcu <= 0 {
+                bail!("historical inference dispute names a non-positive price")
+            }
+            if e.reason.trim().is_empty() || e.reason.chars().count() > 512 {
+                bail!("historical inference dispute carries no usable reason")
+            }
+            let vh = hocmesh_protocol::inference_verdict_body_hash(
+                false,
+                &e.assignment_id,
+                &e.job_id,
+                e.batch_start,
+                e.batch_end,
+                e.price_mcu,
+                &e.outputs_digest,
+            )?;
+            hocmesh_protocol::verify_auth_signature(
+                &e.requester_public_key_b64,
+                &e.requester_auth,
+                "dispute_inference",
+                &vh,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let held = inference_holding_account(&e.assignment_id);
+            if tx.postings.len() != 2
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == held && p.delta_mcu == -e.price_mcu)
+                || !tx.postings.iter().any(|p| {
+                    p.account_id == COMMUNITY_ISSUANCE_ACCOUNT && p.delta_mcu == e.price_mcu
+                })
+            {
+                bail!("historical inference dispute postings invalid")
             }
         }
         _ => bail!("historical transaction kind/evidence mismatch"),
@@ -1134,6 +1424,49 @@ pub fn verify_historical_evidence(
                 &bh,
             )
             .map_err(anyhow::Error::msg)?;
+            requester_verdict(
+                true,
+                &e.requester_public_key_b64,
+                &e.requester_acceptance,
+                &e.requester_acceptance.node_id,
+                &e.assignment_id,
+                &e.job_id,
+                e.batch_start,
+                e.batch_end,
+                e.reward_mcu,
+                &e.outputs_digest,
+            )?;
+        }
+        TransactionEvidence::InferenceReceipt(e) => {
+            let bh = hocmesh_protocol::inference_receipt_body_hash(
+                &e.assignment_id,
+                &e.job_id,
+                e.batch_start,
+                e.batch_end,
+                e.price_mcu,
+                &e.outputs_digest,
+            )?;
+            verify_auth_signature(
+                &e.requester_public_key_b64,
+                &e.requester_auth,
+                "receipt_inference",
+                &bh,
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        TransactionEvidence::InferenceDispute(e) => {
+            requester_verdict(
+                false,
+                &e.requester_public_key_b64,
+                &e.requester_auth,
+                &e.requester_auth.node_id,
+                &e.assignment_id,
+                &e.job_id,
+                e.batch_start,
+                e.batch_end,
+                e.price_mcu,
+                &e.outputs_digest,
+            )?;
         }
         TransactionEvidence::InferenceRefund(e) => {
             let bh = hocmesh_protocol::inference_refund_body_hash(
@@ -2818,6 +3151,7 @@ mod tests {
     /// A provider's claim on a batch, signed the way a provider signs one.
     fn signed_inference_reward(
         provider: &NodeIdentity,
+        requester: &NodeIdentity,
         job_id: &str,
         assignment_id: &str,
         start: u32,
@@ -2835,12 +3169,23 @@ mod tests {
         )
         .unwrap();
         let auth = provider.auth("report_inference", &bh);
+        let vh = hocmesh_protocol::inference_verdict_body_hash(
+            true,
+            assignment_id,
+            job_id,
+            start,
+            end,
+            reward_mcu,
+            &outputs_digest,
+        )
+        .unwrap();
+        let acceptance = requester.auth("accept_inference", &vh);
         LedgerTransaction {
             transaction_id: format!("reward-{assignment_id}"),
             kind: TransactionKind::InferenceReward,
             postings: vec![
                 Posting {
-                    account_id: escrow_account(job_id),
+                    account_id: inference_holding_account(assignment_id),
                     delta_mcu: -reward_mcu,
                 },
                 Posting {
@@ -2857,6 +3202,8 @@ mod tests {
                 outputs_digest,
                 provider_public_key_b64: provider.public_key_b64(),
                 provider_auth: auth,
+                requester_public_key_b64: requester.public_key_b64(),
+                requester_acceptance: acceptance,
             }),
             created_at: 1_700_000_100,
         }
@@ -2865,10 +3212,12 @@ mod tests {
     /// The honest claim: the assigned node, the reserved batch, the agreed price.
     #[test]
     fn an_assigned_provider_is_paid_the_reserved_price() {
+        let requester = test_identity("inf-req-a");
         let provider = test_identity("inf-provider");
-        let r = reservation_for("hocmesh:node:requester", &provider.node_id());
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
         let price = reserved_price(&r);
-        let tx = signed_inference_reward(&provider, "job1", &det("job1", 0), 0, 2, price);
+        let tx =
+            signed_inference_reward(&provider, &requester, "job1", &det("job1", 0), 0, 2, price);
         super::validate_transaction(
             &tx,
             TEST_PREVIOUS_HASH,
@@ -2883,10 +3232,11 @@ mod tests {
     /// is real - it is simply a claim on work that was never assigned to them.
     #[test]
     fn a_node_cannot_claim_a_batch_assigned_to_another() {
+        let requester = test_identity("inf-req-b");
         let thief = test_identity("inf-thief");
-        let r = reservation_for("hocmesh:node:requester", "hocmesh:node:assigned");
+        let r = reservation_for(&requester.node_id(), "hocmesh:node:assigned");
         let price = reserved_price(&r);
-        let tx = signed_inference_reward(&thief, "job1", &det("job1", 0), 0, 2, price);
+        let tx = signed_inference_reward(&thief, &requester, "job1", &det("job1", 0), 0, 2, price);
         let err = super::validate_transaction(
             &tx,
             TEST_PREVIOUS_HASH,
@@ -2903,10 +3253,19 @@ mod tests {
     /// the amount, so this is the provider's own honest signature over a lie.
     #[test]
     fn a_provider_cannot_price_its_own_batch() {
+        let requester = test_identity("inf-req-c");
         let provider = test_identity("inf-greedy");
-        let r = reservation_for("hocmesh:node:requester", &provider.node_id());
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
         let price = reserved_price(&r);
-        let tx = signed_inference_reward(&provider, "job1", &det("job1", 0), 0, 2, price * 10);
+        let tx = signed_inference_reward(
+            &provider,
+            &requester,
+            "job1",
+            &det("job1", 0),
+            0,
+            2,
+            price * 10,
+        );
         let err = super::validate_transaction(
             &tx,
             TEST_PREVIOUS_HASH,
@@ -2923,9 +3282,11 @@ mod tests {
     /// indistinguishable from an honest claim.
     #[test]
     fn an_unreserved_batch_cannot_be_claimed() {
+        let requester = test_identity("inf-req-d");
         let provider = test_identity("inf-ghost");
-        let r = reservation_for("hocmesh:node:requester", &provider.node_id());
-        let tx = signed_inference_reward(&provider, "job1", &det("job1", 1), 2, 4, 1_000);
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let tx =
+            signed_inference_reward(&provider, &requester, "job1", &det("job1", 1), 2, 4, 1_000);
         let err = super::validate_transaction(
             &tx,
             TEST_PREVIOUS_HASH,
@@ -2942,8 +3303,9 @@ mod tests {
     /// or the reserve never certified. There is nothing to pay out of.
     #[test]
     fn a_reward_without_a_reservation_is_rejected() {
+        let requester = test_identity("inf-req-e");
         let provider = test_identity("inf-orphan");
-        let tx = signed_inference_reward(&provider, "job1", "a1", 0, 2, 1_000);
+        let tx = signed_inference_reward(&provider, &requester, "job1", "a1", 0, 2, 1_000);
         let err = super::validate_transaction(
             &tx,
             TEST_PREVIOUS_HASH,
@@ -2960,9 +3322,304 @@ mod tests {
     /// claim collides with the first instead of drawing the escrow down twice.
     #[test]
     fn one_batch_settles_once_whatever_the_assignment_is_called() {
+        let requester = test_identity("inf-req-f");
         let provider = test_identity("inf-double");
-        let a = signed_inference_reward(&provider, "job1", "a1", 0, 2, 1_000);
-        let b = signed_inference_reward(&provider, "job1", "a2", 0, 2, 1_000);
+        let a = signed_inference_reward(&provider, &requester, "job1", "a1", 0, 2, 1_000);
+        let b = signed_inference_reward(&provider, &requester, "job1", "a2", 0, 2, 1_000);
         assert_eq!(claim_key(&a), claim_key(&b));
+    }
+
+    /// A receipt: escrow into the batch's holding account, signed by the node
+    /// that funded the job. It buys the answer, and it buys nothing else.
+    fn signed_receipt(
+        requester: &NodeIdentity,
+        job_id: &str,
+        assignment_id: &str,
+        start: u32,
+        end: u32,
+        price_mcu: i64,
+        outputs_digest: &str,
+    ) -> LedgerTransaction {
+        let bh = hocmesh_protocol::inference_receipt_body_hash(
+            assignment_id,
+            job_id,
+            start,
+            end,
+            price_mcu,
+            outputs_digest,
+        )
+        .unwrap();
+        let auth = requester.auth("receipt_inference", &bh);
+        LedgerTransaction {
+            transaction_id: format!("receipt-{assignment_id}"),
+            kind: TransactionKind::InferenceReceipt,
+            postings: vec![
+                Posting {
+                    account_id: escrow_account(job_id),
+                    delta_mcu: -price_mcu,
+                },
+                Posting {
+                    account_id: inference_holding_account(assignment_id),
+                    delta_mcu: price_mcu,
+                },
+            ],
+            evidence: TransactionEvidence::InferenceReceipt(InferenceReceiptEvidence {
+                job_id: job_id.to_string(),
+                assignment_id: assignment_id.to_string(),
+                batch_start: start,
+                batch_end: end,
+                price_mcu,
+                outputs_digest: outputs_digest.to_string(),
+                requester_public_key_b64: requester.public_key_b64(),
+                requester_auth: auth,
+            }),
+            created_at: 1_700_000_100,
+        }
+    }
+
+    /// A rejection: the holding account back to the commons. It is priced
+    /// exactly like the acceptance it replaces, so refusing an answer never
+    /// costs the requester less than taking it.
+    fn signed_dispute(
+        requester: &NodeIdentity,
+        job_id: &str,
+        assignment_id: &str,
+        start: u32,
+        end: u32,
+        price_mcu: i64,
+        outputs_digest: &str,
+    ) -> LedgerTransaction {
+        let vh = hocmesh_protocol::inference_verdict_body_hash(
+            false,
+            assignment_id,
+            job_id,
+            start,
+            end,
+            price_mcu,
+            outputs_digest,
+        )
+        .unwrap();
+        let auth = requester.auth("dispute_inference", &vh);
+        LedgerTransaction {
+            transaction_id: format!("dispute-{assignment_id}"),
+            kind: TransactionKind::InferenceDispute,
+            postings: vec![
+                Posting {
+                    account_id: inference_holding_account(assignment_id),
+                    delta_mcu: -price_mcu,
+                },
+                Posting {
+                    account_id: COMMUNITY_ISSUANCE_ACCOUNT.to_string(),
+                    delta_mcu: price_mcu,
+                },
+            ],
+            evidence: TransactionEvidence::InferenceDispute(InferenceDisputeEvidence {
+                job_id: job_id.to_string(),
+                assignment_id: assignment_id.to_string(),
+                batch_start: start,
+                batch_end: end,
+                price_mcu,
+                outputs_digest: outputs_digest.to_string(),
+                reason: "the answer was not an answer".into(),
+                requester_public_key_b64: requester.public_key_b64(),
+                requester_auth: auth,
+            }),
+            created_at: 1_700_000_100,
+        }
+    }
+
+    /// The hole this whole two-stage settlement exists to close.
+    ///
+    /// A provider holding a real assignment returns bytes of its own choosing.
+    /// Every signature it can produce is valid - it did sign for that batch of
+    /// that job - and no validator anywhere can recompute a generated answer to
+    /// tell whether the bytes are the model's or the provider's. What refuses
+    /// the claim is that the requester never said the answer was worth paying
+    /// for, and without that sentence there is no reward at all.
+    #[test]
+    fn arbitrary_bytes_from_a_real_assignment_are_not_payable() {
+        let requester = test_identity("inf-req-g");
+        let provider = test_identity("inf-liar");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let assignment = det("job1", 0);
+        let mut tx =
+            signed_inference_reward(&provider, &requester, "job1", &assignment, 0, 2, price);
+        // The provider swaps in its own bytes and re-signs, exactly as it is
+        // able to. Only the acceptance is left over the answer that was really
+        // taken, because that one is not the provider's to write.
+        let junk = hocmesh_protocol::hash_json(&"whatever I felt like returning").unwrap();
+        let TransactionEvidence::InferenceReward(e) = &mut tx.evidence else {
+            unreachable!()
+        };
+        e.outputs_digest = junk.clone();
+        let bh = hocmesh_protocol::inference_reward_body_hash(
+            &e.assignment_id,
+            &e.job_id,
+            e.batch_start,
+            e.batch_end,
+            e.reward_mcu,
+            &junk,
+        )
+        .unwrap();
+        e.provider_auth = provider.auth("report_inference", &bh);
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("accept"), "{err}");
+    }
+
+    /// Somebody else's blessing is not the requester's. Only the node out of
+    /// pocket can say the answer was worth its escrow.
+    #[test]
+    fn an_outsider_cannot_accept_a_batch_it_did_not_pay_for() {
+        let requester = test_identity("inf-req-h");
+        let bystander = test_identity("inf-bystander");
+        let provider = test_identity("inf-honest");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let tx =
+            signed_inference_reward(&provider, &bystander, "job1", &det("job1", 0), 0, 2, price);
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("settle its own"), "{err}");
+    }
+
+    /// A receipt is what fills the account a reward is paid out of, so an
+    /// unreceipted batch has nothing to pay from however well signed it is.
+    #[test]
+    fn a_reward_cannot_be_paid_out_of_an_empty_holding_account() {
+        let requester = test_identity("inf-req-i");
+        let provider = test_identity("inf-eager");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let assignment = det("job1", 0);
+        let tx = signed_inference_reward(&provider, &requester, "job1", &assignment, 0, 2, price);
+        // The balance oracle answers for the real world: nothing was ever
+        // receipted, so the batch's holding account is empty.
+        let held = inference_holding_account(&assignment);
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |a| Ok(if a == held { 0 } else { 1_000_000 }),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("overdraw") || err.contains("insufficient"),
+            "{err}"
+        );
+    }
+
+    /// The honest exchange, both halves. The receipt takes the escrow out of
+    /// the job and the acceptance pays it to the provider, and neither step
+    /// works without the requester's own signature on it.
+    #[test]
+    fn a_receipt_then_an_acceptance_pays_the_provider() {
+        let requester = test_identity("inf-req-j");
+        let provider = test_identity("inf-paid");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let assignment = det("job1", 0);
+        let digest = hocmesh_protocol::hash_json(&"the model's own answer").unwrap();
+        let receipt = signed_receipt(&requester, "job1", &assignment, 0, 2, price, &digest);
+        super::validate_transaction(
+            &receipt,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap();
+        let reward =
+            signed_inference_reward(&provider, &requester, "job1", &assignment, 0, 2, price);
+        super::validate_transaction(
+            &reward,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap();
+        // Receipt and payout are separate stages, so taking delivery closes the
+        // refund without closing the payment it exists to enable.
+        assert_ne!(claim_key(&receipt), claim_key(&reward));
+    }
+
+    /// A dispute costs the requester the same CU an acceptance would have. It
+    /// buys nothing back, which is what makes rejecting good work pointless.
+    #[test]
+    fn a_dispute_returns_the_batch_to_the_commons_and_not_to_the_requester() {
+        let requester = test_identity("inf-req-k");
+        let provider = test_identity("inf-junk");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let assignment = det("job1", 0);
+        let digest = hocmesh_protocol::hash_json(&"garbage").unwrap();
+        let tx = signed_dispute(&requester, "job1", &assignment, 0, 2, price, &digest);
+        super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap();
+        let _ = provider;
+
+        // Pointing the same rejection back at the requester's own account is
+        // the free-compute attack, and it is not a dispute the ledger will take.
+        let mut greedy = tx.clone();
+        greedy.postings[1].account_id = requester.node_id();
+        let err = super::validate_transaction(
+            &greedy,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("commons"), "{err}");
+    }
+
+    /// One batch, one payout. Accepting and disputing share a claim key, so a
+    /// requester cannot both pay for an answer and reject it.
+    #[test]
+    fn a_batch_is_accepted_or_disputed_but_never_both() {
+        let requester = test_identity("inf-req-l");
+        let provider = test_identity("inf-both");
+        let assignment = det("job1", 0);
+        let digest = hocmesh_protocol::hash_json(&"an answer").unwrap();
+        let accept =
+            signed_inference_reward(&provider, &requester, "job1", &assignment, 0, 2, 1_000);
+        let reject = signed_dispute(&requester, "job1", &assignment, 0, 2, 1_000, &digest);
+        assert_eq!(claim_key(&accept), claim_key(&reject));
+    }
+
+    /// Delivery and reclaim are the pair that must not both happen: a receipt
+    /// takes the escrow, so a refund of the same batch has nothing left.
+    #[test]
+    fn a_receipted_batch_cannot_also_be_refunded() {
+        let requester = test_identity("inf-req-m");
+        let assignment = det("job1", 0);
+        let digest = hocmesh_protocol::hash_json(&"an answer").unwrap();
+        let receipt = signed_receipt(&requester, "job1", &assignment, 0, 2, 1_000, &digest);
+        assert_eq!(claim_key(&receipt), "escrow:job1:0:2");
     }
 }
