@@ -810,6 +810,31 @@ Recommended protections before public exposure:
 - database backups,
 - pinned validator membership distributed with clients.
 
+## What the network tests actually break
+
+The quorum flow suite does not assume a healthy wire. It puts a fault-injecting
+TCP relay in front of every validator and advertises the relay addresses in the
+signed validator set, so coordinator-to-validator and validator-to-validator
+traffic both go through it. A test can then delay or sever any link mid-request:
+
+- **WAN latency.** 45 ms one way on every hop. Seeding, submitting, settling and
+  auditing all still complete.
+- **Minority partition.** One of four validators is cut off. The threshold is
+  three, so settlement continues; the isolated replica falls behind rather than
+  inventing entries, and `hocmesh-validator sync` replays it back into line.
+- **Majority partition.** Two of four are cut off, one short of the threshold.
+  Delivery fails instead of paying from a database the chain never certified,
+  and when the link heals `hocmesh-coordinator recover` settles the stranded
+  shard exactly once - running it twice does not pay twice.
+- **Clock skew.** A request signed with a timestamp outside the 300 second
+  window is refused; one inside it still gets work.
+
+What this is not: every process in those tests runs on one machine over
+loopback. Nothing here has crossed a NAT, a real WAN, a lossy or reordering
+link, or a bandwidth cap, and no test spans two operating systems. Treat the
+suite as evidence that the protocol survives delay and partition, not as
+evidence that a multi-host deployment works.
+
 ---
 
 # Current workloads
@@ -888,6 +913,7 @@ This repository intentionally documents the remaining work instead of disguising
 9. Installers are unsigned until platform signing identities are configured in the release environment.
 10. P2P model seeding uses authenticated HTTP peers; NAT traversal and peer discovery remain deployment concerns.
 11. Coordinator crash recovery is implemented through durable ledger intents and `hocmesh-coordinator recover`, and a coordinator whose database is lost entirely can be rebuilt from the chain with `hocmesh-coordinator rebuild`. Both are operator-initiated: automatic failover between competing coordinators, and a full multi-coordinator BFT view-change protocol, remain production blockers.
+12. The network has been broken deliberately but never crossed. `cargo test -p hocmesh-integration-tests --test quorum_flow` now runs the quorum behind a fault-injecting TCP relay: WAN-scale latency on every link, a minority partition (settlement continues, the isolated validator falls behind and is repaired with `hocmesh-validator sync`), a majority partition (settlement refuses rather than fakes, and the stranded shard pays exactly once when the link heals), and authentication under clock skew on both sides of the tolerated window. Every process in those tests still runs on one machine over loopback. Multi-host deployment, NAT traversal, packet loss and reordering, and bandwidth limits are untested.
 
 These are specifically called out in `CODEX_HANDOFF.md` as next engineering targets.
 

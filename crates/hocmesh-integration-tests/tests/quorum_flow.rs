@@ -11,10 +11,10 @@ use hocmesh_ledger::{
     },
 };
 use hocmesh_protocol::{
-    BalanceResponse, ErrorResponse, JobStatusResponse, NodeCapabilities, PollRequest, PollResponse,
-    RegisterRequest, ResultRequest, SubmitJobRequest, SubmitJobResponse, WorkAssignment,
-    WorkResult, WorkSpec, empty_body_hash, job_id_from_auth, now_unix, register_body_hash,
-    result_body_hash, submit_body_hash,
+    AuthProof, BalanceResponse, ErrorResponse, JobStatusResponse, NodeCapabilities, PollRequest,
+    PollResponse, RegisterRequest, ResultRequest, SubmitJobRequest, SubmitJobResponse,
+    WorkAssignment, WorkResult, WorkSpec, canonical_auth_message, empty_body_hash,
+    job_id_from_auth, now_unix, register_body_hash, result_body_hash, submit_body_hash,
 };
 use reqwest::Client;
 use serde_json::json;
@@ -23,6 +23,10 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -962,10 +966,30 @@ fn create_validator_set(
     validator_bin: &Path,
     validator_ports: &[u16; 4],
 ) -> Result<(PathBuf, Vec<PathBuf>, Vec<PathBuf>, ValidatorSet)> {
+    let urls: Vec<String> = validator_ports
+        .iter()
+        .map(|port| format!("http://127.0.0.1:{port}"))
+        .collect();
+    create_validator_set_at(tmp, validator_bin, &urls)
+}
+
+/// Build a set whose advertised URLs are not the ports the validators listen
+/// on.
+///
+/// The advertised URL is part of the signed membership, so a proxy cannot be
+/// slipped in front of a live set after the fact: every node has to agree on
+/// the same addresses or the membership hashes stop matching. Pointing the
+/// whole set at relay ports from the start is how a test gets to break the
+/// wire underneath a network that is already running.
+fn create_validator_set_at(
+    tmp: &TestDir,
+    validator_bin: &Path,
+    urls: &[String],
+) -> Result<(PathBuf, Vec<PathBuf>, Vec<PathBuf>, ValidatorSet)> {
     let mut members = Vec::new();
     let mut validator_homes = Vec::new();
     let mut validator_dbs = Vec::new();
-    for (index, port) in validator_ports.iter().enumerate() {
+    for (index, url) in urls.iter().enumerate() {
         let home = tmp.path.join(format!("validator-{index}"));
         let output = Command::new(validator_bin)
             .arg("id")
@@ -984,7 +1008,7 @@ fn create_validator_set(
         let public_key_b64 = parse_value(&stdout, "public_key_b64=")?;
         members.push(json!({
             "validator_id": validator_id,
-            "url": format!("http://127.0.0.1:{port}"),
+            "url": url,
             "public_key_b64": public_key_b64,
         }));
         validator_homes.push(home);
@@ -1969,4 +1993,576 @@ fn community_mint(
         },
         created_at: now_unix(),
     })
+}
+
+/// Settlement must survive the two things a real network always has: distance,
+/// and a peer that goes away.
+///
+/// Every coordinator-to-validator hop is put behind 45 ms of one-way latency,
+/// which is a plausible cross-continent link and about 90 ms per round trip.
+/// Then one of the four validators is cut off from the coordinator entirely.
+/// Three remain, the threshold is three, so work must still settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settlement_survives_wan_latency_and_a_minority_partition() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let coordinator_bin = bin_dir.join(exe("hocmesh-coordinator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = Client::new();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let mut links = Vec::new();
+    for port in validator_ports {
+        links.push(FaultLink::to(port).await?);
+    }
+    let urls: Vec<String> = links.iter().map(|l| l.url()).collect();
+    let (validators_path, validator_homes, validator_dbs, set) =
+        create_validator_set_at(&tmp, &validator_bin, &urls)?;
+
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    for link in &links {
+        link.set_one_way_latency(45);
+    }
+
+    let coordinator_db = tmp.path.join("coordinator-wan.db");
+    let seed_job = "job_wan_seed";
+    let seed_sponsors = sponsors_file(
+        &tmp.path,
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        seed_job,
+        (2, 50000, 4),
+    )?;
+    run_ok(
+        Command::new(&coordinator_bin)
+            .arg("seed")
+            .arg("--job-id")
+            .arg(seed_job)
+            .arg("--sponsors")
+            .arg(&seed_sponsors)
+            .arg("--db")
+            .arg(&coordinator_db)
+            .arg("--validators")
+            .arg(&validators_path)
+            .arg("--start")
+            .arg("2")
+            .arg("--end")
+            .arg("50000")
+            .arg("--shards")
+            .arg("4"),
+        "seed community job across a delayed link",
+    )?;
+
+    let coordinator_port = free_port()?;
+    let _coordinator = ProcessGuard::spawn(
+        Command::new(&coordinator_bin)
+            .arg("serve")
+            .arg("--db")
+            .arg(&coordinator_db)
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{coordinator_port}"))
+            .arg("--validators")
+            .arg(&validators_path),
+    )?;
+    wait_health(&http, coordinator_port).await?;
+    let coordinator = format!("http://127.0.0.1:{coordinator_port}");
+
+    let node = TestNode::new(&tmp.path.join("wan-node"))?;
+    register(&http, &coordinator, &node).await?;
+
+    // A full round of settlement across four delayed links.
+    let first = poll_until_assignment(&http, &coordinator, &node, Some(seed_job)).await?;
+    complete_assignment(&http, &coordinator, &node, &first).await?;
+    let after_first = balance(&http, &coordinator, &node).await?.balance_mcu;
+    assert!(after_first > 0, "a delayed link must not stop settlement");
+
+    // One validator is now unreachable from the coordinator. Three of four
+    // remain and the threshold is three, so the next shard must still settle.
+    links[0].cut();
+    let second = poll_until_assignment(&http, &coordinator, &node, Some(seed_job)).await?;
+    complete_assignment(&http, &coordinator, &node, &second).await?;
+    let after_second = balance(&http, &coordinator, &node).await?.balance_mcu;
+    assert!(
+        after_second > after_first,
+        "losing a minority of the quorum must not stop settlement"
+    );
+
+    // The link comes back. The three validators that stayed reachable have
+    // been settling all along, so they agree; the isolated one is strictly
+    // behind, because a replica that missed commits does not invent them.
+    links[0].heal();
+    let mut connected = None;
+    for _ in 0..100 {
+        let heads = validator_heads(&http, &set).await?;
+        if heads[1].sequence > 0 && heads[1..].iter().all(|h| h.sequence == heads[1].sequence) {
+            connected = Some(heads[1].sequence);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let connected = connected.context("the reachable validators never agreed on a head")?;
+    let behind = validator_heads(&http, &set).await?[0].sequence;
+    assert!(
+        behind < connected,
+        "a validator cut off from the quorum must fall behind, not keep pace"
+    );
+
+    // Catching it up is the documented repair: stop it, replay from its
+    // peers, start it again. A healed link does not do that on its own.
+    drop(validators.remove(0));
+    run_ok(
+        Command::new(&validator_bin)
+            .arg("sync")
+            .arg("--db")
+            .arg(&validator_dbs[0])
+            .arg("--validators")
+            .arg(&validators_path),
+        "replay the isolated validator from its peers",
+    )?;
+    validators.push(
+        start_validator(
+            &validator_bin,
+            &validators_path,
+            &validator_homes[0],
+            &validator_dbs[0],
+            validator_ports[0],
+            &http,
+        )
+        .await?,
+    );
+    let healed = validator_heads(&http, &set).await?;
+    assert!(
+        healed.iter().all(|h| h.sequence == connected),
+        "every validator should hold the same head once the laggard has replayed"
+    );
+
+    drop(validators);
+    Ok(())
+}
+
+/// Losing a majority of the quorum must stop settlement, not fake it.
+///
+/// The worker takes an assignment while the network is whole, then the
+/// coordinator is cut off from two of four validators - one short of the
+/// three it needs. Delivery must fail. When the link comes back the pending
+/// settlement must complete, and it must be worth exactly one shard - not
+/// two, and not none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_majority_partition_stops_settlement_and_recovery_pays_once() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let coordinator_bin = bin_dir.join(exe("hocmesh-coordinator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = Client::new();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let mut links = Vec::new();
+    for port in validator_ports {
+        links.push(FaultLink::to(port).await?);
+    }
+    let urls: Vec<String> = links.iter().map(|l| l.url()).collect();
+    let (validators_path, validator_homes, validator_dbs, _set) =
+        create_validator_set_at(&tmp, &validator_bin, &urls)?;
+
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    for link in &links {
+        link.set_one_way_latency(5);
+    }
+
+    let coordinator_db = tmp.path.join("coordinator-partition.db");
+    let seed_job = "job_partition_seed";
+    let seed_sponsors = sponsors_file(
+        &tmp.path,
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        seed_job,
+        (2, 50000, 4),
+    )?;
+    run_ok(
+        Command::new(&coordinator_bin)
+            .arg("seed")
+            .arg("--job-id")
+            .arg(seed_job)
+            .arg("--sponsors")
+            .arg(&seed_sponsors)
+            .arg("--db")
+            .arg(&coordinator_db)
+            .arg("--validators")
+            .arg(&validators_path)
+            .arg("--start")
+            .arg("2")
+            .arg("--end")
+            .arg("50000")
+            .arg("--shards")
+            .arg("4"),
+        "seed community job before partitioning the quorum",
+    )?;
+
+    let coordinator_port = free_port()?;
+    let _coordinator = ProcessGuard::spawn(
+        Command::new(&coordinator_bin)
+            .arg("serve")
+            .arg("--db")
+            .arg(&coordinator_db)
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{coordinator_port}"))
+            .arg("--validators")
+            .arg(&validators_path),
+    )?;
+    wait_health(&http, coordinator_port).await?;
+    let coordinator = format!("http://127.0.0.1:{coordinator_port}");
+
+    let node = TestNode::new(&tmp.path.join("partition-node"))?;
+    register(&http, &coordinator, &node).await?;
+
+    let first = poll_until_assignment(&http, &coordinator, &node, Some(seed_job)).await?;
+    complete_assignment(&http, &coordinator, &node, &first).await?;
+    let earned = balance(&http, &coordinator, &node).await?.balance_mcu;
+    assert!(earned > 0);
+
+    // Take the next shard while the network is whole, then remove the
+    // coordinator's majority before delivering it.
+    let stranded = poll_until_assignment(&http, &coordinator, &node, Some(seed_job)).await?;
+    links[0].cut();
+    links[1].cut();
+
+    let refused = complete_assignment(&http, &coordinator, &node, &stranded).await;
+    assert!(
+        refused.is_err(),
+        "settlement must fail outright when the quorum is out of reach"
+    );
+
+    links[0].heal();
+    links[1].heal();
+
+    // Recovery asks the validators whether the persisted transaction was ever
+    // certified, and finishes it either way. Running it twice must not pay
+    // twice: the reward claim key is the shard, and the ledger owns it.
+    for label in [
+        "reconcile the stranded settlement",
+        "repeat it idempotently",
+    ] {
+        run_ok(
+            Command::new(&coordinator_bin)
+                .arg("recover")
+                .arg("--db")
+                .arg(&coordinator_db)
+                .arg("--validators")
+                .arg(&validators_path),
+            label,
+        )?;
+    }
+
+    let settled = balance(&http, &coordinator, &node).await?.balance_mcu;
+    assert_eq!(
+        settled,
+        earned + stranded.reward_mcu,
+        "the stranded shard must be worth exactly one reward once the link heals"
+    );
+
+    drop(validators);
+    Ok(())
+}
+
+/// Machines in different places do not agree on the time.
+///
+/// Signatures are bound to a timestamp, so a node whose clock has drifted far
+/// enough is indistinguishable from someone replaying yesterday's request.
+/// The live API therefore holds a bounded skew window. This checks both edges
+/// of it against a running coordinator: a few minutes of drift is tolerated,
+/// and drift past the window is refused even though the signature is real.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drifting_clock_is_tolerated_up_to_the_window_and_refused_past_it() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let coordinator_bin = bin_dir.join(exe("hocmesh-coordinator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = Client::new();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let (validators_path, validator_homes, validator_dbs, _set) =
+        create_validator_set(&tmp, &validator_bin, &validator_ports)?;
+
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    let coordinator_db = tmp.path.join("coordinator-skew.db");
+    let seed_job = "job_skew_seed";
+    let seed_sponsors = sponsors_file(
+        &tmp.path,
+        &node_bin,
+        &validator_homes,
+        &validators_path,
+        seed_job,
+        (2, 50000, 4),
+    )?;
+    run_ok(
+        Command::new(&coordinator_bin)
+            .arg("seed")
+            .arg("--job-id")
+            .arg(seed_job)
+            .arg("--sponsors")
+            .arg(&seed_sponsors)
+            .arg("--db")
+            .arg(&coordinator_db)
+            .arg("--validators")
+            .arg(&validators_path)
+            .arg("--start")
+            .arg("2")
+            .arg("--end")
+            .arg("50000")
+            .arg("--shards")
+            .arg("4"),
+        "seed community job for the skew test",
+    )?;
+
+    let coordinator_port = free_port()?;
+    let _coordinator = ProcessGuard::spawn(
+        Command::new(&coordinator_bin)
+            .arg("serve")
+            .arg("--db")
+            .arg(&coordinator_db)
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{coordinator_port}"))
+            .arg("--validators")
+            .arg(&validators_path),
+    )?;
+    wait_health(&http, coordinator_port).await?;
+    let coordinator = format!("http://127.0.0.1:{coordinator_port}");
+
+    let node = TestNode::new(&tmp.path.join("skew-node"))?;
+    register(&http, &coordinator, &node).await?;
+
+    // Signed by the right key, for the right action, with the right body -
+    // and refused anyway, because the clock behind it is hours out.
+    let far_past = now_unix() - hocmesh_protocol::AUTH_MAX_CLOCK_SKEW_SECS - 3_600;
+    let stale = PollRequest {
+        auth: skewed_auth(&node, "poll", &empty_body_hash(), far_past),
+    };
+    let rejected: Result<PollResponse> =
+        post_json(&http, &coordinator, "/v1/work/poll", &stale).await;
+    assert!(
+        rejected.is_err(),
+        "a clock hours out of step must not be able to claim work"
+    );
+
+    // A machine a couple of minutes fast is ordinary, not hostile, and it
+    // still has to be able to work.
+    let mut claimed = None;
+    for _ in 0..100 {
+        let drifted = now_unix() + hocmesh_protocol::AUTH_MAX_CLOCK_SKEW_SECS / 2;
+        let ahead = PollRequest {
+            auth: skewed_auth(&node, "poll", &empty_body_hash(), drifted),
+        };
+        let response: PollResponse =
+            post_json(&http, &coordinator, "/v1/work/poll", &ahead).await?;
+        if let Some(assignment) = response.assignment {
+            claimed = Some(assignment);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let claimed = claimed.context("a clock inside the window still has to get work")?;
+    assert_eq!(claimed.job_id, seed_job);
+
+    drop(validators);
+    Ok(())
+}
+
+/// `NodeIdentity::auth` always stamps the current time. A node with a wrong
+/// clock stamps a wrong time and signs it just as honestly, which is what this
+/// reproduces: a real signature over a timestamp the caller chooses.
+fn skewed_auth(node: &TestNode, action: &str, body_hash: &str, timestamp: i64) -> AuthProof {
+    let node_id = node.identity.node_id();
+    static SKEW_NONCE: AtomicU64 = AtomicU64::new(0);
+    let unique = SKEW_NONCE.fetch_add(1, Ordering::Relaxed);
+    let nonce_b64 = format!("skew-nonce-{timestamp}-{unique:016}");
+    let msg = canonical_auth_message(action, &node_id, timestamp, &nonce_b64, body_hash);
+    let signature_b64 = node.identity.sign_bytes_b64(msg.as_bytes());
+    AuthProof {
+        node_id,
+        timestamp,
+        nonce_b64,
+        signature_b64,
+    }
+}
+
+/// A TCP relay that can be told to behave like a wide-area link.
+///
+/// Loopback never produces the conditions that break distributed systems: no
+/// propagation delay, no peer that simply stops answering. The relay sits in
+/// front of a validator and forwards bytes both ways, delaying each burst by
+/// a configurable one-way latency and cutting the link on demand - including
+/// mid-request, which is what a real partition does.
+struct FaultLink {
+    port: u16,
+    cut: Arc<AtomicBool>,
+    one_way_ms: Arc<AtomicU64>,
+    accept: tokio::task::JoinHandle<()>,
+}
+
+impl FaultLink {
+    async fn to(target: u16) -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let port = listener.local_addr()?.port();
+        let cut = Arc::new(AtomicBool::new(false));
+        let one_way_ms = Arc::new(AtomicU64::new(0));
+        let accept = tokio::spawn(accept_loop(
+            listener,
+            target,
+            cut.clone(),
+            one_way_ms.clone(),
+        ));
+        Ok(Self {
+            port,
+            cut,
+            one_way_ms,
+            accept,
+        })
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Delay every burst of bytes in each direction, so a round trip costs
+    /// roughly twice this.
+    fn set_one_way_latency(&self, ms: u64) {
+        self.one_way_ms.store(ms, Ordering::SeqCst);
+    }
+
+    fn cut(&self) {
+        self.cut.store(true, Ordering::SeqCst);
+    }
+
+    fn heal(&self) {
+        self.cut.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for FaultLink {
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
+}
+
+async fn accept_loop(
+    listener: tokio::net::TcpListener,
+    target: u16,
+    cut: Arc<AtomicBool>,
+    one_way_ms: Arc<AtomicU64>,
+) {
+    while let Ok((inbound, _)) = listener.accept().await {
+        if cut.load(Ordering::SeqCst) {
+            continue;
+        }
+        tokio::spawn(relay(inbound, target, cut.clone(), one_way_ms.clone()));
+    }
+}
+
+async fn relay(
+    mut inbound: tokio::net::TcpStream,
+    target: u16,
+    cut: Arc<AtomicBool>,
+    one_way_ms: Arc<AtomicU64>,
+) {
+    let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await else {
+        return;
+    };
+    let (mut from_client, mut to_client) = inbound.split();
+    let (mut from_server, mut to_server) = outbound.split();
+    let up = pump(&mut from_client, &mut to_server, &cut, &one_way_ms);
+    let down = pump(&mut from_server, &mut to_client, &cut, &one_way_ms);
+    let _ = tokio::try_join!(up, down);
+}
+
+/// Copy one direction, honouring latency and noticing a cut between reads.
+///
+/// The short read timeout is what makes a partition bite mid-request: a
+/// connection already open when the link goes down is torn down rather than
+/// left to hang until some outer timeout notices.
+async fn pump<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    cut: &AtomicBool,
+    one_way_ms: &AtomicU64,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        if cut.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "link cut",
+            ));
+        }
+        let read = tokio::time::timeout(Duration::from_millis(25), reader.read(&mut buf)).await;
+        let n = match read {
+            Ok(Ok(0)) => return Ok(()),
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => continue,
+        };
+        let delay = one_way_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        writer.write_all(&buf[..n]).await?;
+        writer.flush().await?;
+    }
 }

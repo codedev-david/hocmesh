@@ -42,7 +42,7 @@
 - Signed checkpoints distributed out-of-band.
 - Sweeping stale inference holding accounts to the commons once the settlement window closes, so a requester that takes delivery and never gives a verdict cannot strand CU indefinitely.
 - Property tests for conservation and replay invariants.
-- Byzantine/fault-injection tests.
+- Byzantine/fault-injection tests. Network faults are covered: the quorum flow suite runs a fault-injecting relay for WAN latency, minority and majority partitions, and clock skew. What is left is adversarial *behaviour* - validators that equivocate, coordinators that lie, workers that forge results - and a real multi-host run.
 
 ## Priority 2 — scheduler federation
 

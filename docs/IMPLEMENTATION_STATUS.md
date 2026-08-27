@@ -18,6 +18,7 @@
 | Community issuance authorization | Implemented | `CommunityReserve` carries threshold sponsorships from the sitting set, bound to job id, workload, shards and price |
 | Validator set membership | Implemented | On-ledger join/leave carrying threshold vouches from sitting members; clients follow the chain forward with `refresh_set` |
 | Key custody | Implemented | Signing key sealed with XChaCha20-Poly1305 under an Argon2id key from `HOCMESH_IDENTITY_PASSPHRASE` |
+| Behaviour under network faults | Partially implemented | Integration tests drive the quorum through a fault-injecting relay: WAN-scale latency, minority partition (settlement continues, laggard repaired by `validator sync`), majority partition (settlement refuses, stranded shard pays once on heal), and clock skew either side of the 300s window. Still one machine over loopback: no multi-host run, NAT traversal, packet loss or reordering |
 
 ## hocMESH AI
 

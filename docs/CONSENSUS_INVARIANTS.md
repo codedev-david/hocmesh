@@ -223,6 +223,24 @@ A participant full-ledger audit must independently replay:
 
 A coordinator UI balance is never the source of truth in quorum mode.
 
+## What has been tested under network faults
+
+Liveness and safety claims here are exercised against a deliberately broken
+wire, not only a healthy one. The quorum flow suite routes every link through
+a fault-injecting relay and asserts that:
+
+- a minority partition does not stop settlement, and the isolated validator
+  falls behind rather than certifying entries it never saw;
+- a majority partition stops settlement instead of paying out of a database
+  the chain never certified;
+- the stranded settlement pays exactly once when the link heals, however many
+  times recovery is run;
+- authentication refuses timestamps outside the tolerated skew window.
+
+These are crash and network faults. Byzantine behaviour - a validator that
+equivocates, a coordinator that lies about what it certified - is still assumed
+away, and every process runs on one machine over loopback.
+
 ## Current consensus limitation
 
 This implementation is a quorum-certified replicated log with ballot-ordered heights, so competing proposers resolve rather than deadlock and no height carries two entries. It is still not Byzantine-fault-tolerant: validators are assumed to follow the protocol, and liveness under competing proposers rests on backoff rather than a proof. Do not market or deploy it as Byzantine-fault-tolerant production consensus until that milestone is completed and reviewed.
