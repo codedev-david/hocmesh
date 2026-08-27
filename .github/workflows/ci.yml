@@ -21,7 +21,12 @@ jobs:
       - name: Check
         run: cargo check --workspace --all-features --locked
       - name: Test
-        run: cargo test --workspace --all-features --locked
+        run: cargo test --workspace --all-features --locked --exclude hocmesh-integration-tests
+      - name: Integration tests
+        # Every one of these stands up a four-validator quorum and at least one
+        # coordinator. A two-core runner cannot host seven of those at once
+        # without starving the very timeouts under test.
+        run: cargo test -p hocmesh-integration-tests --all-features --locked -- --test-threads=2
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Proofs

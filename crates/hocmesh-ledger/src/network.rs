@@ -657,6 +657,7 @@ impl LedgerNetwork {
                 "height {sequence} was taken by ballot {b} mid-round"
             )));
         }
+        let answered = votes.len();
         let sigs: Vec<ValidatorSignature> = votes
             .into_iter()
             .filter_map(|(m, v)| {
@@ -692,6 +693,16 @@ impl LedgerNetwork {
             {
                 return Ok(Attempt::Deferred(format!(
                     "height {sequence} was filled by another proposer"
+                )));
+            }
+            // Fewer answers than the threshold is an availability problem, not
+            // a refusal: nobody said no, they just did not say anything. That
+            // is what the backoff is for, so defer instead of failing the
+            // caller on a link that may already be coming back.
+            if answered < self.set().threshold {
+                return Ok(Attempt::Deferred(format!(
+                    "only {answered} of {} validators answered at height {sequence}",
+                    self.set().members.len()
                 )));
             }
             return Err(RoundError::Rejected(format!(
