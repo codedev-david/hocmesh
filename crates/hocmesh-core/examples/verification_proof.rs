@@ -66,14 +66,26 @@ fn measure(work: &WorkSpec) -> Measured {
     }
     let witness_ms = started.elapsed().as_secs_f64() * 1e3 / f64::from(rounds);
 
+    // The predicted advantage is a price the whole network quotes; a model that
+    // drifts away from the machine is a claim nobody measured. Order of
+    // magnitude is all a static model can promise, so that is what is asserted.
+    let measured = compute_ms / witness_ms;
+    let predicted = verify::verification_advantage(work);
+    let ratio = (measured / predicted).max(predicted / measured);
+    assert!(
+        ratio < 3.0,
+        "{}: predicted {predicted:.0}x but measured {measured:.0}x",
+        label(work)
+    );
+
     println!(
         "{:<15} compute {:>9.2} ms   witness {:>8.3} ms   measured {:>7.0}x cheaper   \
          predicted {:>7.0}x",
         label(work),
         compute_ms,
         witness_ms,
-        compute_ms / witness_ms,
-        verify::verification_advantage(work)
+        measured,
+        predicted
     );
     Measured {
         label: label(work),

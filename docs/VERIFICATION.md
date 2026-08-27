@@ -289,13 +289,18 @@ than lie.
 
 Measured on a Windows 11 laptop, release build:
 
-| workload | compute | witness | cheaper by |
-| --- | --- | --- | --- |
-| prime count, 3M range | 159.0 ms | 7.08 ms | 22x |
-| matrix product, 512-dim, 64 rows | 25.0 ms | 1.11 ms | 23x |
+| workload | compute | witness | measured | predicted |
+| --- | --- | --- | --- | --- |
+| prime count, 3M range | 159.8 ms | 7.75 ms | 21x | 21x |
+| matrix product, 512-dim, 64 rows | 36.8 ms | 1.06 ms | 35x | 27x |
 
 Per accepted shard with three validators, total network cost falls from 5.00x
 the work delivered to 1.14x - a 4.4x cut in waste that grows with `V`.
+
+The last column is `verification_advantage`, the static model the network
+quotes before any work is done. The example asserts the two stay within a
+factor of three of each other, so a model that drifts away from the machine
+fails the run instead of quietly overstating the saving.
 
 Section 4 prices the collusion attack. Escaping one challenge is not escaping
 settlement, and the joint rate tracks the product of the two:

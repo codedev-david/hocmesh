@@ -401,7 +401,12 @@ pub fn witness_ops(work: &WorkSpec) -> u64 {
     match work {
         WorkSpec::PrimeCount { start, end } => {
             let width = end.saturating_sub(*start);
-            width / u64::from(BUCKETS) * u64::from(AUDIT_BUCKETS)
+            // The audit recomputes whole buckets, and a candidate inside an
+            // audited bucket costs exactly what it cost the provider. Leaving
+            // that factor out was the bug: it priced the check as if trial
+            // division were free and reported prime counting as 900x cheaper
+            // to verify than to do, when the sampling rate makes it 21x.
+            width / u64::from(BUCKETS) * u64::from(AUDIT_BUCKETS) * trial_division_ops(*end)
         }
         WorkSpec::MatrixMultiply {
             dim,
@@ -411,7 +416,11 @@ pub fn witness_ops(work: &WorkSpec) -> u64 {
         } => {
             let span = u64::from(row_end.saturating_sub(*row_start));
             let dim = u64::from(*dim);
-            dim * dim + 2 * span * dim
+            // Br is dim^2 and the two shard passes are span*dim each, but the
+            // check also has to regenerate B and the shard's rows of A before
+            // it can touch either. Counting only the multiplies made Freivalds
+            // look twice as cheap as it measures.
+            2 * dim * dim + 3 * span * dim
         }
     }
 }
