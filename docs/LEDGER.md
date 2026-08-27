@@ -214,7 +214,8 @@ They also verify the deterministic assignment ID.
 
 ## Independent result verification
 
-For the current `PrimeCount` workload, validators recompute the result.
+For the integer workloads - `PrimeCount`, `MatrixMultiply` and `CollatzPeak` -
+validators recompute the result, in whole or through a witness.
 
 This is intentionally straightforward rather than efficient.
 

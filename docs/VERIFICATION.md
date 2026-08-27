@@ -52,6 +52,28 @@ three audited buckets fall outside the `m` it faked, with probability
 `C(64 - m, 3) / C(64, 3)`. Skipping a single bucket - the smallest cheat the
 scheme can express - is caught 4.7% of the time; skipping half is caught 86%.
 
+### Collatz peaks - the same buckets, a different rollup
+
+The longest Collatz trajectory in a range is bucketed exactly like a prime
+count, and audited by the same two checks. Only the rollup differs, and the
+difference matters: a peak is a **maximum**, not a total.
+
+That makes the free check weaker here than it is for primes. Summing 64 counts
+pins every bucket: change one and the total moves. Taking a maximum over 64
+peaks pins only the winner - a shard can fake any bucket below the peak and the
+rollup still adds up. So the arithmetic check catches a lie about the *answer*,
+and only the redrawn bucket catches a lie about the *work*.
+
+The escape odds are therefore the bucket odds alone, `C(64 - m, 3) / C(64, 3)`,
+with no free tier underneath - the same 4.7% for a single faked bucket, 86% for
+half. The audited fraction is also the same 3-in-64, because redrawing a bucket
+costs precisely what producing it cost.
+
+Ties resolve to the smaller seed at every level - inside a shard, and again
+when the coordinator rolls shards into a job. Without that rule two honest
+coordinators could report different seeds for the same finished job and both be
+telling the truth, which is exactly the ambiguity an audit cannot survive.
+
 ### Neural network inference - float Freivalds
 
 Everything above assumes exact arithmetic: two honest nodes produce identical
@@ -293,6 +315,7 @@ Measured on a Windows 11 laptop, release build:
 | --- | --- | --- | --- | --- |
 | prime count, 3M range | 159.8 ms | 7.75 ms | 21x | 21x |
 | matrix product, 512-dim, 64 rows | 36.8 ms | 1.06 ms | 35x | 27x |
+| collatz peak, 1M range | 69.8 ms | 3.34 ms | 21x | 21x |
 
 Per accepted shard with three validators, total network cost falls from 5.00x
 the work delivered to 1.14x - a 4.4x cut in waste that grows with `V`.

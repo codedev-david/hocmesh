@@ -162,9 +162,9 @@ The earlier design locked a validator to the first entry hash it saw at a height
 ## Paying for an answer nobody can recompute
 
 Every other workload on the mesh is settled by redoing it. A shard of
-`PrimeCount` or a row block of a matrix product is deterministic, so a second
-node - or the audit in [VERIFICATION.md](VERIFICATION.md) - can rerun it and
-compare. Generated text is not like that. Validators do not hold the weights,
+`PrimeCount`, a row block of a matrix product, a `CollatzPeak` range - every one
+of them is deterministic integer arithmetic, so a second node - or the audit in
+[VERIFICATION.md](VERIFICATION.md) - can rerun it and compare. Generated text is not like that. Validators do not hold the weights,
 the llama.cpp adapter returns text and not logits, and the same prompt on two
 machines does not reproduce token for token. There is nothing for the ledger to
 recompute and nothing to compare it against.

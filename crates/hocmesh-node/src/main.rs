@@ -189,6 +189,15 @@ enum Command {
         #[arg(long, default_value = "")]
         reason: String,
     },
+    /// Search a range of starting values for the longest Collatz trajectory.
+    SubmitCollatz {
+        #[arg(long)]
+        start: u64,
+        #[arg(long)]
+        end: u64,
+        #[arg(long, default_value_t = 8)]
+        shards: u32,
+    },
     SubmitPrime {
         #[arg(long)]
         start: u64,
@@ -777,6 +786,21 @@ stored at: {}",
                 println!("Every batch of {job_id} is now settled.");
             }
         }
+        Command::SubmitCollatz { start, end, shards } => {
+            let r = client
+                .submit(WorkSpec::CollatzPeak { start, end }, shards)
+                .await?;
+            println!(
+                "Submitted job: {}\nParallel shards: {}\nReserved: {:.3} CU\nRemaining balance: {:.3} CU",
+                r.job_id,
+                r.assignments,
+                r.reserved_mcu as f64 / 1000.0,
+                r.balance_mcu as f64 / 1000.0
+            );
+            if let Some(h) = r.ledger_entry_hash {
+                println!("Reservation ledger entry: {h}");
+            }
+        }
         Command::SubmitPrime { start, end, shards } => {
             let r = client
                 .submit(WorkSpec::PrimeCount { start, end }, shards)
@@ -805,6 +829,12 @@ stored at: {}",
             );
             if let Some(t) = j.prime_count_total {
                 println!("Current prime-count result: {t}");
+            }
+            if let Some(c) = j.collatz_peak {
+                println!(
+                    "Current Collatz peak: {} steps from seed {}",
+                    c.steps, c.seed
+                );
             }
             if !j.refundable.is_empty() {
                 println!(

@@ -801,12 +801,14 @@ Recommended protections before public exposure:
 
 ---
 
-# Current workload
+# Current workloads
 
-The first workload is:
+The workloads are a fixed allow-list, never arbitrary binaries:
 
 ```rust
 WorkSpec::PrimeCount { start, end }
+WorkSpec::MatrixMultiply { seed_a, seed_b, dim, row_start, row_end }
+WorkSpec::CollatzPeak { start, end }
 ```
 
 The coordinator splits the requested range into deterministic shards.

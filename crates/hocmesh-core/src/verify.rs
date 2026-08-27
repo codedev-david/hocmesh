@@ -241,6 +241,24 @@ pub fn witness_check(work: &WorkSpec, result: &WorkResult, nonce: AuditNonce) ->
             },
             WorkResult::MatrixMultiply { rows, .. },
         ) => freivalds(*seed_a, *seed_b, *dim, *row_start, *row_end, rows, nonce),
+        (
+            WorkSpec::CollatzPeak { start, end },
+            WorkResult::CollatzPeak {
+                peak_steps,
+                peak_seed,
+                bucket_peaks,
+                bucket_seeds,
+                ..
+            },
+        ) => collatz_witness(
+            *start,
+            *end,
+            *peak_steps,
+            *peak_seed,
+            bucket_peaks,
+            bucket_seeds,
+            nonce,
+        ),
         _ => Verdict::Rejected("result does not match the assigned workload".into()),
     }
 }
@@ -283,6 +301,50 @@ fn prime_witness(
             return Verdict::Rejected(format!(
                 "bucket {index} covering [{from}, {to}) holds {actual} primes, not {}",
                 bucket_counts[index as usize]
+            ));
+        }
+    }
+    Verdict::Accepted(Tier::Witness)
+}
+
+/// Check a Collatz shard the way a prime count is checked.
+///
+/// Two claims are separable here, and both have to hold. The buckets must
+/// combine into the reported peak -- pure arithmetic, free to check -- and a
+/// few buckets drawn from the nonce must genuinely hold the peak claimed for
+/// them. A shard that invents its peak has to guess which sixty-fourths will
+/// be redrawn, with the same `C(m, k) / C(B, k)` odds the prime audit quotes.
+fn collatz_witness(
+    start: u64,
+    end: u64,
+    peak_steps: u32,
+    peak_seed: u64,
+    bucket_peaks: &[u32],
+    bucket_seeds: &[u64],
+    nonce: AuditNonce,
+) -> Verdict {
+    if bucket_peaks.len() != BUCKETS as usize || bucket_seeds.len() != BUCKETS as usize {
+        return Verdict::Rejected(format!(
+            "expected {BUCKETS} bucket peaks and seeds, got {} and {}",
+            bucket_peaks.len(),
+            bucket_seeds.len()
+        ));
+    }
+    let (claimed_steps, claimed_seed) = crate::compute::combine_peaks(bucket_peaks, bucket_seeds);
+    if claimed_steps != peak_steps || claimed_seed != peak_seed {
+        return Verdict::Rejected(format!(
+            "buckets peak at {claimed_steps} steps from {claimed_seed}, \
+             but the shard reports {peak_steps} from {peak_seed}"
+        ));
+    }
+    for index in audit_indices(nonce, BUCKETS, AUDIT_BUCKETS) {
+        let (from, to) = bucket_bounds(start, end, index, BUCKETS);
+        let (steps, seed) = crate::compute::peak_trajectory(from, to);
+        if steps != bucket_peaks[index as usize] || seed != bucket_seeds[index as usize] {
+            return Verdict::Rejected(format!(
+                "bucket {index} covering [{from}, {to}) peaks at {steps} steps from \
+                 {seed}, not {} from {}",
+                bucket_peaks[index as usize], bucket_seeds[index as usize]
             ));
         }
     }
@@ -374,6 +436,9 @@ pub fn compute_ops(work: &WorkSpec) -> u64 {
             let span = u64::from(row_end.saturating_sub(*row_start));
             span * u64::from(*dim) * u64::from(*dim)
         }
+        WorkSpec::CollatzPeak { start, end } => {
+            end.saturating_sub(*start).saturating_mul(collatz_ops(*end))
+        }
     }
 }
 
@@ -394,6 +459,20 @@ pub fn trial_division_ops(n: u64) -> u64 {
     // ln n, from the exact integer log2 scaled by 693/1000 ~ ln 2.
     let ln_n = (u64::from(n.ilog2()) * 693 / 1000).max(1);
     2 + n.isqrt() / (3 * ln_n)
+}
+
+/// Steps one Collatz candidate costs near `n`.
+///
+/// A trajectory from `n` is about `3.5 * ln n` steps long on average -- the
+/// odd-even pair triples then halves twice, so the value shrinks by 3/4 per
+/// two steps and the length grows with the logarithm. Each step is one
+/// comparison and one multiply-or-shift, so the step count is the op count.
+///
+/// Integer arithmetic for the same reason `trial_division_ops` uses it: this
+/// number is a price every validator has to reproduce bit for bit.
+pub fn collatz_ops(n: u64) -> u64 {
+    let ln_n = (u64::from(n.max(2).ilog2()) * 693 / 1000).max(1);
+    (7 * ln_n / 2).max(1)
 }
 
 /// Multiplications needed to check a shard with its witness.
@@ -421,6 +500,12 @@ pub fn witness_ops(work: &WorkSpec) -> u64 {
             // it can touch either. Counting only the multiplies made Freivalds
             // look twice as cheap as it measures.
             2 * dim * dim + 3 * span * dim
+        }
+        WorkSpec::CollatzPeak { start, end } => {
+            let width = end.saturating_sub(*start);
+            // Redrawing a bucket costs exactly what producing it cost, so the
+            // audit is the same 3-in-64 fraction the prime count pays.
+            width / u64::from(BUCKETS) * u64::from(AUDIT_BUCKETS) * collatz_ops(*end)
         }
     }
 }
@@ -832,5 +917,97 @@ mod tests {
             brazen > 8.0,
             "skipping half the work should cost many public rounds, not {brazen}"
         );
+    }
+
+    fn collatz(start: u64, end: u64) -> (WorkSpec, WorkResult) {
+        let work = WorkSpec::CollatzPeak { start, end };
+        let result = execute_work(&work);
+        (work, result)
+    }
+
+    #[test]
+    fn honest_collatz_work_survives_every_challenge_it_could_draw() {
+        let (work, result) = collatz(1, 4_096);
+        for seed in 0..2_000u64 {
+            let verdict = witness_check(&work, &result, AuditNonce::draw(seed));
+            assert_eq!(verdict, Verdict::Accepted(Tier::Witness), "seed {seed}");
+        }
+    }
+
+    /// The cheat this workload invites: report a plausible peak without ever
+    /// running the trajectories. The bucket sum is not a constraint here --
+    /// a peak is a maximum, not a total -- so the only thing standing between
+    /// a liar and payment is the redrawn bucket.
+    #[test]
+    fn an_invented_collatz_peak_is_caught_by_the_bucket_it_cannot_predict() {
+        let (work, honest) = collatz(1, 4_096);
+        let WorkResult::CollatzPeak {
+            bucket_peaks,
+            bucket_seeds,
+            ..
+        } = &honest
+        else {
+            panic!("collatz work produces collatz results");
+        };
+        let mut caught = 0u32;
+        for bucket in 0..BUCKETS as usize {
+            let mut peaks = bucket_peaks.clone();
+            let mut seeds = bucket_seeds.clone();
+            peaks[bucket] = peaks[bucket].saturating_add(1);
+            seeds[bucket] = seeds[bucket].saturating_add(2);
+            let (peak_steps, peak_seed) = crate::compute::combine_peaks(&peaks, &seeds);
+            let lie = WorkResult::CollatzPeak {
+                peak_steps,
+                peak_seed,
+                bucket_peaks: peaks,
+                bucket_seeds: seeds,
+                duration_ms: 0,
+            };
+            let mut redrawn = 0u32;
+            for seed in 0..256u64 {
+                let nonce = AuditNonce::draw(seed);
+                if audit_indices(nonce, BUCKETS, AUDIT_BUCKETS).contains(&(bucket as u32)) {
+                    redrawn += 1;
+                    assert!(
+                        matches!(witness_check(&work, &lie, nonce), Verdict::Rejected(_)),
+                        "bucket {bucket} was redrawn under seed {seed} and still passed"
+                    );
+                }
+            }
+            assert!(
+                redrawn > 0,
+                "bucket {bucket} was never audited in 256 draws"
+            );
+            caught += 1;
+        }
+        assert_eq!(caught, BUCKETS);
+    }
+
+    /// The rollup is arithmetic, so it costs nothing to check and is caught
+    /// without recomputing a single trajectory.
+    #[test]
+    fn a_collatz_peak_that_no_bucket_supports_is_rejected_for_free() {
+        let (work, honest) = collatz(1, 2_048);
+        let WorkResult::CollatzPeak {
+            bucket_peaks,
+            bucket_seeds,
+            ..
+        } = honest
+        else {
+            panic!("collatz work produces collatz results");
+        };
+        let lie = WorkResult::CollatzPeak {
+            peak_steps: 9_999,
+            peak_seed: 7,
+            bucket_peaks,
+            bucket_seeds,
+            duration_ms: 0,
+        };
+        for seed in 0..64u64 {
+            assert!(matches!(
+                witness_check(&work, &lie, AuditNonce::draw(seed)),
+                Verdict::Rejected(_)
+            ));
+        }
     }
 }

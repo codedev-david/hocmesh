@@ -197,6 +197,39 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
         "duplicate result settlement must be rejected"
     );
 
+    // A second workload type, run through the same pipeline as the primes
+    // above. The point is not that Collatz is interesting: it is that adding
+    // a workload costs a spec, a result, and an audit rule, and nothing in
+    // scheduling, settlement or the ledger has to know it exists.
+    let collatz = submit(
+        &http,
+        &coordinator,
+        &node_a,
+        WorkSpec::CollatzPeak {
+            start: 1,
+            end: 1_000,
+        },
+        2,
+    )
+    .await?;
+    assert!(collatz.reserved_mcu > 0, "a collatz job must cost CU");
+    complete_next_for_job(&http, &coordinator, &node_b, &collatz.job_id)
+        .await?
+        .context("node B should complete a collatz shard")?;
+    complete_next_for_job(&http, &coordinator, &node_c, &collatz.job_id)
+        .await?
+        .context("node C should complete a collatz shard")?;
+    let collatz_status = job_status(&http, &coordinator, &collatz.job_id).await?;
+    assert_eq!(collatz_status.status, "completed");
+    // 871 is the longest trajectory starting below 1000, at 178 steps, and
+    // the rollup has to survive being reassembled from two separate shards
+    // that each only saw half the range.
+    let peak = collatz_status
+        .collatz_peak
+        .context("a completed collatz job must report a peak")?;
+    assert_eq!(peak.steps, 178);
+    assert_eq!(peak.seed, 871);
+
     let reused = signed_submit(&node_a, WorkSpec::PrimeCount { start: 2, end: 20 }, 1)?;
     let first_reused_response: SubmitJobResponse =
         post_json(&http, &coordinator, "/v1/jobs/submit", &reused).await?;

@@ -188,7 +188,7 @@ Historical ledger audit deliberately verifies the cryptographic signature **with
 
 hocMESH v0.2 does not accept arbitrary executables from requesters.
 
-Jobs are declarative allow-listed `WorkSpec` values. The implemented workload is deterministic prime counting over a numeric range.
+Jobs are declarative allow-listed `WorkSpec` values. Three are implemented, all deterministic integer work: prime counting over a numeric range, a row block of a seeded matrix product, and the longest Collatz trajectory in a range.
 
 This workload exists because it provides a real end-to-end primitive for testing:
 

@@ -54,7 +54,9 @@ The protocol is declarative:
 
 ```rust
 pub enum WorkSpec {
-    PrimeCount { start: u64, end: u64 }
+    PrimeCount { start: u64, end: u64 },
+    MatrixMultiply { seed_a: u64, seed_b: u64, dim: u32, row_start: u32, row_end: u32 },
+    CollatzPeak { start: u64, end: u64 },
 }
 ```
 

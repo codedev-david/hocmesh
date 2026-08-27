@@ -5,7 +5,7 @@
 | Area | Status | Evidence |
 |---|---|---|
 | Identity and replay-resistant authentication | Implemented | Ed25519 signatures, timestamp/nonce checks, replay tests |
-| Declarative CPU workload execution | Implemented | `PrimeCount`, sharding, deterministic verification |
+| Declarative CPU workload execution | Implemented | `PrimeCount`, `MatrixMultiply` and `CollatzPeak`; a fixed allow-list, sharded and audited by the same rules |
 | Work leases and failure requeue | Implemented | Coordinator SQLite state and process tests |
 | Contribution-first CU accounting | Implemented | Reservation/escrow/reward invariants |
 | Replicated validator ledger | Implemented | Hash-linked entries and quorum certificates |

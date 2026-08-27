@@ -32,13 +32,13 @@ use hocmesh_ledger::{
 };
 use hocmesh_model::ModelManifest;
 use hocmesh_protocol::{
-    BalanceResponse, DEFAULT_LEASE_SECONDS, HeartbeatRequest, JobStatusResponse, NetworkCoordinate,
-    NetworkStatsResponse, NodeCapabilities, NodeStatusResponse, PeerSample, PeerSampleResponse,
-    PollRequest, PollResponse, PricedBatch, RefundRequest, RefundResponse, RefundableShard,
-    RegisterRequest, RegisterResponse, ResultRequest, ResultResponse, SETTLEMENT_WINDOW_SECS,
-    SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, empty_body_hash,
-    heartbeat_body_hash, job_id_from_auth, now_unix, refund_body_hash, register_body_hash,
-    result_body_hash, submit_body_hash, verify_auth,
+    BalanceResponse, CollatzPeakTotal, DEFAULT_LEASE_SECONDS, HeartbeatRequest, JobStatusResponse,
+    NetworkCoordinate, NetworkStatsResponse, NodeCapabilities, NodeStatusResponse, PeerSample,
+    PeerSampleResponse, PollRequest, PollResponse, PricedBatch, RefundRequest, RefundResponse,
+    RefundableShard, RegisterRequest, RegisterResponse, ResultRequest, ResultResponse,
+    SETTLEMENT_WINDOW_SECS, SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkResult,
+    WorkSpec, empty_body_hash, heartbeat_body_hash, job_id_from_auth, now_unix, refund_body_hash,
+    register_body_hash, result_body_hash, submit_body_hash, verify_auth,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Arc;
@@ -2057,6 +2057,7 @@ async fn job_status(
         )
         .map_err(ApiError::internal)?;
     let mut prime_total = 0u64;
+    let mut collatz: Option<CollatzPeakTotal> = None;
     let mut has = false;
     let mut stmt=conn.prepare("SELECT result_json FROM assignments WHERE job_id=?1 AND status='completed' ORDER BY shard_index").map_err(ApiError::internal)?;
     let rows = stmt
@@ -2073,6 +2074,26 @@ async fn job_status(
             // Matrix shards have no scalar total to roll up; the answer is the
             // rows themselves, which the caller fetches per shard.
             WorkResult::MatrixMultiply { .. } => {}
+            WorkResult::CollatzPeak {
+                peak_steps,
+                peak_seed,
+                ..
+            } => {
+                // Ties resolve to the smaller seed, the same rule a shard uses
+                // to combine its own buckets, so the rollup is order-free.
+                let better = match collatz {
+                    None => true,
+                    Some(CollatzPeakTotal { steps, seed }) => {
+                        peak_steps > steps || (peak_steps == steps && peak_seed < seed)
+                    }
+                };
+                if better {
+                    collatz = Some(CollatzPeakTotal {
+                        steps: peak_steps,
+                        seed: peak_seed,
+                    });
+                }
+            }
         }
     }
     // Only a shard that is still waiting and whose window has closed can be
@@ -2114,6 +2135,7 @@ async fn job_status(
         completed_assignments: completed as u32,
         reserved_mcu,
         prime_count_total: has.then_some(prime_total),
+        collatz_peak: collatz,
         refundable,
     }))
 }

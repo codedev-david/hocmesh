@@ -143,6 +143,15 @@ pub enum WorkSpec {
         row_start: u32,
         row_end: u32,
     },
+    /// The longest Collatz trajectory starting anywhere in `[start, end)`.
+    ///
+    /// A distributed search that people really run, and the cheapest possible
+    /// spec: two integers describe arbitrarily much work. Every step is integer
+    /// arithmetic on `u128`, so two machines agree exactly.
+    CollatzPeak {
+        start: u64,
+        end: u64,
+    },
 }
 /// How much of a result a validator can check from the ledger entry alone.
 ///
@@ -170,9 +179,9 @@ impl WorkSpec {
     /// forces the author to state which side of the line it falls on.
     pub fn audit_class(&self) -> AuditClass {
         match self {
-            WorkSpec::PrimeCount { .. } | WorkSpec::MatrixMultiply { .. } => {
-                AuditClass::SelfContained
-            }
+            WorkSpec::PrimeCount { .. }
+            | WorkSpec::MatrixMultiply { .. }
+            | WorkSpec::CollatzPeak { .. } => AuditClass::SelfContained,
         }
     }
 
@@ -193,6 +202,15 @@ impl WorkSpec {
             WorkSpec::MatrixMultiply { dim, row_end, .. } if row_end > dim => {
                 Err("matrix_multiply row_end must not exceed dim".into())
             }
+            WorkSpec::CollatzPeak { start, end } if start >= end => {
+                Err("collatz_peak requires start < end".into())
+            }
+            WorkSpec::CollatzPeak { start, .. } if *start == 0 => {
+                Err("collatz_peak has no trajectory from zero".into())
+            }
+            WorkSpec::CollatzPeak { start, end } if end.saturating_sub(*start) > 2_000_000_000 => {
+                Err("collatz_peak range is too large for one submitted job".into())
+            }
             _ => Ok(()),
         }
     }
@@ -208,6 +226,18 @@ pub enum WorkResult {
     },
     MatrixMultiply {
         rows: Vec<u32>,
+        duration_ms: u64,
+    },
+    /// The peak of one Collatz shard, bucketed the same way a prime count is.
+    ///
+    /// The per-bucket peak and the seed that reached it are both carried, so an
+    /// audit that redraws a bucket can check the whole claim rather than only
+    /// the arithmetic that combines the buckets.
+    CollatzPeak {
+        peak_steps: u32,
+        peak_seed: u64,
+        bucket_peaks: Vec<u32>,
+        bucket_seeds: Vec<u64>,
         duration_ms: u64,
     },
 }
@@ -293,6 +323,10 @@ pub struct JobStatusResponse {
     pub completed_assignments: u32,
     pub reserved_mcu: i64,
     pub prime_count_total: Option<u64>,
+    /// The longest Collatz trajectory across the shards that have finished,
+    /// and the smallest seed that reached it. Absent until one completes.
+    #[serde(default)]
+    pub collatz_peak: Option<CollatzPeakTotal>,
     /// Shards whose settlement window has closed with nothing delivered, so
     /// the requester can sign for their escrow back without having kept the
     /// work spec from the day they submitted it. What is named here is only
@@ -300,6 +334,17 @@ pub struct JobStatusResponse {
     /// it certified, so a coordinator that lies gets a refused refund.
     #[serde(default)]
     pub refundable: Vec<RefundableShard>,
+}
+
+/// A whole job's Collatz answer, rolled up from its shards.
+///
+/// Two shards can tie on length, so the seed is carried and the smaller one
+/// wins. Without that rule two coordinators could report different seeds for
+/// the same finished job and both be telling the truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollatzPeakTotal {
+    pub steps: u32,
+    pub seed: u64,
 }
 
 /// One shard a requester may reclaim, with everything needed to sign for it.

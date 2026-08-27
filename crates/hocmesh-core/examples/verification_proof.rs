@@ -23,12 +23,17 @@ const MATMUL: WorkSpec = WorkSpec::MatrixMultiply {
     row_start: 0,
     row_end: 64,
 };
+const COLLATZ: WorkSpec = WorkSpec::CollatzPeak {
+    start: 1,
+    end: 400_000,
+};
 
 fn main() {
     rule("1. Checking costs less than computing (measured on this machine)");
     let prime = measure(&PRIME);
     let matmul = measure(&MATMUL);
-    network_cost(&prime, &matmul);
+    let collatz = measure(&COLLATZ);
+    network_cost(&[&prime, &matmul, &collatz]);
     detection_sweep();
     collateral_vs_discount();
     grinding_cost();
@@ -44,6 +49,7 @@ fn label(work: &WorkSpec) -> &'static str {
     match work {
         WorkSpec::PrimeCount { .. } => "prime count",
         WorkSpec::MatrixMultiply { .. } => "matrix product",
+        WorkSpec::CollatzPeak { .. } => "collatz peak",
     }
 }
 
@@ -102,10 +108,10 @@ fn rule(title: &str) {
 ///
 /// Before: the coordinator recomputed the shard and so did every validator, so
 /// the hocmesh burned `(V + 2)` times the compute it actually delivered.
-fn network_cost(prime: &Measured, matmul: &Measured) {
+fn network_cost(shards: &[&Measured]) {
     rule("2. Total network cost of one accepted shard (V = 3 validators)");
     let validators = 3.0;
-    for m in [prime, matmul] {
+    for m in shards.iter().copied() {
         let old = m.compute_ms * (validators + 2.0);
         // Now: the worker computes; the coordinator audits at the veteran rate;
         // every validator witnesses the entry it is replaying.

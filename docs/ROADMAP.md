@@ -7,7 +7,7 @@
 - Ed25519 identities.
 - Signed protocol v4 requests with nonces and AI capability advertisements.
 - Hardware discovery and CPU benchmarking.
-- Declarative CPU work.
+- Declarative CPU work: `PrimeCount`, `MatrixMultiply`, `CollatzPeak`.
 - Multi-worker task parallelism.
 - Work leasing/requeue.
 - Contribution-first local ledger mode.
@@ -56,7 +56,9 @@
 
 - Per-platform resource quotas.
 - Process isolation.
-- WASI sandbox for generic CPU workloads.
+- WASI sandbox for generic CPU workloads. Until it exists the allow-list is
+  the safety property: adding a workload means adding a spec, a result and an
+  audit rule to this repository, never shipping a binary to a contributor.
 - Explicit capability model for filesystem/network.
 - Thermal and user-activity controls.
 
