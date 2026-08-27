@@ -118,6 +118,11 @@ struct EntriesQ {
     from: Option<u64>,
     limit: Option<u64>,
 }
+#[derive(Deserialize)]
+struct HistoryQ {
+    before: Option<u64>,
+    limit: Option<u32>,
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -241,6 +246,7 @@ async fn serve(listen: &str, db: &str, home: &FsPath, validators: &str) -> Resul
         .route("/v1/ledger/head", get(head))
         .route("/v1/ledger/state", get(ledger_state))
         .route("/v1/ledger/balance/{account}", get(balance))
+        .route("/v1/ledger/history/{account}", get(history))
         .route("/v1/ledger/claim/{claim}", get(claim))
         .route("/v1/ledger/prepare", post(prepare))
         .route("/v1/ledger/propose", post(propose))
@@ -498,6 +504,22 @@ async fn entries(
     Ok(Json(EntriesResponse {
         certificates: certs,
     }))
+}
+
+/// An account's own postings, newest first.
+///
+/// Unsigned, unlike a balance: this is a convenience for reading, and anything
+/// resting on it can be checked against the entries the chain already serves.
+async fn history(
+    State(a): State<App>,
+    Path(account): Path<String>,
+    Query(q): Query<HistoryQ>,
+) -> Result<Json<AccountHistory>, String> {
+    let s = a.store.lock().map_err(|_| "lock".to_string())?;
+    let page = s
+        .history(&account, q.before, q.limit.unwrap_or(100))
+        .map_err(|e| e.to_string())?;
+    Ok(Json(page))
 }
 
 /// The reward and the refund for one shard are one claim seen from two sides,

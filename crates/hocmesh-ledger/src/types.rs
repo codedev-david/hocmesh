@@ -170,6 +170,31 @@ pub struct BalanceProof {
     pub validator_id: String,
     pub signature_b64: String,
 }
+/// One movement of CU into or out of an account, as the ledger recorded it.
+///
+/// A balance says where an account stands; this says how it got there, which
+/// is what an operator reconciling a bill or a dispute actually needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountHistoryEntry {
+    pub sequence: u64,
+    pub posting_index: u32,
+    pub transaction_id: String,
+    pub delta_mcu: i64,
+    pub created_at: i64,
+}
+
+/// A page of an account's history, newest first.
+///
+/// `next_before` is the cursor for the page after this one, and is absent when
+/// the ledger holds nothing older. Paging on the sequence the entry landed at
+/// rather than on an offset means a page stays correct while the chain grows
+/// underneath the reader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountHistory {
+    pub account_id: String,
+    pub entries: Vec<AccountHistoryEntry>,
+    pub next_before: Option<u64>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimProof {
     pub claim_key: String,

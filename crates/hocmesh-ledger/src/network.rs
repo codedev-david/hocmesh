@@ -610,7 +610,19 @@ impl LedgerNetwork {
         &self,
         transactions: Vec<LedgerTransaction>,
     ) -> std::result::Result<Attempt, RoundError> {
-        let head = self.head_quorum().await.map_err(RoundError::rejected)?;
+        // A head the quorum has not settled on yet is not a refusal. Nothing
+        // was proposed and nothing was applied: two proposers reaching for one
+        // height leave the validators briefly split across it, and a client
+        // that reads that as final gives up on a chain that is a backoff away
+        // from converging. Defer instead, and let the round loop come back.
+        let head = match self.head_quorum().await {
+            Ok(h) => h,
+            Err(e) => {
+                return Ok(Attempt::Deferred(format!(
+                    "no agreed head to build on yet: {e}"
+                )));
+            }
+        };
         let sequence = head.sequence + 1;
         let ballot = self.next_ballot();
         let adopted = match self.claim_height(sequence, &ballot).await {
@@ -785,5 +797,36 @@ impl LedgerNetwork {
             }
         }
         bail!("no validator could provide ledger entries")
+    }
+    /// A page of one account's postings, newest first.
+    ///
+    /// Unverified on purpose, unlike a balance or a certificate: this is an
+    /// index over history the chain already holds, not a new claim about it.
+    /// Every entry names the sequence and transaction it came from, so anything
+    /// resting on a row can be checked against the certificate at that height.
+    pub async fn fetch_history(
+        &self,
+        account: &str,
+        before: Option<u64>,
+        limit: u32,
+    ) -> Result<AccountHistory> {
+        for m in &self.set().members {
+            let mut url = format!(
+                "{}/v1/ledger/history/{}?limit={}",
+                m.url.trim_end_matches('/'),
+                account,
+                limit
+            );
+            if let Some(b) = before {
+                url.push_str(&format!("&before={b}"));
+            }
+            if let Ok(r) = self.http.get(url).send().await
+                && r.status().is_success()
+                && let Ok(page) = r.json::<AccountHistory>().await
+            {
+                return Ok(page);
+            }
+        }
+        bail!("no validator could provide account history")
     }
 }

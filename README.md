@@ -659,6 +659,21 @@ carry a quorum from `validators.json`, name the same entry, and the state
 inside hashes to the digest that quorum signed. So it can be published
 anywhere, and a restore over a store that already holds a chain is refused.
 
+Page back through the postings behind a balance:
+
+```bash
+hocmesh --home .hocmesh-a ledger-history \
+  --db .hocmesh-a/ledger-mirror.db \
+  --account <node-id> \
+  --limit 20
+```
+
+Pass `--validators validators.json` instead of `--db` to read it off the
+network rather than a local mirror, and `--before <sequence>` to follow the
+cursor the previous page printed. Pages run newest first and never stop inside
+one entry's postings, because the cursor is a sequence: a page that split an
+entry would leave postings the next page could never ask for.
+
 Audit it later without trusting the coordinator:
 
 ```bash

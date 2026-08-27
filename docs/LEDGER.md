@@ -157,6 +157,17 @@ the round was overtaken and is retried on the new head, and only otherwise is it
 reported as rejected. A round that fell short applied nothing anywhere, which is
 what makes re-proposing the same batch safe.
 
+The same reasoning applies one step earlier, before a proposal is even built.
+A round starts by reading a head the quorum agrees on, and while two proposers
+are reaching for one height the validators are briefly split across it, so no
+head reaches threshold. That is not a refusal either: nothing was proposed and
+nothing was applied. A client that treats it as one abandons a transaction the
+chain was a backoff away from accepting. So an unagreed head defers the round
+into the same retry loop a contested one uses, and only a round that exhausts
+that budget is reported as failed. `a_client_waits_out_a_head_the_quorum_has_not_agreed_on`
+drops the set one seat below threshold mid-round, heals it, and requires the
+transaction to land anyway.
+
 ## Settlement claims
 
 Validators also keep unique claims.
@@ -375,6 +386,40 @@ because those totals are part of what validators compare when they answer a
 balance query. A restored node carries them in as a baseline underneath the
 postings it later collects, so it agrees with a node that replayed everything
 instead of splitting the quorum on every account it is asked about.
+
+## Account history
+
+A balance says where an account stands. An operator reconciling a bill, or an
+account disputing one, needs the postings that produced it. Every posting a
+certificate carries is indexed as it is applied, keyed on
+`(account_id, sequence, posting_index)`, so reading one account's history is a
+seek into that key rather than a scan of every posting the ledger ever wrote.
+
+Validators serve it at `GET /v1/ledger/history/{account}?before=&limit=`, and
+`hocmesh ledger-history` reads it either from a local mirror or, with
+`--validators`, off the network:
+
+```bash
+hocmesh ledger-history --db .hocmesh/ledger-mirror.db --account <node-id>
+hocmesh ledger-history --validators validators.json --account <node-id> --limit 20
+```
+
+Pages run newest first and the cursor is a sequence, not an offset, so a page
+stays correct while the chain grows underneath the reader. That choice forces
+one rule: a page never stops in the middle of one entry's postings, because the
+next page asks for everything strictly below a sequence and would step over
+whatever was left. A page that would split an entry either takes the whole
+entry or drops it to the next page. A cursor is returned only when older
+postings genuinely exist, so following it never lands on an empty page.
+
+History is served unsigned, unlike a balance or a certificate. It is an index
+over evidence the chain already holds, not a new claim about it: every row names
+the sequence and transaction it came from, so anything resting on a row can be
+checked against the certificate at that height. Pruning keeps this index --
+`account_activity` survives because lifetime totals are part of the balance
+proofs validators compare -- but a node bootstrapped from a snapshot holds no
+postings from before its checkpoint, and says so by ending the page rather than
+handing out a cursor into history it does not have.
 
 ## What makes history difficult to fake
 

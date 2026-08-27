@@ -113,8 +113,13 @@ it for scheduling.
 ## Validator routes
 
 ```text
+GET  /health
 GET  /v1/ledger/head
+GET  /v1/ledger/state
 GET  /v1/ledger/balance/{account}
+GET  /v1/ledger/history/{account}?before=N&limit=M
+GET  /v1/ledger/claim/{claim}
+POST /v1/ledger/prepare
 POST /v1/ledger/propose
 POST /v1/ledger/commit
 GET  /v1/ledger/entries?from=N&limit=M

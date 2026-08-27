@@ -4221,4 +4221,181 @@ mod tests {
             "a refused restore still moved the ledger"
         );
     }
+
+    /// Paging has to be a view of history, not a version of it: walking the
+    /// cursor must reproduce exactly what one unbounded read returns, in the
+    /// same order, with nothing repeated and nothing skipped at a page seam.
+    #[test]
+    fn paging_history_reproduces_one_unbounded_read() {
+        use crate::store::LedgerStore;
+        let validators = validator_set("history-paging");
+        let certs = funded_chain(&validators, 6);
+        let mut store = LedgerStore::open(":memory:").unwrap();
+        for cert in &certs {
+            store.apply(cert, &validators.set).unwrap();
+        }
+        // `funded_chain` mints a fresh identity every call, so the account has
+        // to come out of the chain itself rather than be guessed from a name.
+        let provider = certs
+            .iter()
+            .flat_map(|c| c.entry.transactions.iter())
+            .filter(|t| t.kind == TransactionKind::ProviderReward)
+            .flat_map(|t| t.postings.iter())
+            .find(|p| p.delta_mcu > 0)
+            .map(|p| p.account_id.clone())
+            .expect("the funded chain pays a provider");
+        let whole = store.history(&provider, None, 500).unwrap();
+        assert!(
+            whole.entries.len() >= 6,
+            "the fixture has to give paging something to page over"
+        );
+        assert_eq!(
+            whole.next_before, None,
+            "an unbounded read is the last page"
+        );
+
+        for limit in [1u32, 2, 3, 5] {
+            let mut walked = Vec::new();
+            let mut before = None;
+            loop {
+                let page = store.history(&provider, before, limit).unwrap();
+                assert!(
+                    !page.entries.is_empty(),
+                    "a cursor the ledger handed out must not lead to an empty page"
+                );
+                walked.extend(page.entries.iter().cloned());
+                match page.next_before {
+                    Some(b) => before = Some(b),
+                    None => break,
+                }
+            }
+            assert_eq!(
+                walked, whole.entries,
+                "paging at limit {limit} has to land on the same history"
+            );
+        }
+    }
+
+    /// The cursor is a sequence, so a page that stopped halfway through one
+    /// entry would leave postings no later page can ask for. Batched entries --
+    /// what the proposer writes under load -- are exactly where that bites.
+    #[test]
+    fn a_page_never_stops_inside_one_entry() {
+        use crate::store::LedgerStore;
+        let v = validator_set("history-batch");
+        let batched: Vec<LedgerTransaction> = (0..4)
+            .map(|i| {
+                certified_community_reserve(&v, &format!("history-batch-{i}"), 1, "GENESIS")
+                    .entry
+                    .transactions[0]
+                    .clone()
+            })
+            .collect();
+        let first = certify_batch(&v, batched, 1, "GENESIS");
+        let tail =
+            certified_community_reserve(&v, "history-batch-tail", 2, &first.entry.entry_hash);
+        let mut store = LedgerStore::open(":memory:").unwrap();
+        store.apply(&first, &v.set).unwrap();
+        store.apply(&tail, &v.set).unwrap();
+        let whole = store
+            .history(COMMUNITY_ISSUANCE_ACCOUNT, None, 500)
+            .unwrap();
+        assert_eq!(
+            whole.entries.iter().filter(|e| e.sequence == 1).count(),
+            4,
+            "the batched entry has to hold four postings for one account"
+        );
+
+        for limit in [1u32, 2, 3, 5] {
+            let mut pages: Vec<Vec<AccountHistoryEntry>> = Vec::new();
+            let mut before = None;
+            loop {
+                let page = store
+                    .history(COMMUNITY_ISSUANCE_ACCOUNT, before, limit)
+                    .unwrap();
+                pages.push(page.entries.clone());
+                match page.next_before {
+                    Some(b) => before = Some(b),
+                    None => break,
+                }
+            }
+            for (i, a) in pages.iter().enumerate() {
+                for b in pages.iter().skip(i + 1) {
+                    let shared = a.iter().any(|x| b.iter().any(|y| y.sequence == x.sequence));
+                    assert!(!shared, "limit {limit} split one entry across two pages");
+                }
+            }
+            assert_eq!(
+                pages.concat(),
+                whole.entries,
+                "paging at limit {limit} has to land on the same history"
+            );
+        }
+    }
+
+    /// A node bootstrapped from a snapshot has balances it can prove and a
+    /// history it mostly never saw. It has to say so: serving a short page is
+    /// honest, handing out a cursor into postings it does not hold is not.
+    #[test]
+    fn a_restored_node_only_offers_the_history_it_actually_holds() {
+        use crate::store::LedgerStore;
+        let validators = validator_set("history-restored");
+        let certs = funded_chain(&validators, 6);
+        let cut = 8;
+        let mut early = LedgerStore::open(":memory:").unwrap();
+        for cert in certs.iter().take(cut) {
+            early.apply(cert, &validators.set).unwrap();
+        }
+        let cp = checkpoint_over(&validators, &early);
+        early.store_checkpoint(&cp, &validators.set).unwrap();
+        let snap = early.snapshot(&validators.set).unwrap();
+        let mut restored = LedgerStore::open(":memory:").unwrap();
+        restored.install_snapshot(&snap, &validators.set).unwrap();
+        // `funded_chain` mints a fresh identity every call, so the account has
+        // to come out of the chain itself rather than be guessed from a name.
+        let provider = certs
+            .iter()
+            .flat_map(|c| c.entry.transactions.iter())
+            .filter(|t| t.kind == TransactionKind::ProviderReward)
+            .flat_map(|t| t.postings.iter())
+            .find(|p| p.delta_mcu > 0)
+            .map(|p| p.account_id.clone())
+            .expect("the funded chain pays a provider");
+        let fresh = restored.history(&provider, None, 100).unwrap();
+        assert!(
+            fresh.entries.is_empty() && fresh.next_before.is_none(),
+            "a node that has applied nothing must not claim postings"
+        );
+        for cert in certs.iter().skip(cut) {
+            restored.apply(cert, &validators.set).unwrap();
+        }
+        let mut full = LedgerStore::open(":memory:").unwrap();
+        for cert in &certs {
+            full.apply(cert, &validators.set).unwrap();
+        }
+        let after = restored.history(&provider, None, 100).unwrap();
+        let everything = full.history(&provider, None, 100).unwrap();
+        assert_eq!(
+            after.next_before, None,
+            "the bottom of a restored node's history is the bottom, not a cursor"
+        );
+        assert!(
+            after.entries.iter().all(|e| e.sequence > cp.head.sequence),
+            "nothing below the checkpoint was replayed, so nothing below it exists"
+        );
+        assert_eq!(
+            after.entries,
+            everything
+                .entries
+                .iter()
+                .filter(|e| e.sequence > cp.head.sequence)
+                .cloned()
+                .collect::<Vec<_>>(),
+            "what it did replay has to match a node that replayed everything"
+        );
+        assert!(
+            everything.entries.len() > after.entries.len(),
+            "the full replayer is the one that holds the older postings"
+        );
+    }
 }

@@ -434,6 +434,98 @@ impl LedgerStore {
         let (base_e, base_s) = self.activity_baseline(a)?;
         Ok((earned + base_e, spent + base_s))
     }
+    /// A page of an account's postings, newest first.
+    ///
+    /// `before` excludes everything at or above that sequence, so paging walks
+    /// backwards through the chain. The primary key on
+    /// `(account_id, sequence, posting_index)` is what makes this a seek rather
+    /// than a scan of every posting the ledger has ever written.
+    pub fn history(
+        &self,
+        account: &str,
+        before: Option<u64>,
+        limit: u32,
+    ) -> Result<AccountHistory> {
+        let limit = limit.clamp(1, 500);
+        let ceiling = before.unwrap_or(u64::MAX).min(i64::MAX as u64) as i64;
+        let mut q = self.conn.prepare(
+            "SELECT sequence,posting_index,transaction_id,delta_mcu,created_at
+             FROM account_activity WHERE account_id=?1 AND sequence<?2
+             ORDER BY sequence DESC, posting_index DESC LIMIT ?3",
+        )?;
+        let mut entries: Vec<AccountHistoryEntry> = q
+            .query_map(params![account, ceiling, limit], |r| {
+                Ok(AccountHistoryEntry {
+                    sequence: r.get::<_, i64>(0)? as u64,
+                    posting_index: r.get::<_, i64>(1)? as u32,
+                    transaction_id: r.get(2)?,
+                    delta_mcu: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+
+        // A page must never stop in the middle of one entry's postings, or the
+        // cursor -- which is a sequence -- would step over whatever was left.
+        // Either the page holds more than one sequence, in which case the last
+        // one is dropped and comes back whole next time, or it holds exactly
+        // one and the rest of it is fetched now.
+        let more = entries.len() as u32 == limit;
+        if more {
+            let last = entries[entries.len() - 1].clone();
+            if entries[0].sequence == last.sequence {
+                entries.extend(self.postings_at(account, last.sequence, last.posting_index)?);
+            } else {
+                entries.retain(|e| e.sequence != last.sequence);
+            }
+        }
+        // The cursor is whatever survived, not whatever the page happened to
+        // hold: dropping a partial entry shortens the page below `limit`, and
+        // reading fullness off the trimmed page would end history right there.
+        let next_before = match entries.last() {
+            Some(e) if more && self.has_history_below(account, e.sequence)? => Some(e.sequence),
+            _ => None,
+        };
+        Ok(AccountHistory {
+            account_id: account.to_string(),
+            entries,
+            next_before,
+        })
+    }
+
+    /// The postings for one account inside one entry, below a given index.
+    ///
+    /// Only ever called to finish a page that landed inside an entry, so the
+    /// count is whatever that single transaction posted, not a page's worth.
+    fn postings_at(&self, account: &str, seq: u64, below: u32) -> Result<Vec<AccountHistoryEntry>> {
+        let mut q = self.conn.prepare(
+            "SELECT sequence,posting_index,transaction_id,delta_mcu,created_at
+             FROM account_activity
+             WHERE account_id=?1 AND sequence=?2 AND posting_index<?3
+             ORDER BY posting_index DESC",
+        )?;
+        Ok(q.query_map(params![account, seq as i64, below], |r| {
+            Ok(AccountHistoryEntry {
+                sequence: r.get::<_, i64>(0)? as u64,
+                posting_index: r.get::<_, i64>(1)? as u32,
+                transaction_id: r.get(2)?,
+                delta_mcu: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Whether anything older than `before` is still on this node.
+    ///
+    /// A full page is not evidence that more exists, and a cursor that leads
+    /// to an empty page makes a caller walk one more round for nothing.
+    fn has_history_below(&self, account: &str, before: u64) -> Result<bool> {
+        let mut q = self.conn.prepare(
+            "SELECT 1 FROM account_activity WHERE account_id=?1 AND sequence<?2 LIMIT 1",
+        )?;
+        Ok(q.exists(params![account, before.min(i64::MAX as u64) as i64])?)
+    }
     /// What a snapshot carried in for this account before the first posting
     /// this store holds. Zero for anyone who replayed the chain from genesis.
     fn activity_baseline(&self, a: &str) -> Result<(i64, i64)> {

@@ -25,6 +25,7 @@
 - Two-stage inference settlement, so generated text is paid for by a signed exchange rather than by trusting whoever produced it.
 - Portable signed snapshots, so a newcomer adopts a quorum-signed state and syncs from there instead of replaying the chain from genesis.
 - Out-of-band checkpoint distribution, because that snapshot proves itself against a validator set the reader already trusts and so can travel by any untrusted route.
+- Indexed account history, so an operator reconciling a bill can page back through the postings behind a balance -- served by validators, readable from a local mirror, and keyed so a page is a seek rather than a scan.
 
 ## Priority 0 — handoff validation
 
@@ -38,7 +39,6 @@
 
 ## Priority 1 — production ledger hardening
 
-- Efficient indexed transaction/account history.
 - Reconciliation daemon for partial coordinator/ledger failures.
 - Sweeping stale inference holding accounts to the commons once the settlement window closes, so a requester that takes delivery and never gives a verdict cannot strand CU indefinitely.
 - Property tests for conservation and replay invariants. Covered in `hocmesh-ledger`: a settled reward survives no single edit to its postings, evidence, or signature; the community ceiling is never crossed by any sequence of mints; and a chain replayed into two databases leaves them identical, refuses every certificate a second time, and sums to exactly zero.

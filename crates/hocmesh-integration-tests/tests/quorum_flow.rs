@@ -6,8 +6,9 @@ use hocmesh_core::{
 use hocmesh_ledger::{
     network::LedgerNetwork,
     types::{
-        COMMUNITY_ISSUANCE_ACCOUNT, LedgerHead, LedgerTransaction, Posting, TransactionEvidence,
-        TransactionKind, ValidatorMember, ValidatorSet, ValidatorSignature, escrow_account,
+        AccountHistory, COMMUNITY_ISSUANCE_ACCOUNT, LedgerHead, LedgerTransaction, Posting,
+        TransactionEvidence, TransactionKind, ValidatorMember, ValidatorSet, ValidatorSignature,
+        escrow_account,
     },
 };
 use hocmesh_protocol::{
@@ -617,6 +618,65 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
         .is_err(),
         "a ledger that already had a chain was overwritten by a snapshot"
     );
+
+    // Balances say where an account stands; an operator reconciling a bill
+    // needs to see how it got there. The index has to agree with the chain it
+    // is an index over -- both the validator serving it and the mirror the node
+    // reads locally -- or it is just a second, softer set of books.
+    let earner = node_a.identity.node_id();
+    let served: AccountHistory = get_json(
+        &http,
+        &format!("http://127.0.0.1:{}", validator_ports[0]),
+        &format!("/v1/ledger/history/{earner}?limit=100"),
+    )
+    .await?;
+    assert!(
+        !served.entries.is_empty(),
+        "an account that earned and spent has to have postings behind it"
+    );
+    let net: i64 = served.entries.iter().map(|e| e.delta_mcu).sum();
+    assert_eq!(
+        net,
+        balance(&http, &coordinator, &node_a).await?.balance_mcu,
+        "the postings have to add up to the balance the quorum reports"
+    );
+    assert!(
+        served.entries.iter().any(|e| e.delta_mcu > 0)
+            && served.entries.iter().any(|e| e.delta_mcu < 0),
+        "this node both earned and spent, so both directions have to show"
+    );
+
+    // The same history through the node CLI, once out of the local mirror and
+    // once off the network, has to be the same history.
+    let from_mirror = run_capture(
+        Command::new(&node_bin)
+            .arg("ledger-history")
+            .arg("--db")
+            .arg(&mirror)
+            .arg("--account")
+            .arg(&earner),
+        "read account history out of the local mirror",
+    )?;
+    let from_network = run_capture(
+        Command::new(&node_bin)
+            .arg("ledger-history")
+            .arg("--validators")
+            .arg(&validators_path)
+            .arg("--account")
+            .arg(&earner),
+        "read account history off the validator network",
+    )?;
+    assert_eq!(
+        from_mirror, from_network,
+        "a mirror and the network it mirrors must not disagree about history"
+    );
+    for entry in &served.entries {
+        assert!(
+            from_mirror.contains(&entry.transaction_id),
+            "the CLI dropped a posting the validator served: {}",
+            entry.transaction_id
+        );
+    }
 
     Ok(())
 }
@@ -1399,6 +1459,26 @@ fn run_ok(command: &mut Command, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Runs a node command and hands back its stdout.
+///
+/// `run_ok` throws stdout away, which is fine for commands whose only product
+/// is a side effect; a command whose product *is* the output needs this.
+fn run_capture(command: &mut Command, label: &str) -> Result<String> {
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("running {label}"))?;
+    if !output.status.success() {
+        bail!(
+            "{label} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
 fn workspace_root() -> Result<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
@@ -2034,6 +2114,85 @@ async fn two_independent_proposers_both_settle() -> Result<()> {
     }
     assert!(converged, "the quorum never agreed on the second entry");
 
+    for mut validator in validators {
+        validator.kill();
+    }
+    Ok(())
+}
+
+/// A quorum that has not agreed on a head *yet* is not a quorum that refused.
+///
+/// Two proposers reaching for one height leave the validators briefly split
+/// across it, and so does any hiccup that puts the set below threshold for a
+/// moment. A client that reads either as final abandons a transaction the
+/// chain was about to accept -- the failure mode is silent, and it strands
+/// work nobody rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_waits_out_a_head_the_quorum_has_not_agreed_on() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = test_client();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let mut links = Vec::new();
+    for port in validator_ports {
+        links.push(FaultLink::to(port).await?);
+    }
+    let urls: Vec<String> = links.iter().map(|l| l.url()).collect();
+    let (validators_path, validator_homes, validator_dbs, set) =
+        create_validator_set_at(&tmp, &validator_bin, &urls)?;
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    // Settle one entry the ordinary way, so the head the client later has to
+    // wait for is a real one rather than genesis.
+    let client = LedgerNetwork::new(set.clone())?;
+    let warmup = community_mint(&node_bin, &validator_homes, &validators_path, "job_wait_a")?;
+    client.transact(warmup).await?;
+    let contested = community_mint(&node_bin, &validator_homes, &validators_path, "job_wait_b")?;
+
+    // Drop the set one seat below threshold. Nothing has refused anything --
+    // there is simply no head three of four validators will agree on.
+    links[0].cut();
+    links[1].cut();
+    assert!(
+        client.head_quorum().await.is_err(),
+        "the split has to be real before the client is asked to survive it"
+    );
+
+    // Heal while the client is mid-round. With the split treated as a refusal
+    // this transaction is already lost by now; treated as a deferral it lands.
+    let healer = tokio::spawn({
+        let (a, b) = (links[0].cut.clone(), links[1].cut.clone());
+        async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            a.store(false, Ordering::SeqCst);
+            b.store(false, Ordering::SeqCst);
+        }
+    });
+    let settled = client.transact(contested).await;
+    healer.await?;
+    let cert = settled.context("a client gave up on a head the quorum was about to agree on")?;
+    assert_eq!(
+        cert.entry.sequence, 2,
+        "the deferred transaction has to land on the entry after the warmup"
+    );
     for mut validator in validators {
         validator.kill();
     }

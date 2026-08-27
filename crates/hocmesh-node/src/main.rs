@@ -276,6 +276,23 @@ enum Command {
         #[arg(long)]
         snapshot: PathBuf,
     },
+    /// Page through one account's postings, newest first.
+    ///
+    /// Reads the local mirror by default. `--validators` asks the network
+    /// instead, which is what an operator without a mirror -- or with one
+    /// pruned below the entry they are chasing -- actually has to do.
+    LedgerHistory {
+        #[arg(long)]
+        account: String,
+        #[arg(long, default_value = ".hocmesh/ledger-mirror.db")]
+        db: String,
+        #[arg(long)]
+        validators: Option<String>,
+        #[arg(long)]
+        before: Option<u64>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
     /// Sign a sponsorship for a community-funded job.
     ///
     /// The mint is the one place CU comes from nothing, so it is an operator
@@ -1050,6 +1067,40 @@ stored at: {}",
                 "RESTORED: height={} head={} — sync from here rather than genesis",
                 head.sequence, head.entry_hash
             );
+        }
+        Command::LedgerHistory {
+            account,
+            db,
+            validators,
+            before,
+            limit,
+        } => {
+            // A pruned mirror is not a broken one -- it simply stopped holding
+            // what it no longer needs -- so the network is the fallback rather
+            // than an error.
+            let page = match &validators {
+                Some(v) => {
+                    load_network(v)?
+                        .fetch_history(&account, before, limit)
+                        .await?
+                }
+                None => LedgerStore::open(&db)?.history(&account, before, limit)?,
+            };
+            println!("History for {} (newest first)", page.account_id);
+            for e in &page.entries {
+                println!(
+                    "  seq={:<6} #{:<2} {:>10.3} CU  tx={}  at={}",
+                    e.sequence,
+                    e.posting_index,
+                    e.delta_mcu as f64 / 1000.0,
+                    e.transaction_id,
+                    e.created_at
+                );
+            }
+            match page.next_before {
+                Some(b) => println!("-- older postings remain: rerun with --before {b}"),
+                None => println!("-- start of this ledger's history for {account}"),
+            }
         }
         Command::CommunityVouch {
             validators,
