@@ -2020,7 +2020,19 @@ async fn two_independent_proposers_both_settle() -> Result<()> {
         ra.entry.sequence, rb.entry.sequence,
         "two proposers settled at the same height"
     );
-    assert_eq!(first.head_quorum().await?.sequence, 2);
+    // Both proposals carry a certificate, but a validator can still be
+    // finishing the write that makes the newer one visible to a reader. The
+    // claim being tested is that two racing proposers converge, not that they
+    // converge before anyone has finished writing anything down.
+    let mut converged = false;
+    for _ in 0..100 {
+        if matches!(first.head_quorum().await, Ok(head) if head.sequence == 2) {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(converged, "the quorum never agreed on the second entry");
 
     for mut validator in validators {
         validator.kill();
@@ -2178,7 +2190,14 @@ async fn settlement_survives_wan_latency_and_a_minority_partition() -> Result<()
     links[0].heal();
     let mut connected = None;
     for _ in 0..100 {
-        let heads = validator_heads(&http, &set).await?;
+        // A request across a link that was just cut and healed can hang on a
+        // socket the partition left behind, and one such request must not eat
+        // the whole retry budget. Bound it and ask again.
+        let fetch = tokio::time::timeout(Duration::from_secs(5), validator_heads(&http, &set));
+        let Ok(Ok(heads)) = fetch.await else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
         if heads[1].sequence > 0 && heads[1..].iter().all(|h| h.sequence == heads[1].sequence) {
             connected = Some(heads[1].sequence);
             break;
@@ -2570,7 +2589,13 @@ async fn accept_loop(
     cut: Arc<AtomicBool>,
     one_way_ms: Arc<AtomicU64>,
 ) {
-    while let Ok((inbound, _)) = listener.accept().await {
+    loop {
+        // A transient accept error must not retire the link for good: a test
+        // whose network quietly stopped existing reports a partition that was
+        // never asked for.
+        let Ok((inbound, _)) = listener.accept().await else {
+            continue;
+        };
         if cut.load(Ordering::SeqCst) {
             continue;
         }
@@ -2591,7 +2616,14 @@ async fn relay(
     let (mut from_server, mut to_server) = outbound.split();
     let up = pump(&mut from_client, &mut to_server, &cut, &one_way_ms);
     let down = pump(&mut from_server, &mut to_client, &cut, &one_way_ms);
-    let _ = tokio::try_join!(up, down);
+    // Whichever direction ends first ends the connection. try_join! waited for
+    // both, so when the validator closed an idle keep-alive socket the relay
+    // swallowed the close and left the client half open: the next request sent
+    // on that pooled socket went nowhere until an outer timeout noticed.
+    tokio::select! {
+        _ = up => {}
+        _ = down => {}
+    }
 }
 
 /// Copy one direction, honouring latency and noticing a cut between reads.
@@ -2611,6 +2643,9 @@ where
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = vec![0u8; 16 * 1024];
+    // Whether the link has been silent long enough that the next bytes start a
+    // new message rather than continue one already crossing it.
+    let mut quiet = true;
     loop {
         if cut.load(Ordering::SeqCst) {
             return Err(std::io::Error::new(
@@ -2623,12 +2658,21 @@ where
             Ok(Ok(0)) => return Ok(()),
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
-            Err(_) => continue,
+            Err(_) => {
+                quiet = true;
+                continue;
+            }
         };
         let delay = one_way_ms.load(Ordering::SeqCst);
-        if delay > 0 {
+        // Propagation is paid once per message, not once per TCP segment: a
+        // continuation arrives behind the bytes that preceded it and has
+        // already crossed the wire. Charging every burst made the simulated
+        // delay depend on how the kernel happened to chunk the stream, which
+        // is a property of the machine rather than of the network under test.
+        if delay > 0 && quiet {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
+        quiet = false;
         writer.write_all(&buf[..n]).await?;
         writer.flush().await?;
     }

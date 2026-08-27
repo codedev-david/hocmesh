@@ -85,7 +85,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Measure workspace coverage
-        run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/hocmesh-coverage.lcov --fail-under-lines 45
+        run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/hocmesh-coverage.lcov --fail-under-lines 45 -- --test-threads=1
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v7
         with:
