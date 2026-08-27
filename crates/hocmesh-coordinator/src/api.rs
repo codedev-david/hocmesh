@@ -1,7 +1,9 @@
 use crate::error::ApiError;
+use crate::federation::Federation;
+use crate::schedule::{self, ResourceGraph, ShardCandidate, Vertex, WorkerProfile};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
 };
 use hocmesh_ai::{
@@ -42,6 +44,8 @@ use hocmesh_protocol::{
     verify_auth,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(test)]
 use uuid::Uuid;
@@ -50,6 +54,9 @@ use uuid::Uuid;
 pub struct AppState {
     pub db: Arc<crate::db::Pool>,
     pub ledger: Option<LedgerNetwork>,
+    /// Set when this coordinator is one of several over the same ledger.
+    /// `None` is a deployment of one, which owns every job by definition.
+    pub federation: Option<Federation>,
 }
 
 type AssignmentSettlementRow = (String, String, i64, i64, String, Option<String>, i64);
@@ -84,6 +91,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/ai/work/result", post(report_inference))
         .route("/v1/ai/work/fail", post(fail_inference))
         .route("/v1/ledger/reconciliation", get(reconciliation))
+        .route("/v1/topology", get(topology))
+        .route("/v1/federation/status", get(federation_status))
+        .route("/v1/federation/jobs/{id}", get(federation_job_owner))
         .with_state(state)
 }
 
@@ -828,9 +838,15 @@ async fn receipt_inference(
             })?;
         }
         let conn = state.db.get().map_err(ApiError::internal)?;
+        // The receipt is kept, not just counted. If this requester never comes
+        // back to accept or dispute, this proof is the only thing that will
+        // let the commons collect the batch once the window closes.
         conn.execute(
-            "UPDATE ai_assignments SET receipted=1 WHERE assignment_id=?1",
-            params![req.assignment_id],
+            "UPDATE ai_assignments SET receipted=1, receipt_auth_json=?2 WHERE assignment_id=?1",
+            params![
+                req.assignment_id,
+                serde_json::to_string(&req.auth).map_err(ApiError::internal)?
+            ],
         )
         .map_err(ApiError::internal)?;
     }
@@ -1424,9 +1440,15 @@ async fn register(
         let mut conn = state.db.get().map_err(ApiError::internal)?;
         consume_nonce(&conn, &req.auth)?;
         let tx = conn.transaction().map_err(ApiError::internal)?;
-        tx.execute(r#"INSERT INTO nodes(node_id,public_key_b64,capabilities_json,registered_at,last_seen)
-            VALUES(?1,?2,?3,?4,?4) ON CONFLICT(node_id) DO UPDATE SET public_key_b64=excluded.public_key_b64,capabilities_json=excluded.capabilities_json,last_seen=excluded.last_seen"#,
-            params![req.auth.node_id, req.public_key_b64, caps_json, now]).map_err(ApiError::internal)?;
+        tx.execute(r#"INSERT INTO nodes(node_id,public_key_b64,capabilities_json,registered_at,last_seen,region)
+            VALUES(?1,?2,?3,?4,?4,?5) ON CONFLICT(node_id) DO UPDATE SET public_key_b64=excluded.public_key_b64,capabilities_json=excluded.capabilities_json,last_seen=excluded.last_seen,region=excluded.region"#,
+            params![
+                req.auth.node_id,
+                req.public_key_b64,
+                caps_json,
+                now,
+                state.federation.as_ref().and_then(|f| f.region())
+            ]).map_err(ApiError::internal)?;
         tx.execute(
             "INSERT OR IGNORE INTO balances(node_id,balance_mcu) VALUES(?1,0)",
             params![req.auth.node_id],
@@ -1455,11 +1477,181 @@ async fn heartbeat(
     authenticate_known_node(&conn, &req.auth, "heartbeat", &body_hash)?;
     let caps_json = serde_json::to_string(&req.capabilities).map_err(ApiError::internal)?;
     conn.execute(
-        "UPDATE nodes SET last_seen=?2,capabilities_json=?3 WHERE node_id=?1",
-        params![req.auth.node_id, now_unix(), caps_json],
+        "UPDATE nodes SET last_seen=?2,capabilities_json=?3,region=?4 WHERE node_id=?1",
+        params![
+            req.auth.node_id,
+            now_unix(),
+            caps_json,
+            state.federation.as_ref().and_then(|f| f.region())
+        ],
     )
     .map_err(ApiError::internal)?;
     Ok(Json(serde_json::json!({"ok":true})))
+}
+
+/// How many pending shards one poll scores.
+///
+/// Scoring is cheap but not free, and a coordinator with a long backlog should
+/// not walk all of it on every poll. The window is bounded and ordered by age,
+/// so the shards nearest to starving are always the ones inside it.
+const POLL_WINDOW: i64 = 256;
+
+/// The pending shards this coordinator would consider handing to one node,
+/// paired with the specs needed to answer with them.
+struct PendingWork {
+    candidates: Vec<ShardCandidate>,
+    /// `assignment_id` -> the parsed spec and whether the job is system-funded.
+    specs: HashMap<String, (WorkSpec, bool)>,
+}
+
+/// Working-set estimate for a shard, used only to keep a shard off a node that
+/// cannot hold it.
+///
+/// Deliberately an upper bound rather than a measurement: being wrong high
+/// costs a node one shard it could have run, while being wrong low hands a node
+/// work that will die part-way through and take the lease with it.
+fn shard_memory_bytes(work: &WorkSpec) -> u64 {
+    // Interpreter, buffers, and the result entry, none of which scale with the
+    // spec.
+    const BASELINE: u64 = 1 << 20;
+    match work {
+        // Both are a running counter over a range; nothing is materialised.
+        WorkSpec::PrimeCount { .. } | WorkSpec::CollatzPeak { .. } => BASELINE,
+        WorkSpec::MatrixMultiply {
+            dim,
+            row_start,
+            row_end,
+            ..
+        } => {
+            // The whole of B is generated from its seed and held, plus the row
+            // block of the product. Both are u32 elements.
+            let dim = u64::from(*dim);
+            let span = u64::from(row_end.saturating_sub(*row_start));
+            let elements = dim
+                .saturating_mul(dim)
+                .saturating_add(span.saturating_mul(dim));
+            BASELINE.saturating_add(elements.saturating_mul(4))
+        }
+    }
+}
+
+/// What this coordinator knows about a node, in the shape the scheduler wants.
+fn worker_profile(conn: &Connection, node_id: &str) -> Result<WorkerProfile, ApiError> {
+    let (caps_json, region): (String, Option<String>) = conn
+        .query_row(
+            "SELECT capabilities_json,region FROM nodes WHERE node_id=?1",
+            params![node_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(ApiError::internal)?;
+    let caps: NodeCapabilities = serde_json::from_str(&caps_json).map_err(ApiError::internal)?;
+    Ok(WorkerProfile {
+        node_id: node_id.to_string(),
+        region,
+        caps,
+        reputation: reputation_row(conn, node_id)?,
+    })
+}
+
+/// The shards this node has already finished, per job.
+///
+/// This is the whole of the scheduler's cache-locality evidence: a node that
+/// has done neighbouring shards of the same job holds the same generated
+/// operands, and giving it another shard of that job avoids regenerating them.
+fn completed_shards_by_job(
+    conn: &Connection,
+    node_id: &str,
+) -> Result<HashMap<String, Vec<u32>>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT job_id,shard_index FROM assignments
+             WHERE leased_to=?1 AND status IN ('completed','settling')",
+        )
+        .map_err(ApiError::internal)?;
+    let rows = stmt
+        .query_map(params![node_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .map_err(ApiError::internal)?;
+    let mut history: HashMap<String, Vec<u32>> = HashMap::new();
+    for row in rows {
+        let (job_id, shard_index) = row.map_err(ApiError::internal)?;
+        history
+            .entry(job_id)
+            .or_default()
+            .push(shard_index.clamp(0, i64::from(u32::MAX)) as u32);
+    }
+    Ok(history)
+}
+
+/// Collect the pending shards this coordinator may offer to `node_id`.
+///
+/// Two filters apply before any scoring. A node is never offered a shard of a
+/// job it requested itself, because self-serving a job would let a requester
+/// audit its own work. And in a federated deployment a coordinator only offers
+/// the jobs it owns, so two coordinators never hand the same shard to two
+/// nodes.
+fn pending_work(
+    conn: &Connection,
+    node_id: &str,
+    federation: Option<&Federation>,
+) -> Result<PendingWork, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.assignment_id,a.job_id,a.shard_index,a.work_json,a.reward_mcu,
+                    j.system_funded,j.created_at
+             FROM assignments a JOIN jobs j ON j.job_id=a.job_id
+             WHERE a.status='pending' AND (j.requester_node_id IS NULL OR j.requester_node_id != ?1)
+             ORDER BY j.created_at ASC, a.rowid ASC LIMIT ?2",
+        )
+        .map_err(ApiError::internal)?;
+    let rows = stmt
+        .query_map(params![node_id, POLL_WINDOW], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(ApiError::internal)?;
+
+    let history = completed_shards_by_job(conn, node_id)?;
+    let mut candidates = Vec::new();
+    let mut specs = HashMap::new();
+    for row in rows {
+        let (assignment_id, job_id, shard_index, work_json, reward_mcu, system_funded, created_at) =
+            row.map_err(ApiError::internal)?;
+        if let Some(fed) = federation
+            && !fed.owns(&job_id)
+        {
+            continue;
+        }
+        let work: WorkSpec = serde_json::from_str(&work_json).map_err(ApiError::internal)?;
+        let shard_index = shard_index.clamp(0, i64::from(u32::MAX)) as u32;
+        let done = history.get(&job_id);
+        candidates.push(ShardCandidate {
+            assignment_id: assignment_id.clone(),
+            job_id,
+            shard_index,
+            reward_mcu,
+            memory_bytes: shard_memory_bytes(&work),
+            // A shard's wait starts when its job was submitted: shards are
+            // created with the job, so this is the age of the shard too.
+            created_at,
+            shards_done_here: done.map_or(0, |v| v.len() as u32),
+            nearest_done_shard: done
+                .and_then(|v| v.iter().copied().min_by_key(|s| s.abs_diff(shard_index))),
+            // CPU workloads need nothing on disk. Model-backed shards will
+            // populate this when they gain a coordinator-side spec.
+            required_manifests: Vec::new(),
+        });
+        specs.insert(assignment_id, (work, system_funded != 0));
+    }
+    Ok(PendingWork { candidates, specs })
 }
 
 async fn poll_work(
@@ -1469,37 +1661,286 @@ async fn poll_work(
     let conn = state.db.get().map_err(ApiError::internal)?;
     authenticate_known_node(&conn, &req.auth, "poll", &empty_body_hash())?;
     let now = now_unix();
-    conn.execute("UPDATE assignments SET status='pending',leased_to=NULL,lease_until=NULL WHERE status='leased' AND lease_until < ?1", params![now]).map_err(ApiError::internal)?;
+    conn.execute("UPDATE assignments SET status='pending',leased_to=NULL,lease_until=NULL,leased_by=NULL WHERE status='leased' AND lease_until < ?1", params![now]).map_err(ApiError::internal)?;
     conn.execute(
         "UPDATE nodes SET last_seen=?2 WHERE node_id=?1",
         params![req.auth.node_id, now],
     )
     .map_err(ApiError::internal)?;
-    let candidate: Option<(String,String,i64,String,i64,i64)> = conn.query_row(
-        "SELECT a.assignment_id,a.job_id,a.shard_index,a.work_json,a.reward_mcu,j.system_funded FROM assignments a JOIN jobs j ON j.job_id=a.job_id WHERE a.status='pending' AND (j.requester_node_id IS NULL OR j.requester_node_id != ?1) ORDER BY a.rowid LIMIT 1",
-        params![req.auth.node_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(ApiError::internal)?;
-    let Some((assignment_id, job_id, shard_index, work_json, reward_mcu, system_funded)) =
-        candidate
-    else {
+
+    let worker = worker_profile(&conn, &req.auth.node_id)?;
+    let pending = pending_work(&conn, &req.auth.node_id, state.federation.as_ref())?;
+    let region = state.federation.as_ref().and_then(|f| f.region());
+    let Some((chosen, fit)) = schedule::best(
+        &worker,
+        &pending.candidates,
+        now,
+        region,
+        &schedule::Weights::default(),
+    ) else {
         return Ok(Json(PollResponse { assignment: None }));
     };
+    let Some((work, system_funded)) = pending.specs.get(&chosen.assignment_id).cloned() else {
+        return Ok(Json(PollResponse { assignment: None }));
+    };
+    // Emitted per decision so a placement that looks wrong can be explained by
+    // the axis that drove it rather than guessed at.
+    tracing::debug!(
+        node = %worker.node_id,
+        assignment = %chosen.assignment_id,
+        considered = pending.candidates.len(),
+        hardware = fit.hardware,
+        network = fit.network,
+        reliability = fit.reliability,
+        locality = fit.locality,
+        starvation = fit.starvation,
+        total = fit.total,
+        "shard offered"
+    );
+
     let lease_until = now + DEFAULT_LEASE_SECONDS;
-    let updated=conn.execute("UPDATE assignments SET status='leased',leased_to=?2,lease_until=?3 WHERE assignment_id=?1 AND status='pending'",params![assignment_id,req.auth.node_id,lease_until]).map_err(ApiError::internal)?;
+    // `leased_by` records which coordinator is responsible for this lease, so a
+    // peer that goes unreachable can have its in-flight leases cut short
+    // without touching anyone else's.
+    let updated = conn.execute(
+        "UPDATE assignments SET status='leased',leased_to=?2,lease_until=?3,leased_by=?4 WHERE assignment_id=?1 AND status='pending'",
+        params![
+            chosen.assignment_id,
+            req.auth.node_id,
+            lease_until,
+            state.federation.as_ref().map(|f| f.coordinator_id().to_string())
+        ],
+    ).map_err(ApiError::internal)?;
     if updated == 0 {
         return Ok(Json(PollResponse { assignment: None }));
     }
-    let work: WorkSpec = serde_json::from_str(&work_json).map_err(ApiError::internal)?;
     Ok(Json(PollResponse {
         assignment: Some(WorkAssignment {
-            assignment_id,
-            job_id,
-            shard_index: shard_index as u32,
+            assignment_id: chosen.assignment_id.clone(),
+            job_id: chosen.job_id.clone(),
+            shard_index: chosen.shard_index,
             work,
-            reward_mcu,
+            reward_mcu: chosen.reward_mcu,
             lease_seconds: DEFAULT_LEASE_SECONDS,
-            system_funded: system_funded != 0,
+            system_funded,
         }),
     }))
+}
+
+/// A request for a set of machines that are near one another.
+#[derive(Debug, Deserialize)]
+struct TopologyQuery {
+    /// How many machines the caller wants held together. Absent means "just
+    /// describe the graph".
+    #[serde(default)]
+    cluster: Option<usize>,
+    /// Restrict the cluster to one region.
+    #[serde(default)]
+    region: Option<String>,
+    /// Machines with less than this much shareable memory are not considered.
+    #[serde(default)]
+    min_memory_bytes: Option<u64>,
+    /// Exclude machines below this standing, in `[0, 1]`.
+    ///
+    /// Worth setting for tightly coupled work: a collective finishes when its
+    /// last member does, so one unreliable machine costs the whole set, which
+    /// is not true of independent shards.
+    #[serde(default)]
+    min_standing: Option<f64>,
+}
+
+/// One machine, as the topology view sees it.
+#[derive(Serialize)]
+struct TopologyNode {
+    node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+    /// Sustained throughput in mCU/s, or `None` when the node has not
+    /// benchmarked itself. Absent is not zero, and must not be read as slow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcu_per_second: Option<f64>,
+    shared_memory_bytes: u64,
+    shared_logical_cpus: usize,
+    gpus: usize,
+    /// Standing in `[0, 1]`, from the same audit history the scheduler uses.
+    standing: f64,
+    /// Whether this node's coordinate is usable for distance at all.
+    located: bool,
+}
+
+/// The machines currently offering capacity and how far apart they are.
+///
+/// A read-only view: nothing here reserves anything or moves CU. It exists so
+/// that work which must run on several machines at once can be placed on
+/// machines that are actually near each other, and so an operator can see the
+/// shape of the network the scheduler is choosing from.
+#[derive(Serialize)]
+struct TopologyReport {
+    online: usize,
+    /// Round trip assumed between two machines that have measured nothing,
+    /// reported so a caller can tell a real distance from a placeholder.
+    unknown_edge_micros: u64,
+    nodes: Vec<TopologyNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cluster: Option<schedule::Cluster>,
+    /// Set when a cluster was asked for and could not be formed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cluster_unavailable: Option<String>,
+}
+
+/// Build the resource graph from every node the coordinator has heard from.
+///
+/// Offline nodes stay in the graph as vertices but are never chosen: they are
+/// still useful context for an operator, and `cluster` gates on `online`
+/// itself.
+fn resource_graph(conn: &Connection) -> Result<ResourceGraph, ApiError> {
+    let mut stmt = conn
+        .prepare("SELECT node_id,capabilities_json,region,last_seen FROM nodes")
+        .map_err(ApiError::internal)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(ApiError::internal)?;
+    let cutoff = now_unix() - NODE_ONLINE_SECS;
+    let mut vertices = Vec::new();
+    for row in rows {
+        let (node_id, caps_json, region, last_seen) = row.map_err(ApiError::internal)?;
+        let Ok(caps) = serde_json::from_str::<NodeCapabilities>(&caps_json) else {
+            continue;
+        };
+        let reputation = reputation_row(conn, &node_id)?;
+        vertices.push(Vertex {
+            node_id,
+            region,
+            caps,
+            reputation,
+            online: last_seen >= cutoff,
+        });
+    }
+    Ok(ResourceGraph::new(vertices))
+}
+
+async fn topology(
+    State(state): State<AppState>,
+    Query(query): Query<TopologyQuery>,
+) -> Result<Json<TopologyReport>, ApiError> {
+    let conn = state.db.get().map_err(ApiError::internal)?;
+    let graph = resource_graph(&conn)?;
+    let nodes: Vec<TopologyNode> = graph
+        .vertices()
+        .iter()
+        .map(|v| TopologyNode {
+            node_id: v.node_id.clone(),
+            region: v.region.clone(),
+            mcu_per_second: schedule::mcu_per_second(&v.caps),
+            shared_memory_bytes: v.caps.shared_memory_bytes,
+            shared_logical_cpus: v.caps.shared_logical_cpus,
+            gpus: v.caps.gpus.len(),
+            standing: schedule::standing(&v.reputation),
+            located: v
+                .caps
+                .network_coordinate
+                .as_ref()
+                .is_some_and(hocmesh_core::proximity::is_plausible),
+        })
+        .collect();
+    let online = graph.vertices().iter().filter(|v| v.online).count();
+
+    let (cluster, cluster_unavailable) = match query.cluster {
+        None => (None, None),
+        Some(size) => {
+            let region = query.region.clone();
+            let min_memory = query.min_memory_bytes.unwrap_or(0);
+            let min_standing = query.min_standing.unwrap_or(0.0);
+            let found = graph.cluster(size, |v| {
+                v.caps.shared_memory_bytes >= min_memory
+                    && schedule::standing(&v.reputation) >= min_standing
+                    && region
+                        .as_deref()
+                        .is_none_or(|r| v.region.as_deref() == Some(r))
+            });
+            match found {
+                Some(c) => (Some(c), None),
+                None => (
+                    None,
+                    Some(format!(
+                        "no {size} online machines satisfy the requested constraints"
+                    )),
+                ),
+            }
+        }
+    };
+
+    Ok(Json(TopologyReport {
+        online,
+        unknown_edge_micros: schedule::UNKNOWN_EDGE_MICROS,
+        nodes,
+        cluster,
+        cluster_unavailable,
+    }))
+}
+
+/// What this coordinator believes about its peers.
+#[derive(Serialize)]
+struct FederationReport {
+    federated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<crate::federation::FederationStatus>,
+}
+
+/// Which coordinator is responsible for a job, and where to reach it.
+///
+/// A client that lands on the wrong coordinator can use this to find the right
+/// one rather than being told no.
+#[derive(Serialize)]
+struct JobOwnerReport {
+    job_id: String,
+    federated: bool,
+    /// `None` when unfederated: there is one coordinator and it owns
+    /// everything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    mine: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+}
+
+async fn federation_status(State(state): State<AppState>) -> Json<FederationReport> {
+    Json(FederationReport {
+        federated: state.federation.is_some(),
+        status: state.federation.as_ref().map(|f| f.status()),
+    })
+}
+
+async fn federation_job_owner(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Json<JobOwnerReport> {
+    let Some(fed) = state.federation.as_ref() else {
+        return Json(JobOwnerReport {
+            job_id,
+            federated: false,
+            owner: None,
+            mine: true,
+            url: None,
+        });
+    };
+    let owner = fed.owner_of(&job_id);
+    let mine = owner == fed.coordinator_id();
+    let url = fed.peer_url(&owner);
+    Json(JobOwnerReport {
+        job_id,
+        federated: true,
+        owner: Some(owner),
+        mine,
+        url,
+    })
 }
 
 async fn report_result(
@@ -2455,6 +2896,11 @@ fn draw_randomness() -> u64 {
 
 fn load_reputation(state: &AppState, node_id: &str) -> Result<Reputation, ApiError> {
     let conn = state.db.get().map_err(ApiError::internal)?;
+    reputation_row(&conn, node_id)
+}
+
+/// A node's standing, read from a connection the caller already holds.
+fn reputation_row(conn: &Connection, node_id: &str) -> Result<Reputation, ApiError> {
     let row = conn
         .query_row(
             "SELECT accepted,rejected,streak FROM reputation WHERE node_id=?1",
@@ -2538,6 +2984,7 @@ mod ai_api_tests {
         let state = AppState {
             db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
+            federation: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2791,6 +3238,7 @@ mod ai_api_tests {
         let state = AppState {
             db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
+            federation: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3028,6 +3476,7 @@ mod ai_api_tests {
         let state = AppState {
             db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
+            federation: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3225,6 +3674,7 @@ mod ai_api_tests {
         let state = AppState {
             db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
+            federation: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3441,6 +3891,7 @@ mod ai_api_tests {
         let state = AppState {
             db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
+            federation: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3580,6 +4031,7 @@ mod ai_api_tests {
         let state = AppState {
             db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
             ledger: None,
+            federation: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3649,6 +4101,7 @@ mod ai_api_tests {
                 crate::db::Pool::open(root.join("coordinator.db").to_str().unwrap()).unwrap(),
             ),
             ledger: None,
+            federation: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

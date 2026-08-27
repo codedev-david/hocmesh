@@ -3487,3 +3487,403 @@ async fn a_lying_coordinator_cannot_take_more_than_the_work_was_worth() -> Resul
     drop(validators);
     Ok(())
 }
+
+/// Two coordinators over one job store, and one of them dies.
+///
+/// The thing under test is that nothing has to be elected, transferred, or
+/// agreed for the survivor to pick up the dead peer's work. Ownership is a
+/// pure function of the job id and the set of coordinators currently
+/// answering, so the moment `b` stops answering `a`'s probes, `a`'s answer to
+/// "who owns this job" changes on its own -- and the shards `a` was refusing
+/// to hand out become shards it offers.
+///
+/// The split is checked against a live `b` first, from both sides, because a
+/// failover test that never establishes the pre-failure state proves only that
+/// one coordinator will serve everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_federated_coordinator_takes_over_the_jobs_of_a_peer_that_stops_answering() -> Result<()>
+{
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let coordinator_bin = bin_dir.join(exe("hocmesh-coordinator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = test_client();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let (validators_path, validator_homes, validator_dbs, _set) =
+        create_validator_set(&tmp, &validator_bin, &validator_ports)?;
+
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    // One database, two coordinators. This is what federation is for: the job
+    // store is shared, so without an owner rule both would hand out the same
+    // shard to different workers and pay for it twice.
+    let db = tmp.path.join("federated.db");
+    let port_a = free_port()?;
+    let port_b = free_port()?;
+    let url_a = format!("http://127.0.0.1:{port_a}");
+    let url_b = format!("http://127.0.0.1:{port_b}");
+
+    let config_a = federation_config(&tmp.path, "a", "eu", &url_a, &[("b", "us", &url_b)])?;
+    let config_b = federation_config(&tmp.path, "b", "us", &url_b, &[("a", "eu", &url_a)])?;
+
+    let coordinator_a = start_coordinator(
+        &coordinator_bin,
+        &db,
+        &validators_path,
+        Some(&config_a),
+        port_a,
+        &http,
+    )
+    .await?;
+    let mut coordinator_b = start_coordinator(
+        &coordinator_bin,
+        &db,
+        &validators_path,
+        Some(&config_b),
+        port_b,
+        &http,
+    )
+    .await?;
+
+    // Each has to actually see the other before any claim about the split
+    // means anything. Peers start down on purpose -- a coordinator that has
+    // not yet reached a peer must not assume it is there.
+    wait_for_live(&http, &url_a, &["a", "b"]).await?;
+    wait_for_live(&http, &url_b, &["a", "b"]).await?;
+
+    // Find one job id each coordinator owns. Ownership is a hash, so this is a
+    // lookup rather than a guess, and it is asked of both coordinators to show
+    // they agree without having talked about it.
+    let mut owned_by_a = None;
+    let mut owned_by_b = None;
+    for index in 0..64 {
+        let job_id = format!("fed-job-{index}");
+        let from_a = job_owner(&http, &url_a, &job_id).await?;
+        let from_b = job_owner(&http, &url_b, &job_id).await?;
+        assert_eq!(
+            from_a, from_b,
+            "both coordinators must name the same owner for {job_id} without an election"
+        );
+        match from_a.as_str() {
+            "a" if owned_by_a.is_none() => owned_by_a = Some(job_id),
+            "b" if owned_by_b.is_none() => owned_by_b = Some(job_id),
+            _ => {}
+        }
+        if owned_by_a.is_some() && owned_by_b.is_some() {
+            break;
+        }
+    }
+    let job_a = owned_by_a.context("no job id hashed to coordinator a in 64 tries")?;
+    let job_b = owned_by_b.context("no job id hashed to coordinator b in 64 tries")?;
+
+    // Community-funded work, so a worker can be paid without a requester
+    // having earned first. Both jobs are seeded into the one shared database.
+    for job_id in [&job_a, &job_b] {
+        let sponsors = sponsors_file(
+            &tmp.path,
+            &node_bin,
+            &validator_homes,
+            &validators_path,
+            job_id,
+            (2, 200000, 4),
+        )?;
+        run_ok(
+            Command::new(&coordinator_bin)
+                .arg("seed")
+                .arg("--job-id")
+                .arg(job_id)
+                .arg("--sponsors")
+                .arg(&sponsors)
+                .arg("--db")
+                .arg(&db)
+                .arg("--validators")
+                .arg(&validators_path)
+                .arg("--start")
+                .arg("2")
+                .arg("--end")
+                .arg("200000")
+                .arg("--shards")
+                .arg("4"),
+            "seed federated community work",
+        )?;
+    }
+
+    let worker = TestNode::new(&tmp.path.join("federation-worker"))?;
+    register(&http, &url_a, &worker).await?;
+
+    // While `b` is alive, `a` will not hand out `b`'s shards no matter how
+    // many times it is asked -- even though both jobs are sitting in the
+    // database it is reading.
+    for _ in 0..4 {
+        let offered = poll(&http, &url_a, &worker).await?;
+        let assignment = offered
+            .assignment
+            .context("coordinator a should still be serving its own job")?;
+        assert_eq!(
+            assignment.job_id, job_a,
+            "coordinator a must not hand out a job that hashes to b"
+        );
+    }
+    // And the same holds in the other direction.
+    let from_b = poll(&http, &url_b, &worker).await?;
+    let assignment_b = from_b
+        .assignment
+        .context("coordinator b should be serving its own job")?;
+    assert_eq!(
+        assignment_b.job_id, job_b,
+        "coordinator b must not hand out a job that hashes to a"
+    );
+
+    // The peer dies. Nothing tells `a` about it; `a` has to notice.
+    coordinator_b.kill();
+    wait_for_live(&http, &url_a, &["a"]).await?;
+    let status = federation_status(&http, &url_a).await?;
+    let peer_b = status
+        .peers
+        .iter()
+        .find(|p| p.coordinator_id == "b")
+        .context("coordinator a should still list b")?;
+    assert!(!peer_b.up, "b should be marked down after the misses");
+    assert!(
+        peer_b.consecutive_misses >= 2,
+        "b should be down because probes failed, not for some other reason"
+    );
+
+    // Ownership moved on its own: the same job id now answers `a`.
+    assert_eq!(
+        job_owner(&http, &url_a, &job_b).await?,
+        "a",
+        "the surviving coordinator should own the dead peer's jobs"
+    );
+
+    // And the takeover is real work, not a status flag: `a` now offers the
+    // job it was refusing, and the shard settles and pays.
+    let before = balance(&http, &url_a, &worker).await?.balance_mcu;
+    let taken_over = poll_until_assignment(&http, &url_a, &worker, Some(&job_b))
+        .await
+        .context("coordinator a should offer the dead peer's shards")?;
+    assert_eq!(taken_over.job_id, job_b);
+    complete_assignment(&http, &url_a, &worker, &taken_over).await?;
+    let after = balance(&http, &url_a, &worker).await?.balance_mcu;
+    assert!(
+        after > before,
+        "the taken-over shard should have been settled and paid ({before} -> {after})"
+    );
+
+    drop(coordinator_a);
+    for mut validator in validators {
+        validator.kill();
+    }
+    Ok(())
+}
+
+/// The topology view describes the machines the scheduler is choosing from.
+///
+/// It is read-only and moves no CU, so the only thing worth asserting is that
+/// it tells the truth: every registered machine appears, a machine that never
+/// placed itself is reported as unplaced rather than as nearby, and a cluster
+/// request that cannot be satisfied says so instead of returning a short set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_topology_view_reports_who_is_available_and_how_far_apart_they_are() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let coordinator_bin = bin_dir.join(exe("hocmesh-coordinator"));
+
+    let tmp = TestDir::new()?;
+    let http = test_client();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let (validators_path, validator_homes, validator_dbs, _set) =
+        create_validator_set(&tmp, &validator_bin, &validator_ports)?;
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    let db = tmp.path.join("topology.db");
+    let port = free_port()?;
+    let url = format!("http://127.0.0.1:{port}");
+    let coordinator =
+        start_coordinator(&coordinator_bin, &db, &validators_path, None, port, &http).await?;
+
+    let first = TestNode::new(&tmp.path.join("topology-a"))?;
+    let second = TestNode::new(&tmp.path.join("topology-b"))?;
+    register(&http, &url, &first).await?;
+    register(&http, &url, &second).await?;
+
+    let view: serde_json::Value = get_json(&http, &url, "/v1/topology").await?;
+    assert_eq!(view["online"].as_u64(), Some(2));
+    let nodes = view["nodes"].as_array().context("nodes array")?;
+    assert_eq!(nodes.len(), 2);
+    for node in nodes {
+        assert_eq!(
+            node["located"].as_bool(),
+            Some(false),
+            "a node that has not placed itself must not be reported as located"
+        );
+        assert!(node["shared_memory_bytes"].as_u64().unwrap_or(0) > 0);
+    }
+
+    let pair: serde_json::Value = get_json(&http, &url, "/v1/topology?cluster=2").await?;
+    let cluster = pair["cluster"].as_object().context("a pair should form")?;
+    assert_eq!(
+        cluster["node_ids"].as_array().map(Vec::len),
+        Some(2),
+        "a cluster of two should hold exactly two machines"
+    );
+    assert_eq!(
+        cluster["worst_edge_micros"].as_u64(),
+        pair["unknown_edge_micros"].as_u64(),
+        "two unplaced machines are at the placeholder distance, not at zero"
+    );
+
+    let impossible: serde_json::Value = get_json(&http, &url, "/v1/topology?cluster=5").await?;
+    assert!(impossible["cluster"].is_null());
+    assert!(
+        impossible["cluster_unavailable"].is_string(),
+        "an unsatisfiable request should say why rather than return a short set"
+    );
+
+    drop(coordinator);
+    for mut validator in validators {
+        validator.kill();
+    }
+    Ok(())
+}
+
+/// Write a `--federation` file.
+fn federation_config(
+    dir: &Path,
+    coordinator_id: &str,
+    region: &str,
+    advertise: &str,
+    peers: &[(&str, &str, &str)],
+) -> Result<PathBuf> {
+    let path = dir.join(format!("federation-{coordinator_id}.json"));
+    let peers: Vec<serde_json::Value> = peers
+        .iter()
+        .map(|(id, region, url)| json!({ "coordinator_id": id, "region": region, "url": url }))
+        .collect();
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "coordinator_id": coordinator_id,
+            "region": region,
+            "advertise": advertise,
+            "peers": peers,
+            // Short enough that the test does not sit through a production
+            // probe cycle, long enough that a loaded machine is not called
+            // dead for being slow.
+            "probe_interval_secs": 1,
+            "misses_before_down": 2,
+        }))?,
+    )?;
+    Ok(path)
+}
+
+async fn start_coordinator(
+    coordinator_bin: &Path,
+    db: &Path,
+    validators_path: &Path,
+    federation: Option<&Path>,
+    port: u16,
+    http: &Client,
+) -> Result<ProcessGuard> {
+    let mut command = Command::new(coordinator_bin);
+    command
+        .arg("serve")
+        .arg("--db")
+        .arg(db)
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--validators")
+        .arg(validators_path);
+    if let Some(federation) = federation {
+        command.arg("--federation").arg(federation);
+    }
+    let guard = ProcessGuard::spawn(&mut command)?;
+    wait_health(http, port).await?;
+    Ok(guard)
+}
+
+#[derive(serde::Deserialize)]
+struct TestPeerHealth {
+    coordinator_id: String,
+    up: bool,
+    consecutive_misses: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct TestFederationStatus {
+    live: Vec<String>,
+    peers: Vec<TestPeerHealth>,
+}
+
+async fn federation_status(http: &Client, url: &str) -> Result<TestFederationStatus> {
+    let report: serde_json::Value = get_json(http, url, "/v1/federation/status").await?;
+    let status = report
+        .get("status")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .context("coordinator reported no federation")?;
+    Ok(serde_json::from_value(status)?)
+}
+
+/// Wait until a coordinator's live set is exactly `expected`.
+///
+/// Bounded rather than unbounded: the probe interval is a second, so a set
+/// that has not converged in twenty is a failure and not slowness.
+async fn wait_for_live(http: &Client, url: &str, expected: &[&str]) -> Result<()> {
+    let expected: Vec<String> = expected.iter().map(|id| (*id).to_string()).collect();
+    let mut last = Vec::new();
+    for _ in 0..200 {
+        if let Ok(status) = federation_status(http, url).await {
+            if status.live == expected {
+                return Ok(());
+            }
+            last = status.live;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!(
+        "{url} never settled on live set {expected:?}, last saw {last:?}"
+    ))
+}
+
+async fn job_owner(http: &Client, url: &str, job_id: &str) -> Result<String> {
+    let report: serde_json::Value =
+        get_json(http, url, &format!("/v1/federation/jobs/{job_id}")).await?;
+    report
+        .get("owner")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .context("federation job report carried no owner")
+}

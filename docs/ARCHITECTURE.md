@@ -69,6 +69,24 @@ irreplaceable: `hocmesh-coordinator rebuild` reconstructs the whole table set
 from the chain, so a destroyed coordinator costs availability, not work and
 not CU. See `docs/CRASH_RECOVERY.md`.
 
+## Coordinator federation
+
+Several coordinators can serve one job store. Which of them hands out a given
+job's shards is a rendezvous hash of the job id over the coordinators currently
+answering their probes -- so nothing is elected, nothing is locked, and nothing
+is handed over. A peer that stops answering leaves the live set after a bounded
+number of missed probes, and its jobs become the survivors' to offer without
+anyone being told.
+
+The asymmetry that makes this safe is that a wrong split costs duplicated
+effort and never duplicated CU: assignment ids are derived from the job rather
+than remembered, so two coordinators that briefly disagree produce the *same*
+assignment id, and the ledger's claim key refuses the second reward.
+
+Scheduling is separate from federation and equally unprivileged: a score
+decides which shard a worker is offered and nothing else. See
+`docs/FEDERATION.md`.
+
 ## Validator responsibilities
 
 Validators own replicated accounting state:

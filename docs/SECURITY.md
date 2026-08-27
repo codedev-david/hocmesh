@@ -44,7 +44,9 @@ In quorum-ledger mode, compromising only the coordinator does not allow silent C
 
 Validators independently verify ledger transactions and keep separate replicas.
 
-A compromised coordinator can still attack availability and scheduling quality. Scheduler federation and signed scheduler assignments are future hardening work.
+A compromised coordinator can still attack availability and scheduling quality, and federation narrows only the first of those. Several coordinators can serve one job store, splitting ownership by a hash of the job id over the set that is currently answering, so losing one costs the jobs it owned for as long as it takes the others to notice rather than costing the whole mesh. A coordinator that is compromised rather than dead still answers its probes, and still owns its share.
+
+Scheduling quality is deliberately not defended, because it does not need to be. A score decides which shard a worker is offered and nothing else. A coordinator that scores maliciously wastes effort -- it hands the wrong shard to the wrong machine, or starves a job it dislikes -- and cannot overpay, underpay, or pay twice, because every payment is settled by the quorum against evidence the worker signed under a claim key derived from the job. Signed scheduler assignments remain future work; they would make bad scheduling attributable, not make it profitable.
 
 Losing one, however, is survivable. Because the coordinator is a cache over facts the ledger already holds, `hocmesh-coordinator rebuild` replays certified entries into an empty database and stands a replacement up. Shard ids are derived from the job id rather than remembered, so the replacement reconstructs exactly the ids the dead coordinator issued, and the `reward:<assignment>` claim key means a rebuild that got its bookkeeping wrong would have the duplicate reward refused by the validators. The worst a bad rebuild costs is repeated compute. See `docs/CRASH_RECOVERY.md`.
 

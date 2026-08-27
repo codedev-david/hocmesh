@@ -45,20 +45,97 @@ pub async fn rebuild_from_ledger(
         .head_quorum()
         .await
         .context("asking the validator quorum for the head")?;
-    let mut set: ValidatorSet = net.set();
+    let (mut report, next, set) = replay(conn, net, batch, 1, net.set(), head.sequence).await?;
+    finalize_jobs(conn)?;
+    record_watermark(conn, next, &set)?;
+    report.open_shards = count(
+        conn,
+        "SELECT COUNT(*) FROM assignments WHERE status='pending'",
+    )?;
+    Ok(report)
+}
+
+/// Where this replica has read the chain up to, and the set that signed it.
+const WATERMARK_KEY: &str = "ledger_watermark_sequence";
+const WATERMARK_SET_KEY: &str = "ledger_watermark_set";
+
+/// Catch up with whatever has settled since the last pass.
+///
+/// This is what makes job state shared rather than merely shareable. A
+/// coordinator only ever saw the jobs submitted to it; a federated one has to
+/// know about the rest, and the honest place to read them from is the chain,
+/// not a peer -- a peer would be an unverified second source for facts the
+/// ledger already holds under signature.
+///
+/// Resuming is what makes it affordable to run on a timer. A full rebuild
+/// re-reads and re-verifies the whole chain, which is right when standing a
+/// replacement up and wrong every ten seconds. The watermark carries the
+/// validator set as it stood at that point, so entries are still verified
+/// against the set that actually signed them.
+pub async fn sync_from_ledger(
+    conn: &mut Connection,
+    net: &LedgerNetwork,
+    batch: u64,
+) -> Result<RebuildReport> {
+    let Some((from, watermark_set)) = read_watermark(conn)? else {
+        // Nothing read yet, so there is no shortcut to take.
+        return rebuild_from_ledger(conn, net, batch).await;
+    };
+    net.refresh_set().await.ok();
+    let head = net
+        .head_quorum()
+        .await
+        .context("asking the validator quorum for the head")?;
+    let (mut report, next, set) =
+        replay(conn, net, batch, from, watermark_set, head.sequence).await?;
+    finalize_jobs(conn)?;
+    record_watermark(conn, next, &set)?;
+    report.open_shards = count(
+        conn,
+        "SELECT COUNT(*) FROM assignments WHERE status='pending'",
+    )?;
+    Ok(report)
+}
+
+fn read_watermark(conn: &Connection) -> Result<Option<(u64, ValidatorSet)>> {
+    let (Some(sequence), Some(set)) = (
+        crate::db::coordinator_state(conn, WATERMARK_KEY)?,
+        crate::db::coordinator_state(conn, WATERMARK_SET_KEY)?,
+    ) else {
+        return Ok(None);
+    };
+    let sequence: u64 = sequence
+        .parse()
+        .context("ledger watermark is not a sequence number")?;
+    let set: ValidatorSet =
+        serde_json::from_str(&set).context("ledger watermark carries no readable validator set")?;
+    Ok(Some((sequence.max(1), set)))
+}
+
+fn record_watermark(conn: &Connection, next: u64, set: &ValidatorSet) -> Result<()> {
+    crate::db::set_coordinator_state(conn, WATERMARK_KEY, &next.to_string())?;
+    crate::db::set_coordinator_state(conn, WATERMARK_SET_KEY, &serde_json::to_string(set)?)
+}
+
+/// Apply entries `next..=head_sequence`, returning where to resume and the set
+/// as it stood there.
+async fn replay(
+    conn: &mut Connection,
+    net: &LedgerNetwork,
+    batch: u64,
+    mut next: u64,
+    mut set: ValidatorSet,
+    head_sequence: u64,
+) -> Result<(RebuildReport, u64, ValidatorSet)> {
     let mut report = RebuildReport::default();
-    let mut next = 1u64;
     let batch = batch.max(1);
-    while next <= head.sequence {
+    while next <= head_sequence {
         let certs = net
             .fetch_certificates(next, batch, &set)
             .await
             .with_context(|| format!("fetching ledger entries from {next}"))?;
         if certs.is_empty() {
-            anyhow::bail!(
-                "validators report head {} but returned nothing at {next}",
-                head.sequence
-            );
+            anyhow::bail!("validators report head {head_sequence} but returned nothing at {next}");
         }
         for cert in certs {
             if cert.entry.sequence != next {
@@ -92,12 +169,7 @@ pub async fn rebuild_from_ledger(
             next = cert.entry.sequence + 1;
         }
     }
-    finalize_jobs(conn)?;
-    report.open_shards = count(
-        conn,
-        "SELECT COUNT(*) FROM assignments WHERE status='pending'",
-    )?;
-    Ok(report)
+    Ok((report, next, set))
 }
 
 fn count(conn: &Connection, sql: &str) -> Result<u64> {

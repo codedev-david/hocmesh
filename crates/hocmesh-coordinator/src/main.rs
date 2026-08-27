@@ -1,7 +1,9 @@
 mod api;
 mod db;
 mod error;
+mod federation;
 mod rebuild;
+mod schedule;
 
 use anyhow::{Context, Result, bail};
 use api::AppState;
@@ -10,8 +12,9 @@ use hocmesh_core::compute::{split_work, work_cost_mcu};
 use hocmesh_ledger::{
     network::LedgerNetwork,
     types::{
-        COMMUNITY_ISSUANCE_ACCOUNT, LedgerTransaction, Posting, TransactionEvidence,
-        TransactionKind, ValidatorSet, ValidatorSignature, escrow_account,
+        COMMUNITY_ISSUANCE_ACCOUNT, InferenceExpiryEvidence, LedgerTransaction, Posting,
+        TransactionEvidence, TransactionKind, ValidatorSet, ValidatorSignature, escrow_account,
+        inference_holding_account,
     },
     validate::claim_key,
 };
@@ -40,6 +43,10 @@ enum Command {
         db: String,
         #[arg(long)]
         validators: Option<String>,
+        /// Path to a federation config, when this is one coordinator of
+        /// several over the same ledger.
+        #[arg(long)]
+        federation: Option<String>,
     },
     Seed {
         #[arg(long, default_value = "hocmesh.db")]
@@ -96,7 +103,8 @@ async fn main() -> Result<()> {
             listen,
             db,
             validators,
-        } => serve(&listen, &db, validators.as_deref()).await,
+            federation,
+        } => serve(&listen, &db, validators.as_deref(), federation.as_deref()).await,
         Command::Seed {
             db,
             start,
@@ -228,9 +236,18 @@ async fn seed(
     Ok(())
 }
 
-async fn serve(listen: &str, db_path: &str, validators: Option<&str>) -> Result<()> {
+async fn serve(
+    listen: &str,
+    db_path: &str,
+    validators: Option<&str>,
+    federation_path: Option<&str>,
+) -> Result<()> {
     let ledger = match validators {
         Some(p) => Some(load_network(p)?),
+        None => None,
+    };
+    let federation = match federation_path {
+        Some(p) => Some(federation::Federation::load(p)?),
         None => None,
     };
     // A first pass before the door opens, so an operator sees what the previous
@@ -265,6 +282,102 @@ async fn serve(listen: &str, db_path: &str, validators: Option<&str>) -> Result<
             }
         });
     }
+    // Two more loops when the deployment is federated. Neither one moves CU or
+    // decides anything a peer could dispute: the first watches whether peers
+    // answer, the second reads the chain that already holds the shared job
+    // state. A coordinator that is wrong about either wastes effort; it cannot
+    // pay twice, because the ledger's claim key rejects the second settlement
+    // of a shard whichever coordinator sent it.
+    if let Some(fed) = federation.clone() {
+        let probe_db = db_path.to_string();
+        tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default();
+            let mut interval = tokio::time::interval(fed.probe_interval());
+            loop {
+                interval.tick().await;
+                for (peer, transition) in fed.probe_all(&client, now_unix()).await {
+                    match transition {
+                        federation::Transition::WentDown => {
+                            tracing::warn!(peer=%peer, "federation peer stopped answering");
+                            // Ownership of that peer's jobs has just moved
+                            // here. Its outstanding leases are shortened, not
+                            // cancelled: a worker mid-shard is not at fault for
+                            // a coordinator-to-coordinator link failing, so it
+                            // keeps a grace window to report in before the
+                            // shard is offered to anyone else.
+                            match shorten_peer_leases(&probe_db, &peer) {
+                                Ok(0) => {}
+                                Ok(n) => tracing::info!(
+                                    peer=%peer,
+                                    leases=n,
+                                    "shortened leases held by the unreachable peer"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    peer=%peer, error=%e,
+                                    "could not shorten leases for the unreachable peer"
+                                ),
+                            }
+                        }
+                        federation::Transition::CameUp => {
+                            tracing::info!(peer=%peer, "federation peer is answering again")
+                        }
+                    }
+                }
+            }
+        });
+    }
+    if let (Some(net), Some(_)) = (ledger.clone(), federation.as_ref()) {
+        let sync_db = db_path.to_string();
+        // The replay holds a SQLite connection open across the network calls
+        // that fetch each batch of certificates, so its future is not `Send`
+        // and cannot be handed to the shared runtime. One thread with its own
+        // single-threaded runtime says that plainly instead of contorting the
+        // replay to hide it.
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error=%e, "ledger sync thread could not start a runtime");
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let pool = match db::Pool::open(&sync_db) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error=%e, "ledger sync could not open the database");
+                        return;
+                    }
+                };
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
+                loop {
+                    interval.tick().await;
+                    let mut conn = match pool.get() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(error=%e, "ledger sync could not take a connection");
+                            continue;
+                        }
+                    };
+                    match rebuild::sync_from_ledger(&mut conn, &net, 256).await {
+                        Ok(report) if report.entries > 0 => tracing::info!(
+                            entries = report.entries,
+                            jobs = report.jobs,
+                            "adopted federated job state from the ledger"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error=%e, "ledger sync pass failed"),
+                    }
+                }
+            });
+        });
+    }
     let pool = db::Pool::open(db_path)?;
     let mode = if ledger.is_some() {
         "quorum"
@@ -274,16 +387,41 @@ async fn serve(listen: &str, db_path: &str, validators: Option<&str>) -> Result<
     let state = AppState {
         db: Arc::new(pool),
         ledger,
+        federation,
     };
+    let state_coordinator = state
+        .federation
+        .as_ref()
+        .map(|f| f.coordinator_id().to_string());
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("binding coordinator to {listen}"))?;
-    tracing::info!(listen=%listen,db=%db_path,ledger_mode=mode,"hocMESH coordinator started");
+    tracing::info!(
+        listen=%listen,
+        db=%db_path,
+        ledger_mode=mode,
+        coordinator=state_coordinator.as_deref().unwrap_or("standalone"),
+        "hocMESH coordinator started"
+    );
     axum::serve(listener, app)
         .await
         .context("coordinator server failed")?;
     Ok(())
+}
+
+/// Cut short the leases an unreachable peer handed out.
+///
+/// Opens its own connection because it runs from the probe loop, which holds
+/// no pool. The deadline is a grace window rather than zero, so a worker that
+/// is still running the shard can report in and be paid before the shard is
+/// offered again.
+fn shorten_peer_leases(db_path: &str, peer: &str) -> Result<usize> {
+    /// How long a worker keeps a lease whose coordinator has gone away.
+    const GRACE_SECONDS: i64 = 60;
+    let pool = db::Pool::open(db_path)?;
+    let conn = pool.get()?;
+    db::shorten_leases_from(&conn, peer, now_unix() + GRACE_SECONDS)
 }
 
 /// What one reconciliation pass did.
@@ -302,14 +440,17 @@ struct ReconcileReport {
     /// Counted, never repaired: closing this gap locally would mean the
     /// coordinator deciding CU exists, which it has no standing to do.
     orphaned: usize,
+    /// Received batches whose requester never judged them, returned to the
+    /// commons now that their window has closed.
+    expired: usize,
 }
 
 impl std::fmt::Display for ReconcileReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "reconciled: {} settled, {} deferred, {} parked, {} orphaned",
-            self.recovered, self.deferred, self.abandoned, self.orphaned
+            "reconciled: {} settled, {} deferred, {} parked, {} orphaned, {} expired",
+            self.recovered, self.deferred, self.abandoned, self.orphaned, self.expired
         )
     }
 }
@@ -436,6 +577,7 @@ async fn recover_pending(db_path: &str, net: &LedgerNetwork) -> Result<Reconcile
             }
         }
     }
+    report.expired = sweep_expired_batches(&mut conn, net).await?;
     report.orphaned = db::orphaned_funding_objects(&conn)? as usize;
     if report.abandoned > 0 || report.orphaned > 0 {
         tracing::warn!(
@@ -445,6 +587,132 @@ async fn recover_pending(db_path: &str, net: &LedgerNetwork) -> Result<Reconcile
         );
     }
     Ok(report)
+}
+
+/// Return batches nobody ever judged to the commons.
+///
+/// A receipt is deliberately a one-way door: after it, the CU sits in a
+/// holding account that only an acceptance or a dispute can empty, and both
+/// need the requester's signature. That is what stops a requester reading an
+/// answer and then refunding itself - and it is also why a requester that
+/// simply stops answering freezes the provider's CU permanently.
+///
+/// This is the way out, and the reason it is safe is that it decides nothing.
+/// The coordinator proposes; every validator re-derives the requester's own
+/// receipt signature and measures the window against the timestamp inside it.
+/// A coordinator that swept early, or swept a batch that was never received,
+/// or pointed the CU anywhere but the commons, would simply be refused. The
+/// same pass run by anybody else produces the same transaction.
+async fn sweep_expired_batches(
+    conn: &mut rusqlite::Connection,
+    net: &LedgerNetwork,
+) -> Result<usize> {
+    let now = now_unix();
+    let candidates = {
+        let mut st = conn.prepare(
+            "SELECT a.assignment_id, a.job_id, a.report_json, a.outputs_digest,
+                    a.receipt_auth_json, n.public_key_b64
+             FROM ai_assignments a
+             JOIN ai_jobs j ON j.job_id = a.job_id
+             JOIN nodes n ON n.node_id = j.requester_node_id
+             WHERE a.receipted = 1 AND a.settled IS NULL
+               AND a.report_json IS NOT NULL AND a.receipt_auth_json IS NOT NULL",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row?)
+        }
+        v
+    };
+    let mut swept = 0usize;
+    for (assignment_id, job_id, report_json, outputs_digest, receipt_json, requester_pk) in
+        candidates
+    {
+        let report: hocmesh_ai::ReportInferenceRequest = match serde_json::from_str(&report_json) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(assignment=%assignment_id, error=%e, "unreadable batch report; not sweeping");
+                continue;
+            }
+        };
+        let receipt: hocmesh_protocol::AuthProof = match serde_json::from_str(&receipt_json) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(assignment=%assignment_id, error=%e, "unreadable receipt proof; not sweeping");
+                continue;
+            }
+        };
+        // The same arithmetic the validators will do. Checking it here saves a
+        // round trip per unripe batch on every pass, and there will be far
+        // more unripe batches than ripe ones.
+        if now < receipt.timestamp + hocmesh_protocol::SETTLEMENT_WINDOW_SECS {
+            continue;
+        }
+        let price = report.reward_mcu;
+        let tx = LedgerTransaction {
+            transaction_id: format!("expire_{assignment_id}"),
+            kind: TransactionKind::InferenceExpiry,
+            postings: vec![
+                Posting {
+                    account_id: inference_holding_account(&assignment_id),
+                    delta_mcu: -price,
+                },
+                Posting {
+                    account_id: COMMUNITY_ISSUANCE_ACCOUNT.to_string(),
+                    delta_mcu: price,
+                },
+            ],
+            evidence: TransactionEvidence::InferenceExpiry(InferenceExpiryEvidence {
+                job_id: job_id.clone(),
+                assignment_id: assignment_id.clone(),
+                batch_start: report.batch_start,
+                batch_end: report.batch_end,
+                price_mcu: price,
+                outputs_digest,
+                requester_public_key_b64: requester_pk,
+                requester_receipt: receipt,
+            }),
+            created_at: now,
+        };
+        // A batch already settled under this claim key by an acceptance or a
+        // dispute is not an error here: it is the requester having come back
+        // in the gap between the query and the proposal. Record what the chain
+        // says and move on.
+        let ck = claim_key(&tx);
+        let settled = match net.claim_quorum(&ck).await {
+            Ok(existing) if existing.entry_hash.is_some() => false,
+            Ok(_) => match net.transact(tx).await {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::debug!(assignment=%assignment_id, error=%e, "expiry sweep deferred to a later pass");
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::debug!(assignment=%assignment_id, error=%e, "expiry claim not confirmable yet");
+                continue;
+            }
+        };
+        conn.execute(
+            "UPDATE ai_assignments SET settled='expired' WHERE assignment_id=?1 AND settled IS NULL",
+            params![assignment_id],
+        )?;
+        if settled {
+            swept += 1;
+            tracing::info!(assignment=%assignment_id, job=%job_id, price_mcu=price, "batch abandoned by its requester returned to the commons");
+        }
+    }
+    Ok(swept)
 }
 
 fn finalize_reservation_db(

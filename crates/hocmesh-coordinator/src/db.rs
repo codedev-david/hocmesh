@@ -148,11 +148,17 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // the coordinator has to remember the provider's signed report until the
     // requester takes delivery and settles. Added by ALTER so an existing
     // coordinator database picks the columns up without being rebuilt.
+    // `receipt_auth_json` arrived with the expiry sweep. A batch whose
+    // requester takes delivery and then never judges it would otherwise strand
+    // its holding account forever, and the only thing that can authorise the
+    // commons to collect it is the receipt the requester signed on the way in.
+    // The coordinator has to keep that proof to be able to hand it back.
     for column in [
         "report_json TEXT",
         "outputs_digest TEXT",
         "receipted INTEGER NOT NULL DEFAULT 0",
         "settled TEXT",
+        "receipt_auth_json TEXT",
     ] {
         // Fails only when the column is already there, which is the steady state.
         let _ = conn.execute(
@@ -170,7 +176,69 @@ fn init_schema(conn: &Connection) -> Result<()> {
             [],
         );
     }
+    // Federation. `leased_by` names the coordinator that handed a shard out,
+    // which is what lets a survivor tell its own leases from those of a
+    // coordinator that has since died. `region` on a node is the region of the
+    // coordinator it registered with -- the only region anything knows about
+    // it -- and is what the scheduler's network axis compares against.
+    let _ = conn.execute("ALTER TABLE assignments ADD COLUMN leased_by TEXT", []);
+    let _ = conn.execute("ALTER TABLE nodes ADD COLUMN region TEXT", []);
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS coordinator_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_assignments_leased_by ON assignments(leased_by);
+        "#,
+    )?;
     Ok(())
+}
+
+/// Read one row of the coordinator's own working state.
+///
+/// Deliberately a key/value table and deliberately not on the ledger: what is
+/// kept here is how far this replica has read, which is a fact about this
+/// process and nobody else's business.
+pub fn coordinator_state(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM coordinator_state WHERE key=?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+pub fn set_coordinator_state(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO coordinator_state(key,value) VALUES(?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// Bring forward the expiry of every lease a departed coordinator granted.
+///
+/// Not a straight release. The worker on the other end may be perfectly
+/// healthy and halfway through the shard -- what failed might be the link
+/// between the coordinators rather than the coordinator itself -- and
+/// cancelling its lease outright would throw that work away and reject the
+/// result when it arrives. Shortening the lease instead means the adopting
+/// coordinator waits a grace period rather than the full fifteen minutes, and
+/// an in-flight worker still gets to finish. Leases already expiring sooner
+/// are left alone.
+pub fn shorten_leases_from(
+    conn: &Connection,
+    coordinator_id: &str,
+    deadline: i64,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE assignments SET lease_until=?2
+         WHERE status='leased' AND leased_by=?1 AND (lease_until IS NULL OR lease_until > ?2)",
+        params![coordinator_id, deadline],
+    )?)
 }
 
 pub fn persist_ledger_intent(
@@ -434,6 +502,96 @@ impl std::ops::DerefMut for PooledConnection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job with four leases, spread across two coordinators and two states.
+    fn lease_db() -> Connection {
+        let conn = open(":memory:").expect("in-memory coordinator database");
+        conn.execute(
+            "INSERT INTO jobs(job_id,system_funded,work_json,status,reserved_mcu,created_at) \
+             VALUES('job1',1,'{}','running',0,0)",
+            [],
+        )
+        .expect("seeding a job");
+        // (id, status, leased_by, lease_until)
+        let rows = [
+            ("a-long", "leased", Some("a"), Some(10_000i64)),
+            ("a-short", "leased", Some("a"), Some(50i64)),
+            ("a-done", "completed", Some("a"), Some(10_000i64)),
+            ("b-long", "leased", Some("b"), Some(10_000i64)),
+            ("orphan", "leased", None, Some(10_000i64)),
+        ];
+        for (index, (id, status, by, until)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO assignments(assignment_id,job_id,shard_index,work_json,status,lease_until,leased_by,reward_mcu) \
+                 VALUES(?1,'job1',?2,'{}',?3,?4,?5,1)",
+                params![id, index as i64, status, until, by],
+            )
+            .expect("seeding an assignment");
+        }
+        conn
+    }
+
+    fn lease_until(conn: &Connection, id: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT lease_until FROM assignments WHERE assignment_id=?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .expect("reading a lease")
+    }
+
+    /// Cutting a dead coordinator's leases short must not touch anyone else's.
+    ///
+    /// This runs when a peer stops answering, which is exactly when the mesh
+    /// is least sure what is going on -- so it has to be surgical. Reclaiming
+    /// a live coordinator's leases here would turn one coordinator's outage
+    /// into everybody's.
+    #[test]
+    fn shortening_a_dead_peers_leases_leaves_every_other_lease_alone() {
+        let conn = lease_db();
+        assert_eq!(shorten_leases_from(&conn, "a", 100).unwrap(), 1);
+        assert_eq!(lease_until(&conn, "a-long"), Some(100));
+        // Already inside the deadline, so there was nothing to cut.
+        assert_eq!(lease_until(&conn, "a-short"), Some(50));
+        // A finished shard is not a lease, whoever handed it out.
+        assert_eq!(lease_until(&conn, "a-done"), Some(10_000));
+        // The live coordinator keeps its work.
+        assert_eq!(lease_until(&conn, "b-long"), Some(10_000));
+        // So does a lease from before the column existed.
+        assert_eq!(lease_until(&conn, "orphan"), Some(10_000));
+    }
+
+    /// The deadline is a floor, never an extension.
+    ///
+    /// A second pass over the same peer -- the probe loop is a loop -- must not
+    /// hand a worker back time that the first pass took away.
+    #[test]
+    fn shortening_never_lengthens_a_lease() {
+        let conn = lease_db();
+        shorten_leases_from(&conn, "a", 100).unwrap();
+        assert_eq!(shorten_leases_from(&conn, "a", 9_000).unwrap(), 0);
+        assert_eq!(lease_until(&conn, "a-long"), Some(100));
+    }
+
+    /// The watermark has to survive a restart and has to move forward, because
+    /// a coordinator that forgets it replays the chain from genesis and one
+    /// that cannot overwrite it never advances past its first pass.
+    #[test]
+    fn coordinator_state_round_trips_and_overwrites() {
+        let conn = open(":memory:").expect("in-memory coordinator database");
+        assert_eq!(coordinator_state(&conn, "watermark").unwrap(), None);
+        set_coordinator_state(&conn, "watermark", "17").unwrap();
+        assert_eq!(
+            coordinator_state(&conn, "watermark").unwrap().as_deref(),
+            Some("17")
+        );
+        set_coordinator_state(&conn, "watermark", "42").unwrap();
+        assert_eq!(
+            coordinator_state(&conn, "watermark").unwrap().as_deref(),
+            Some("42")
+        );
+        assert_eq!(coordinator_state(&conn, "other").unwrap(), None);
+    }
 
     /// A pending intent with nothing else in the database around it.
     fn intent_db(claim: &str) -> Connection {
