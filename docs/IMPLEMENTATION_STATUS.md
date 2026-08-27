@@ -19,6 +19,7 @@
 | Validator set membership | Implemented | On-ledger join/leave carrying threshold vouches from sitting members; clients follow the chain forward with `refresh_set` |
 | Key custody | Implemented | Signing key sealed with XChaCha20-Poly1305 under an Argon2id key from `HOCMESH_IDENTITY_PASSPHRASE` |
 | Behaviour under network faults | Partially implemented | Integration tests drive the quorum through a fault-injecting relay: WAN-scale latency, minority partition (settlement continues, laggard repaired by `validator sync`), majority partition (settlement refuses, stranded shard pays once on heal), and clock skew either side of the 300s window. Still one machine over loopback: no multi-host run, NAT traversal, packet loss or reordering |
+| Adversarial and property coverage | Partially implemented | `hocmesh-ledger` property tests: no single edit to a settled reward survives validation (10 mutations across postings, evidence, and signature), the community issuance ceiling is never crossed, a replayed chain is deterministic and idempotent and sums to zero. Byzantine cases covered: an equivocating quorum cannot fill a height twice, a quorum of strangers settles nothing. Not covered: equivocation combined with partition, and any run on more than one machine |
 
 ## hocMESH AI
 

@@ -835,6 +835,35 @@ link, or a bandwidth cap, and no test spans two operating systems. Treat the
 suite as evidence that the protocol survives delay and partition, not as
 evidence that a multi-host deployment works.
 
+
+## What the ledger tests assume an adversary will try
+
+The network tests break the wire. These break the evidence.
+
+- **Every single edit to a settled reward.** Take a reward the chain would
+  accept and change exactly one thing - double a posting, negate one, drop
+  one, redirect the credit to another account, inflate the claimed reward,
+  renumber the shard, flip who pays, forge the worker's signature, swap the
+  work, relabel the kind - and the chain has to refuse it. Four hundred
+  randomised rounds, each one first proving the unedited reward is accepted.
+- **The issuance ceiling.** However the community budget is drawn on, it can
+  never be drawn past the bound the sitting set agreed to. That bound is the
+  whole of "no purchased CU": free work exists, but only up to here.
+- **Replay.** A chain fed to two databases leaves them byte-identical; fed to
+  the same database twice, every certificate is refused the second time; and
+  across every account the balances sum to exactly zero.
+- **Equivocation.** The same seats signing two different entries at one height
+  get at most one of them onto the chain. Both certificates verify on their
+  own - a signature is a claim about one entry - but the branch that loses the
+  height funds nothing.
+- **A quorum of strangers.** A full threshold of correct signatures from
+  validators outside the sitting set settles nothing. Membership, not signature
+  count, is what makes a certificate binding.
+
+What this is not: a validator that equivocates *while* its peers are
+partitioned, or a coordinator that lies about scheduling rather than about
+payment, is still untested. So is any of it on more than one machine.
+
 ---
 
 # Current workloads
@@ -914,6 +943,7 @@ This repository intentionally documents the remaining work instead of disguising
 10. P2P model seeding uses authenticated HTTP peers; NAT traversal and peer discovery remain deployment concerns.
 11. Coordinator crash recovery is implemented through durable ledger intents and `hocmesh-coordinator recover`, and a coordinator whose database is lost entirely can be rebuilt from the chain with `hocmesh-coordinator rebuild`. Both are operator-initiated: automatic failover between competing coordinators, and a full multi-coordinator BFT view-change protocol, remain production blockers.
 12. The network has been broken deliberately but never crossed. `cargo test -p hocmesh-integration-tests --test quorum_flow` now runs the quorum behind a fault-injecting TCP relay: WAN-scale latency on every link, a minority partition (settlement continues, the isolated validator falls behind and is repaired with `hocmesh-validator sync`), a majority partition (settlement refuses rather than fakes, and the stranded shard pays exactly once when the link heals), and authentication under clock skew on both sides of the tolerated window. Every process in those tests still runs on one machine over loopback. Multi-host deployment, NAT traversal, packet loss and reordering, and bandwidth limits are untested.
+13. Adversarial coverage stops at one lie at a time. The ledger crate now proves that no single edit to a settled reward survives validation, that the issuance ceiling holds under any sequence of mints, that a replayed chain is deterministic and idempotent and sums to zero, that an equivocating quorum cannot fill a height twice, and that a quorum of strangers settles nothing. What no test covers is faults in combination - equivocation while the honest peers are partitioned - or a coordinator that lies about scheduling rather than about payment.
 
 These are specifically called out in `CODEX_HANDOFF.md` as next engineering targets.
 

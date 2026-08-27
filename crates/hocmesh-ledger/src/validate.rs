@@ -3622,4 +3622,365 @@ mod tests {
         let receipt = signed_receipt(&requester, "job1", &assignment, 0, 2, 1_000, &digest);
         assert_eq!(claim_key(&receipt), "escrow:job1:0:2");
     }
+
+    /// A deterministic stream, so a failing case can be reproduced from its
+    /// seed instead of from luck.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn reward_evidence(tx: &mut LedgerTransaction) -> &mut ProviderRewardEvidence {
+        match &mut tx.evidence {
+            TransactionEvidence::ProviderReward(e) => e,
+            _ => panic!("signed_reward should have produced provider-reward evidence"),
+        }
+    }
+
+    /// One edit to a settled reward. Every variant changes something the
+    /// signature, the arithmetic, or the recomputation is meant to cover, so
+    /// every one of them has to be refused.
+    fn mutate(tx: &mut LedgerTransaction, choice: u64) -> &'static str {
+        match choice {
+            0 => {
+                tx.postings[0].delta_mcu *= 2;
+                "doubled the debit"
+            }
+            1 => {
+                tx.postings[1].delta_mcu = -tx.postings[1].delta_mcu;
+                "negated the credit"
+            }
+            2 => {
+                tx.postings.pop();
+                "dropped a posting"
+            }
+            3 => {
+                tx.postings[1].account_id = "node_somebody_else".into();
+                "redirected the credit"
+            }
+            4 => {
+                reward_evidence(tx).reward_mcu += 1;
+                "inflated the claimed reward"
+            }
+            5 => {
+                reward_evidence(tx).shard_index += 1;
+                "renumbered the shard"
+            }
+            6 => {
+                let e = reward_evidence(tx);
+                e.system_funded = !e.system_funded;
+                "flipped who pays"
+            }
+            7 => {
+                let sig = &mut reward_evidence(tx).provider_auth.signature_b64;
+                let swap = if sig.starts_with('A') { "B" } else { "A" };
+                sig.replace_range(0..1, swap);
+                "forged the provider signature"
+            }
+            8 => {
+                reward_evidence(tx).work = WorkSpec::PrimeCount { start: 2, end: 97 };
+                "swapped the work"
+            }
+            _ => {
+                tx.kind = TransactionKind::JobRefund;
+                "relabelled the transaction kind"
+            }
+        }
+    }
+
+    const MUTATIONS: u64 = 10;
+
+    /// Property: a settlement is worth exactly what its evidence proves. Take
+    /// a reward the chain would accept, change one thing about it, and the
+    /// chain has to refuse it — whichever thing was changed.
+    #[test]
+    fn no_single_edit_to_a_settled_reward_survives_validation() {
+        let provider = test_identity("provider-mutation");
+        let mut rng = Rng(0x5eed_1234_9abc_def1);
+        for round in 0..400u64 {
+            let seed = rng.next();
+            let shard = (seed % 7) as u32;
+            let work = WorkSpec::PrimeCount {
+                start: 2,
+                end: 20 + (seed >> 8) % 60,
+            };
+            let job = format!("job-mutation-{round}");
+            let honest = signed_reward(&job, shard, &provider, &work, true);
+            // Without this the loop could be "passing" on transactions that
+            // were never valid to begin with.
+            validate_transaction(&honest, TEST_PREVIOUS_HASH, |_| Ok(10_000), 1_000_000)
+                .unwrap_or_else(|e| panic!("seed {seed:#x}: honest reward rejected: {e}"));
+            let mut tampered = honest.clone();
+            let what = mutate(&mut tampered, rng.below(MUTATIONS));
+            assert_ne!(
+                transaction_hash(&tampered).unwrap(),
+                transaction_hash(&honest).unwrap(),
+                "seed {seed:#x}: {what} changed nothing, so this round proves nothing"
+            );
+            assert!(
+                validate_transaction(&tampered, TEST_PREVIOUS_HASH, |_| Ok(10_000), 1_000_000)
+                    .is_err(),
+                "seed {seed:#x}: {what} and the ledger still accepted it"
+            );
+        }
+    }
+
+    fn community_reserve_tx(
+        job_id: &str,
+        work: WorkSpec,
+        shards: u32,
+        cost: i64,
+    ) -> LedgerTransaction {
+        LedgerTransaction {
+            transaction_id: format!("reserve-{job_id}"),
+            kind: TransactionKind::CommunityReserve,
+            postings: vec![
+                Posting {
+                    account_id: COMMUNITY_ISSUANCE_ACCOUNT.into(),
+                    delta_mcu: -cost,
+                },
+                Posting {
+                    account_id: escrow_account(job_id),
+                    delta_mcu: cost,
+                },
+            ],
+            evidence: TransactionEvidence::CommunityReserve {
+                job_id: job_id.into(),
+                work,
+                shards,
+                sponsors: vec![],
+            },
+            created_at: 1,
+        }
+    }
+
+    /// Property: however the community budget is drawn on, it can never be
+    /// drawn past the ceiling the sitting set agreed to. That bound is the
+    /// whole of "no purchased CU" — free work exists, but only up to here.
+    #[test]
+    fn community_issuance_never_crosses_its_ceiling() {
+        let mut rng = Rng(0x0c0f_fee0_1234_5678);
+        let mut draws: Vec<(String, WorkSpec, u32, i64)> = Vec::new();
+        for round in 0..300u64 {
+            let seed = rng.next();
+            let work = WorkSpec::PrimeCount {
+                start: 2,
+                end: 1_000 + seed % 60_000,
+            };
+            let shards = 1 + (seed >> 32) as u32 % 4;
+            let cost: i64 = split_work(&work, shards).iter().map(work_cost_mcu).sum();
+            draws.push((format!("job-ceiling-{round}"), work, shards, cost));
+        }
+        // A ceiling the first two dozen draws can reach and the rest cannot,
+        // so the run is guaranteed to see both a mint that is allowed and a
+        // mint that is refused.
+        let limit: i64 = draws.iter().take(25).map(|d| d.3).sum();
+        let mut issued: i64 = 0;
+        let mut minted = 0u32;
+        let mut refused = 0u32;
+        for (job, work, shards, cost) in draws {
+            let before = issued;
+            let ledger = move |account: &str| -> Result<i64> {
+                if account == COMMUNITY_ISSUANCE_ACCOUNT {
+                    Ok(before)
+                } else {
+                    Ok(0)
+                }
+            };
+            let tx = community_reserve_tx(&job, work, shards, cost);
+            if validate_transaction(&tx, TEST_PREVIOUS_HASH, ledger, limit).is_ok() {
+                issued -= cost;
+                minted += 1;
+            } else {
+                refused += 1;
+            }
+            assert!(
+                issued >= -limit,
+                "{job} drew the community account to {issued}, past the ceiling of {limit}"
+            );
+        }
+        assert!(
+            minted > 0,
+            "nothing was ever minted, so no ceiling was tested"
+        );
+        assert!(
+            refused > 0,
+            "the run never reached the ceiling, so it never tested it"
+        );
+    }
+
+    /// Property: the chain is the state. Two databases fed the same
+    /// certificates have to agree exactly, a certificate replayed against a
+    /// database that already carries it has to be refused rather than paid
+    /// twice, and no run of settlements may create or destroy a single mCU.
+    #[test]
+    fn replaying_a_chain_is_deterministic_idempotent_and_conserving() {
+        use crate::store::LedgerStore;
+
+        let validators = validator_set("replay-property");
+        let provider = test_identity("replay-provider");
+        let work = WorkSpec::PrimeCount { start: 2, end: 20 };
+        let mut rng = Rng(0xfeed_face_0bad_c0de);
+        let mut certs: Vec<QuorumCertificate> = Vec::new();
+        let mut previous = "GENESIS".to_string();
+        let mut rewarded = 0u32;
+        let mut refunded = 0u32;
+        for round in 0..12u64 {
+            let job = format!("job-replay-{round}");
+            let reserve = certified_community_reserve(&validators, &job, 2 * round + 1, &previous);
+            previous = reserve.entry.entry_hash.clone();
+            certs.push(reserve);
+            let settle = if rng.below(2) == 0 {
+                rewarded += 1;
+                signed_reward(&job, 0, &provider, &work, true)
+            } else {
+                refunded += 1;
+                refund_tx(&job, 0, &work, true, None, 1)
+            };
+            let cert = certify(&validators, settle, 2 * round + 2, &previous);
+            previous = cert.entry.entry_hash.clone();
+            certs.push(cert);
+        }
+        assert!(
+            rewarded > 0 && refunded > 0,
+            "the chain has to exercise both endings to prove anything about either"
+        );
+
+        let mut first = LedgerStore::open(":memory:").unwrap();
+        let mut second = LedgerStore::open(":memory:").unwrap();
+        for cert in &certs {
+            first.apply(cert, &validators.set).unwrap();
+            second.apply(cert, &validators.set).unwrap();
+        }
+        assert_eq!(
+            first.state().unwrap(),
+            second.state().unwrap(),
+            "the same certificates left two databases in different states"
+        );
+        assert_eq!(
+            first.state().unwrap().digest().unwrap(),
+            second.state().unwrap().digest().unwrap(),
+            "two databases agreeing on state must agree on its digest"
+        );
+
+        let settled = first.state().unwrap();
+        assert!(
+            settled.balances.values().any(|v| *v != 0),
+            "nothing moved, so conservation here would be trivially true"
+        );
+        let total: i64 = settled.balances.values().sum();
+        assert_eq!(total, 0, "the chain left {total} mCU that nobody paid for");
+
+        let before = first.state().unwrap().digest().unwrap();
+        for cert in &certs {
+            assert!(
+                first.apply(cert, &validators.set).is_err(),
+                "sequence {} was allowed to settle twice",
+                cert.entry.sequence
+            );
+        }
+        assert_eq!(
+            first.state().unwrap().digest().unwrap(),
+            before,
+            "a refused replay still moved the ledger"
+        );
+    }
+
+    /// A validator that signs two different entries at the same height is the
+    /// classic Byzantine move. Nothing stops a validator from signing twice —
+    /// but the chain has one slot per height, and whichever entry lands first
+    /// owns it. The second is refused, and the equivocation stays provable:
+    /// two certificates, the same signers, one sequence, two entry hashes.
+    #[test]
+    fn an_equivocating_quorum_cannot_fill_a_height_twice() {
+        use crate::store::LedgerStore;
+
+        let validators = validator_set("equivocation");
+        let honest = certified_community_reserve(&validators, "job-honest", 1, "GENESIS");
+        let forked = certified_community_reserve(&validators, "job-forked", 1, "GENESIS");
+        assert_ne!(
+            honest.entry.entry_hash, forked.entry.entry_hash,
+            "the two branches have to differ or there is no equivocation here"
+        );
+        let signers = |c: &QuorumCertificate| -> Vec<String> {
+            c.signatures
+                .iter()
+                .map(|s| s.validator_id.clone())
+                .collect()
+        };
+        assert_eq!(
+            signers(&honest),
+            signers(&forked),
+            "the same seats have to have signed both, or this is not equivocation"
+        );
+        // Each certificate is true on its own: a signature is a claim about
+        // one entry, and both of these claims are honestly signed. The lie is
+        // only visible when you hold the pair.
+        verify_certificate(&honest, &validators.set).unwrap();
+        verify_certificate(&forked, &validators.set).unwrap();
+
+        let mut store = LedgerStore::open(":memory:").unwrap();
+        store.apply(&honest, &validators.set).unwrap();
+        let refusal = store
+            .apply(&forked, &validators.set)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("does not extend local head"),
+            "the fork was refused, but for the wrong reason: {refusal}"
+        );
+        assert_eq!(
+            store.head(&validators.set).unwrap().entry_hash,
+            honest.entry.entry_hash,
+            "the height belongs to whichever branch got there first"
+        );
+        assert!(store.balance(&escrow_account("job-honest")).unwrap() > 0);
+        assert_eq!(
+            store.balance(&escrow_account("job-forked")).unwrap(),
+            0,
+            "the branch that lost the height must not have funded anything"
+        );
+    }
+
+    /// A full quorum of signatures is worth nothing if the signers are not the
+    /// sitting set. Membership, not signature count, is what makes a
+    /// certificate binding — which is why membership is itself a ledger event.
+    #[test]
+    fn a_quorum_of_strangers_settles_nothing() {
+        use crate::store::LedgerStore;
+
+        let sitting = validator_set("stranger-sitting");
+        let impostors = validator_set("stranger-impostor");
+        let forged = certified_community_reserve(&impostors, "job-forged", 1, "GENESIS");
+        // Signed correctly, by the wrong people. Against their own invented
+        // set it is a perfectly good certificate.
+        verify_certificate(&forged, &impostors.set).unwrap();
+        assert!(
+            verify_certificate(&forged, &sitting.set).is_err(),
+            "an invented set was allowed to certify for the real one"
+        );
+
+        let mut store = LedgerStore::open(":memory:").unwrap();
+        assert!(
+            store.apply(&forged, &sitting.set).is_err(),
+            "a stranger's quorum was allowed to mint"
+        );
+        assert_eq!(
+            store.head(&sitting.set).unwrap().sequence,
+            0,
+            "a refused certificate must leave the chain where it was"
+        );
+        assert_eq!(store.balance(&escrow_account("job-forged")).unwrap(), 0);
+    }
 }

@@ -41,8 +41,8 @@
 - Reconciliation daemon for partial coordinator/ledger failures.
 - Signed checkpoints distributed out-of-band.
 - Sweeping stale inference holding accounts to the commons once the settlement window closes, so a requester that takes delivery and never gives a verdict cannot strand CU indefinitely.
-- Property tests for conservation and replay invariants.
-- Byzantine/fault-injection tests. Network faults are covered: the quorum flow suite runs a fault-injecting relay for WAN latency, minority and majority partitions, and clock skew. What is left is adversarial *behaviour* - validators that equivocate, coordinators that lie, workers that forge results - and a real multi-host run.
+- Property tests for conservation and replay invariants. Covered in `hocmesh-ledger`: a settled reward survives no single edit to its postings, evidence, or signature; the community ceiling is never crossed by any sequence of mints; and a chain replayed into two databases leaves them identical, refuses every certificate a second time, and sums to exactly zero.
+- Byzantine/fault-injection tests. Network faults are covered: the quorum flow suite runs a fault-injecting relay for WAN latency, minority and majority partitions, and clock skew. Two Byzantine cases are covered too: an equivocating quorum that signs two entries at one height cannot get both onto the chain, and a full quorum of strangers certifies nothing. What is left is the rest of adversarial *behaviour* - a validator that equivocates while its peers are partitioned, a coordinator that lies about scheduling rather than about payment - and a real multi-host run.
 
 ## Priority 2 — scheduler federation
 

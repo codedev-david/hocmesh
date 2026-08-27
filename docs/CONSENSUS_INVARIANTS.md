@@ -237,9 +237,28 @@ a fault-injecting relay and asserts that:
   times recovery is run;
 - authentication refuses timestamps outside the tolerated skew window.
 
-These are crash and network faults. Byzantine behaviour - a validator that
-equivocates, a coordinator that lies about what it certified - is still assumed
-away, and every process runs on one machine over loopback.
+These are crash and network faults, and they run on one machine over loopback.
+
+## What has been tested under adversarial behaviour
+
+Two Byzantine cases are exercised directly in `hocmesh-ledger`:
+
+- an equivocating quorum - the same seats signing two different entries at one
+  height - can get at most one of them onto the chain, and the branch that
+  loses the height funds nothing;
+- a full quorum of signatures from validators outside the sitting set settles
+  nothing, because membership rather than signature count is what binds.
+
+Alongside those, property tests assert what no adversary should be able to do
+to a settled chain: no single edit to a reward - to its postings, its evidence,
+or its signature - survives validation; no sequence of mints crosses the
+community issuance ceiling; and a chain replayed into a second database leaves
+it identical, refuses every certificate the second time, and sums to exactly
+zero across every account.
+
+What is still assumed away is the combination: a validator that equivocates
+while its peers are partitioned, a coordinator that lies about scheduling
+rather than about payment, and any of this across more than one machine.
 
 ## Current consensus limitation
 
