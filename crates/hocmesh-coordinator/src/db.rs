@@ -279,24 +279,35 @@ pub fn orphaned_funding_objects(conn: &Connection) -> Result<u64> {
     )? as u64)
 }
 
+/// Seed a system-funded job, and the intent that will pay for it, together.
+///
+/// One transaction on purpose. A job written without its intent is work the
+/// reconciliation pass can only report, never finish: nothing names it, so
+/// nothing will ever propose the entry it is waiting on, and the coordinator
+/// is not allowed to write that entry on its own say-so.
 pub fn seed_system_job_with_id(
     conn: &mut Connection,
     job_id: &str,
     work: WorkSpec,
     shards: u32,
-    ready: bool,
+    intent: Option<(&str, &str, &str)>,
 ) -> Result<()> {
     work.validate().map_err(anyhow::Error::msg)?;
     let parts = split_work(&work, shards.clamp(1, 256));
     let reserved_mcu: i64 = parts.iter().map(work_cost_mcu).sum();
     let now = now_unix();
     let tx = conn.transaction()?;
+    // No intent means nothing has to be paid for before the work can run.
+    let ready = intent.is_none();
     let job_status = if ready { "pending" } else { "funding" };
     let assignment_status = if ready { "pending" } else { "blocked" };
     tx.execute("INSERT INTO jobs(job_id,requester_node_id,system_funded,work_json,status,reserved_mcu,created_at) VALUES(?1,NULL,1,?2,?3,?4,?5)",params![job_id,serde_json::to_string(&work)?,job_status,reserved_mcu,now])?;
     for (index, part) in parts.iter().enumerate() {
         let assignment_id = hocmesh_protocol::assignment_id(job_id, index as u32);
         tx.execute("INSERT INTO assignments(assignment_id,job_id,shard_index,work_json,status,reward_mcu) VALUES(?1,?2,?3,?4,?5,?6)",params![assignment_id,job_id,index as i64,serde_json::to_string(part)?,assignment_status,work_cost_mcu(part)])?;
+    }
+    if let Some((claim_key, kind, transaction_json)) = intent {
+        persist_ledger_intent(&tx, claim_key, kind, job_id, transaction_json)?;
     }
     tx.commit()?;
     Ok(())
@@ -491,5 +502,25 @@ mod tests {
         // entry locally would be the coordinator deciding CU into existence.
         abandon_ledger_intent(&conn, "ck4", "claim mismatch").unwrap();
         assert_eq!(orphaned_funding_objects(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_seeded_job_and_the_intent_that_pays_for_it_land_together() {
+        let mut conn = open(":memory:").expect("in-memory coordinator database");
+        let work = WorkSpec::PrimeCount { start: 2, end: 100 };
+        seed_system_job_with_id(
+            &mut conn,
+            "job_seeded",
+            work,
+            1,
+            Some(("ck_seed", "community_reserve", "{}")),
+        )
+        .unwrap();
+        // The job is parked waiting on funding, and the intent that will pay
+        // for it exists in the same breath -- so nothing is stranded.
+        assert_eq!(orphaned_funding_objects(&conn).unwrap(), 0);
+        let rows = unsettled_ledger_intents(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].object_id, "job_seeded");
     }
 }

@@ -193,16 +193,24 @@ async fn seed(
         }
     });
     let mut conn = db::open(db_path)?;
-    db::seed_system_job_with_id(&mut conn, &job_id, work, shards, ledger_tx.is_none())?;
+    // Build the intent before the job exists, so the two land together or not
+    // at all. A job seeded without one is stranded: the reconciliation pass can
+    // report it and nothing more.
+    let intent = ledger_tx
+        .as_ref()
+        .map(|tx| Ok::<_, anyhow::Error>((claim_key(tx), serde_json::to_string(tx)?)))
+        .transpose()?;
+    db::seed_system_job_with_id(
+        &mut conn,
+        &job_id,
+        work,
+        shards,
+        intent
+            .as_ref()
+            .map(|(ck, json)| (ck.as_str(), "community_reserve", json.as_str())),
+    )?;
     if let Some(tx) = ledger_tx {
         let ck = claim_key(&tx);
-        db::persist_ledger_intent(
-            &conn,
-            &ck,
-            "community_reserve",
-            &job_id,
-            &serde_json::to_string(&tx)?,
-        )?;
         match network.as_ref().unwrap().transact(tx).await {
             Ok(cert) => {
                 finalize_reservation_db(&mut conn, &job_id, &ck, &cert.entry.entry_hash)?;
