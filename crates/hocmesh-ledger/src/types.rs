@@ -31,6 +31,7 @@ pub enum TransactionKind {
     InferenceReceipt,
     InferenceReward,
     InferenceDispute,
+    InferenceExpiry,
     InferenceRefund,
     MembershipChange,
 }
@@ -84,6 +85,7 @@ pub enum TransactionEvidence {
     InferenceReceipt(InferenceReceiptEvidence),
     InferenceReward(InferenceRewardEvidence),
     InferenceDispute(InferenceDisputeEvidence),
+    InferenceExpiry(InferenceExpiryEvidence),
     InferenceRefund(InferenceRefundEvidence),
     MembershipChange(MembershipChangeEvidence),
 }
@@ -387,6 +389,46 @@ pub struct InferenceDisputeEvidence {
     pub reason: String,
     pub requester_public_key_b64: String,
     pub requester_auth: AuthProof,
+}
+
+/// The commons collecting a batch the requester took and then never judged.
+///
+/// A receipt moves CU somewhere neither party can reach alone: only an
+/// acceptance or a dispute empties a holding account, and both need the
+/// requester's signature. A requester that reads its answer and then goes
+/// quiet - or loses its key, or simply stops caring - therefore strands that
+/// CU forever, and the provider waits forever with it.
+///
+/// So the passage of time is made a third verdict. Nobody signs an expiry;
+/// there is no one left to sign it. What makes it checkable instead is the
+/// receipt the requester already signed: it names the batch and the price, and
+/// its `AuthProof` carries the moment the requester claimed delivery. Any
+/// validator can re-derive that signature and compare the two timestamps, so
+/// an expiry is exactly as verifiable years later, replaying from genesis, as
+/// it was on the day it settled.
+///
+/// The CU goes to the commons, never to the sweeper: a permissionless
+/// transaction that paid whoever submitted it would be a race, and the race
+/// would be the point. Here submitting one is pure cost, which is why the
+/// coordinator does it on a timer and anybody else may.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceExpiryEvidence {
+    pub job_id: String,
+    pub assignment_id: String,
+    pub batch_start: u32,
+    pub batch_end: u32,
+    pub price_mcu: i64,
+    pub outputs_digest: String,
+    pub requester_public_key_b64: String,
+    /// The receipt that filled the holding account, replayed verbatim.
+    ///
+    /// Both halves of the rule live in here: the signature proves the
+    /// requester really took this batch at this price, and `timestamp` is when
+    /// it said so, which is what the settlement window is measured from. A
+    /// requester could backdate its own receipt to shorten its own window, and
+    /// gains nothing by it - disputing was always free to it - while nobody
+    /// else can move that timestamp at all without the requester's key.
+    pub requester_receipt: AuthProof,
 }
 
 /// A requester taking back the escrow on a batch nobody delivered.

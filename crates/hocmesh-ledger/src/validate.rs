@@ -5,8 +5,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hocmesh_core::compute::{split_work, work_cost_mcu};
 use hocmesh_core::verify::{self, AuditNonce};
 use hocmesh_protocol::{
-    AuthProof, PricedBatch, hash_json, refund_body_hash, result_body_hash, submit_body_hash,
-    verify_auth_signature,
+    AuthProof, PricedBatch, SETTLEMENT_WINDOW_SECS, hash_json, refund_body_hash, result_body_hash,
+    submit_body_hash, verify_auth_signature,
 };
 
 pub fn validate_validator_set(set: &ValidatorSet) -> Result<()> {
@@ -84,6 +84,13 @@ pub fn claim_key(tx: &LedgerTransaction) -> String {
             inference_claim_key(&e.job_id, e.batch_start, e.batch_end)
         }
         TransactionEvidence::InferenceDispute(e) => {
+            inference_payout_key(&e.job_id, e.batch_start, e.batch_end)
+        }
+        // The third way a received batch can be paid out, and so a rival for
+        // the same key: a batch that has already gone to its provider or to
+        // the commons cannot also expire, and one that expires cannot later be
+        // accepted by a requester that resurfaces.
+        TransactionEvidence::InferenceExpiry(e) => {
             inference_payout_key(&e.job_id, e.batch_start, e.batch_end)
         }
         TransactionEvidence::InferenceRefund(e) => {
@@ -266,6 +273,9 @@ pub fn validate_transaction(
         }
         (TransactionKind::InferenceDispute, TransactionEvidence::InferenceDispute(e)) => {
             validate_inference_dispute(tx, e, reserved(&e.job_id)?.as_ref())?
+        }
+        (TransactionKind::InferenceExpiry, TransactionEvidence::InferenceExpiry(e)) => {
+            validate_inference_expiry(tx, e, reserved(&e.job_id)?.as_ref())?
         }
         (TransactionKind::InferenceRefund, TransactionEvidence::InferenceRefund(e)) => {
             validate_inference_refund(tx, e, reserved(&e.job_id)?.as_ref())?
@@ -609,6 +619,92 @@ fn validate_inference_dispute(
             .any(|p| p.account_id == COMMUNITY_ISSUANCE_ACCOUNT && p.delta_mcu == price)
     {
         bail!("inference dispute postings do not return the batch to the commons")
+    }
+    Ok(())
+}
+
+/// What the receipt behind an expiry has to say for itself.
+///
+/// Shared by the live and the historical path so there is exactly one
+/// statement of the rule. A validator seeing this today and an auditor
+/// replaying it in ten years reach their verdict the same way, out of the same
+/// bytes, with no reservation state and no clock of their own.
+fn expired_receipt(tx: &LedgerTransaction, e: &InferenceExpiryEvidence) -> Result<()> {
+    if e.batch_end <= e.batch_start {
+        bail!("an inference expiry covers an empty batch")
+    }
+    if e.price_mcu <= 0 {
+        bail!("an inference expiry names a non-positive price")
+    }
+    // Re-derived, never read off the evidence: this is the same body hash the
+    // receipt was signed over, so a claimant that changed the batch or the
+    // price to suit itself changes the hash and the signature stops verifying.
+    let bh = hocmesh_protocol::inference_receipt_body_hash(
+        &e.assignment_id,
+        &e.job_id,
+        e.batch_start,
+        e.batch_end,
+        e.price_mcu,
+        &e.outputs_digest,
+    )?;
+    verify_auth_signature(
+        &e.requester_public_key_b64,
+        &e.requester_receipt,
+        "receipt_inference",
+        &bh,
+    )
+    .map_err(|e| anyhow::anyhow!("an inference expiry carries no receipt for its batch: {e}"))?;
+    // The window is the provider's protection. Until it closes only the
+    // requester can empty the holding account, so an honest provider always
+    // gets its stated interval to be paid in before anyone may sweep.
+    let deadline = e
+        .requester_receipt
+        .timestamp
+        .checked_add(SETTLEMENT_WINDOW_SECS)
+        .ok_or_else(|| anyhow::anyhow!("inference expiry deadline overflows"))?;
+    if tx.created_at < deadline {
+        bail!(
+            "this batch still has {}s left for its requester to judge it",
+            deadline - tx.created_at
+        )
+    }
+    Ok(())
+}
+
+/// The commons taking a batch its requester abandoned.
+///
+/// Rides the same claim key as the reward and the dispute, so a batch still
+/// settles exactly once and in exactly one direction. What is different is
+/// that nobody authorises it: the requester is by definition not answering.
+/// The authority is the receipt it signed on the way in, plus a clock.
+fn validate_inference_expiry(
+    tx: &LedgerTransaction,
+    e: &InferenceExpiryEvidence,
+    reserved: Option<&InferenceReservation>,
+) -> Result<()> {
+    expired_receipt(tx, e)?;
+    let Some(r) = reserved else {
+        bail!("an inference expiry has no reservation to close")
+    };
+    if r.requester != e.requester_receipt.node_id {
+        bail!("an inference expiry names a receipt from someone who did not fund the batch")
+    }
+    let (_, price) = reserved_batch(r, &e.assignment_id, e.batch_start, e.batch_end)?;
+    if e.price_mcu != price {
+        bail!("inference expiry does not carry the price the requester signed for the batch")
+    }
+    let held = inference_holding_account(&e.assignment_id);
+    if tx.postings.len() != 2
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == held && p.delta_mcu == -price)
+        || !tx
+            .postings
+            .iter()
+            .any(|p| p.account_id == COMMUNITY_ISSUANCE_ACCOUNT && p.delta_mcu == price)
+    {
+        bail!("inference expiry postings do not return the batch to the commons")
     }
     Ok(())
 }
@@ -1141,6 +1237,28 @@ pub fn validate_historical_transaction(
                 bail!("historical inference dispute postings invalid")
             }
         }
+        (TransactionKind::InferenceExpiry, TransactionEvidence::InferenceExpiry(e)) => {
+            // An abandoned batch, collected. There is no fresh signature to
+            // check because there was nobody left to give one; the receipt in
+            // the evidence is the authorisation, and the entry's own
+            // `created_at` is what the window is measured against. The
+            // balance check above is what proves the receipt was really
+            // applied rather than merely signed: nothing else could have put
+            // CU in this holding account.
+            expired_receipt(tx, e)?;
+            let held = inference_holding_account(&e.assignment_id);
+            if tx.postings.len() != 2
+                || !tx
+                    .postings
+                    .iter()
+                    .any(|p| p.account_id == held && p.delta_mcu == -e.price_mcu)
+                || !tx.postings.iter().any(|p| {
+                    p.account_id == COMMUNITY_ISSUANCE_ACCOUNT && p.delta_mcu == e.price_mcu
+                })
+            {
+                bail!("historical inference expiry postings invalid")
+            }
+        }
         _ => bail!("historical transaction kind/evidence mismatch"),
     }
     Ok(())
@@ -1467,6 +1585,12 @@ pub fn verify_historical_evidence(
                 e.price_mcu,
                 &e.outputs_digest,
             )?;
+        }
+        TransactionEvidence::InferenceExpiry(e) => {
+            // The only settlement with no signature of its own. What stands in
+            // for one is the receipt it carries, and the window measured from
+            // the moment that receipt says the requester took delivery.
+            expired_receipt(tx, e)?;
         }
         TransactionEvidence::InferenceRefund(e) => {
             let bh = hocmesh_protocol::inference_refund_body_hash(
@@ -3426,6 +3550,254 @@ mod tests {
             }),
             created_at: 1_700_000_100,
         }
+    }
+
+    /// The commons collecting a batch its requester walked away from.
+    ///
+    /// Nobody signs this one. What it carries instead is the receipt the
+    /// requester signed on the way in, and `created_at` says when the sweep was
+    /// proposed - which is the only thing the window is measured against.
+    fn signed_expiry(
+        requester: &NodeIdentity,
+        price_mcu: i64,
+        created_at: i64,
+    ) -> LedgerTransaction {
+        // The batch itself is fixed: what an expiry test varies is the price
+        // and how long the requester was given, never which batch it was.
+        let assignment_id = det("job1", 0);
+        let TransactionEvidence::InferenceReceipt(r) = signed_receipt(
+            requester,
+            "job1",
+            &assignment_id,
+            0,
+            2,
+            price_mcu,
+            "digest-abandoned",
+        )
+        .evidence
+        else {
+            unreachable!()
+        };
+        LedgerTransaction {
+            transaction_id: format!("expire-{assignment_id}"),
+            kind: TransactionKind::InferenceExpiry,
+            postings: vec![
+                Posting {
+                    account_id: inference_holding_account(&assignment_id),
+                    delta_mcu: -price_mcu,
+                },
+                Posting {
+                    account_id: COMMUNITY_ISSUANCE_ACCOUNT.to_string(),
+                    delta_mcu: price_mcu,
+                },
+            ],
+            evidence: TransactionEvidence::InferenceExpiry(InferenceExpiryEvidence {
+                job_id: "job1".to_string(),
+                assignment_id: assignment_id.clone(),
+                batch_start: 0,
+                batch_end: 2,
+                price_mcu,
+                outputs_digest: "digest-abandoned".to_string(),
+                requester_public_key_b64: requester.public_key_b64(),
+                requester_receipt: r.requester_auth,
+            }),
+            created_at,
+        }
+    }
+
+    /// A ripe expiry: the receipt exists, and the window it started has closed.
+    fn ripe_expiry(requester: &NodeIdentity, price: i64) -> LedgerTransaction {
+        let receipt_at = hocmesh_protocol::now_unix();
+        signed_expiry(requester, price, receipt_at + SETTLEMENT_WINDOW_SECS)
+    }
+
+    /// The gap the two-stage settlement opened, and the reason this exists.
+    ///
+    /// A receipt is a one-way door: once it fires, only an acceptance or a
+    /// dispute can empty the holding account, and both need the requester's
+    /// signature. A requester that reads its answer and then never speaks
+    /// again - crashed, uninterested, or holding the provider's CU hostage on
+    /// purpose - would otherwise freeze that CU permanently. Time is the third
+    /// verdict, and it pays the commons rather than either party.
+    #[test]
+    fn a_batch_its_requester_abandoned_goes_to_the_commons() {
+        let requester = test_identity("inf-req-expiry");
+        let provider = test_identity("inf-prov-expiry");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let tx = ripe_expiry(&requester, price);
+        super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap();
+    }
+
+    /// The provider's protection. Until the window closes the holding account
+    /// is the requester's to settle, so an honest provider always gets its full
+    /// interval to be paid in before anyone may sweep the batch out from under
+    /// it.
+    #[test]
+    fn a_batch_cannot_be_swept_while_its_requester_still_has_time() {
+        let requester = test_identity("inf-req-early");
+        let provider = test_identity("inf-prov-early");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let receipt_at = hocmesh_protocol::now_unix();
+        let tx = signed_expiry(&requester, price, receipt_at + SETTLEMENT_WINDOW_SECS - 1);
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("left for its requester to judge it"), "{err}");
+    }
+
+    /// The obvious attack on a rule made of a timestamp: move the timestamp.
+    ///
+    /// It fails because the timestamp is inside the message the requester
+    /// signed, so shifting it invalidates the signature that makes the expiry
+    /// checkable at all. Only the requester can move its own deadline, and
+    /// moving it only ever shortens its own window.
+    #[test]
+    fn an_expiry_cannot_backdate_the_receipt_it_rests_on() {
+        let requester = test_identity("inf-req-backdate");
+        let provider = test_identity("inf-prov-backdate");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let mut tx = ripe_expiry(&requester, price);
+        tx.created_at -= SETTLEMENT_WINDOW_SECS;
+        let TransactionEvidence::InferenceExpiry(e) = &mut tx.evidence else {
+            unreachable!()
+        };
+        // Drag the receipt back far enough that the sweep looks ripe again.
+        e.requester_receipt.timestamp -= SETTLEMENT_WINDOW_SECS;
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no receipt for its batch"), "{err}");
+    }
+
+    /// A sweep of a batch that was never delivered. The receipt is real, but it
+    /// is a receipt for something else, so the body hash it was signed over
+    /// stops matching the batch being claimed.
+    #[test]
+    fn an_expiry_needs_a_receipt_for_the_batch_it_claims() {
+        let requester = test_identity("inf-req-wrongbatch");
+        let provider = test_identity("inf-prov-wrongbatch");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let mut tx = ripe_expiry(&requester, price);
+        let TransactionEvidence::InferenceExpiry(e) = &mut tx.evidence else {
+            unreachable!()
+        };
+        e.outputs_digest = "some other answer entirely".into();
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no receipt for its batch"), "{err}");
+    }
+
+    /// The reason a permissionless settlement is safe: submitting one is pure
+    /// cost. An expiry that paid its sweeper would be a race worth winning, so
+    /// the CU may go to exactly one place and it is not the proposer.
+    #[test]
+    fn an_expiry_can_only_pay_the_commons() {
+        let requester = test_identity("inf-req-selfpay");
+        let provider = test_identity("inf-prov-selfpay");
+        let sweeper = test_identity("inf-sweeper");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let mut tx = ripe_expiry(&requester, price);
+        tx.postings[1].account_id = sweeper.node_id();
+        let err = super::validate_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            |_| Ok(1_000_000),
+            |_| Ok(Some(r.clone())),
+            &unsponsored_set(0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("return the batch to the commons"), "{err}");
+    }
+
+    /// One batch, one settlement, three ways in. A requester that resurfaces
+    /// after the sweep finds the claim already taken, and a sweep proposed
+    /// against a batch already accepted collides the same way.
+    #[test]
+    fn an_expiry_races_the_verdict_for_a_single_claim() {
+        let requester = test_identity("inf-req-race");
+        let provider = test_identity("inf-prov-race");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let assignment = det("job1", 0);
+        let expiry = ripe_expiry(&requester, price);
+        let dispute = signed_dispute(
+            &requester,
+            "job1",
+            &assignment,
+            0,
+            2,
+            price,
+            "digest-abandoned",
+        );
+        let reward =
+            signed_inference_reward(&provider, &requester, "job1", &assignment, 0, 2, price);
+        assert_eq!(claim_key(&expiry), claim_key(&dispute));
+        assert_eq!(claim_key(&expiry), claim_key(&reward));
+    }
+
+    /// An expiry has to be as checkable in ten years as it was on the day, and
+    /// out of the same bytes: an auditor replaying from genesis holds no
+    /// reservation state and no clock of its own.
+    #[test]
+    fn an_expiry_replays_from_the_entry_alone() {
+        let requester = test_identity("inf-req-replay");
+        let provider = test_identity("inf-prov-replay");
+        let r = reservation_for(&requester.node_id(), &provider.node_id());
+        let price = reserved_price(&r);
+        let tx = ripe_expiry(&requester, price);
+        let held = inference_holding_account(&det("job1", 0));
+        super::validate_historical_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            &[],
+            |a| Ok(if a == held { price } else { 0 }),
+            &unsponsored_set(0),
+        )
+        .unwrap();
+        // And the balance check is what proves a receipt really landed: with an
+        // empty holding account there was nothing to sweep in the first place.
+        let err = super::validate_historical_transaction(
+            &tx,
+            TEST_PREVIOUS_HASH,
+            &[],
+            |_| Ok(0),
+            &unsponsored_set(0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("insufficient historical balance"), "{err}");
     }
 
     /// The hole this whole two-stage settlement exists to close.

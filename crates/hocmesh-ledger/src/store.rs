@@ -1217,6 +1217,28 @@ impl LedgerStore {
                             bail!("inference dispute is not what the batch prices at")
                         }
                     }
+                    TransactionEvidence::InferenceExpiry(e) => {
+                        let Some((billing, _, requester, _)) = inference.get(&e.job_id) else {
+                            bail!(
+                                "inference expiry references missing reservation: {}",
+                                e.job_id
+                            )
+                        };
+                        // The receipt is the requester's, or it authorises
+                        // nothing. `validate_historical_transaction` has
+                        // already checked that it verifies and that the window
+                        // has closed; what the replay adds is the reservation
+                        // this receipt has to belong to.
+                        if requester != &e.requester_receipt.node_id {
+                            bail!(
+                                "inference expiry carries a receipt from someone other than the requester"
+                            )
+                        }
+                        if inference_batch_price(billing, e.batch_start, e.batch_end) != e.price_mcu
+                        {
+                            bail!("inference expiry is not what the batch prices at")
+                        }
+                    }
                     TransactionEvidence::InferenceRefund(e) => {
                         let Some((billing, batches, requester, reserved_at)) =
                             inference.get(&e.job_id)
@@ -1454,10 +1476,13 @@ fn index_certificate(tx: &rusqlite::Transaction<'_>, cert: &QuorumCertificate) -
                 ],
             )?;
             }
-            TransactionEvidence::InferenceReceipt(_) | TransactionEvidence::InferenceDispute(_) => {
-                // Neither pays a provider, so there is no reward to index. The
-                // claim keys already record that the batch was received and
-                // that it was settled away from the provider.
+            TransactionEvidence::InferenceReceipt(_)
+            | TransactionEvidence::InferenceDispute(_)
+            | TransactionEvidence::InferenceExpiry(_) => {
+                // None of the three pays a provider, so there is no reward to
+                // index. The claim keys already record that the batch was
+                // received and that it was settled away from the provider,
+                // whether the requester said so or simply never came back.
             }
             TransactionEvidence::InferenceRefund(_) => {
                 // Nothing to index, for the same reason a shard refund indexes
