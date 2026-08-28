@@ -57,10 +57,12 @@ Before publishing a public release:
 
 - Generate and publish SHA-256 checksums for every binary and packaged archive.
 - Generate a CycloneDX SBOM from the exact source revision used for the build.
-- Sign platform binaries or installers with the relevant OS signing mechanism.
 - Record the Rust toolchain, target triple, source commit, and build command.
 - Keep validator membership files out of generic release artifacts unless they
   are explicitly intended as a public deployment policy.
+- Add the version's section to `CHANGELOG.md` **before** pushing the tag: the
+  release body is read from it, and a tag with no section publishes a release
+  that says nothing.
 
 GitHub release process:
 
@@ -70,6 +72,15 @@ GitHub release process:
 - Each platform publishes a full archive, a headless installer
   (DEB, MSI, or PKG), and the desktop-app installers for that platform, with a
   `.sha256` checksum for each.
+- Artifacts are signed by `scripts/sign-artifacts.ps1` (Authenticode) and
+  `scripts/sign-artifacts.sh` (Developer ID and notarisation on macOS, a
+  GPG-signed checksum list on Linux). Windows and macOS sign **before** the
+  checksums are taken, so the published digest is the digest of the file a user
+  runs. With no key configured the scripts say so and succeed;
+  `HOCMESH_SIGNING_REQUIRED=1` turns that into a build failure. See
+  `docs/DISTRIBUTION.md`.
+- The release body is the matching `CHANGELOG.md` section, so a release and the
+  repository cannot say different things.
 - The workflow creates a draft prerelease so checksums, release notes, and
   signing status can be reviewed before publishing.
 
