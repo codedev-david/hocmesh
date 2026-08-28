@@ -118,10 +118,18 @@ async fn the_app_starts_a_node_watches_it_earn_changes_its_limits_and_stops_it()
     .await?;
     assert!(working.overview.node_id.is_some());
     assert_eq!(working.overview.coordinator, coordinator);
+    // Not a flat `Some(2)`: a two-core CI runner lending the default half of
+    // itself is allowed one worker, and asking for two does not raise that
+    // ceiling. What has to hold on every machine is that the daemon reports
+    // the count the operator's own share permits, so the expectation is
+    // computed from the same rule the daemon applies rather than assumed.
+    let permitted =
+        ResourceLimits::default().clamp_requested_workers(Some(2), cold.resources.logical_cpus);
     assert_eq!(
         working.overview.workers,
-        Some(2),
-        "the worker count the operator chose has to be the one the daemon reports"
+        Some(permitted),
+        "the worker count the operator chose has to be the one the daemon \
+         reports, clamped by the share they lent"
     );
     assert!(
         working.overview.node_version.is_some(),

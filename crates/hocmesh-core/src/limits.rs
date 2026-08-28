@@ -247,6 +247,24 @@ mod tests {
     }
 
     #[test]
+    fn a_small_machine_lending_half_of_itself_allows_one_worker() {
+        // Two logical CPUs at the default half share round down to one. An
+        // operator asking for two does not get two, and a node that
+        // advertises itself must still be able to take one assignment -- so
+        // the answer is 1, never 0 and never the 2 that was asked for. This
+        // is the size of a stock CI runner, which is why it is pinned.
+        let default = ResourceLimits::default();
+        assert_eq!(default.cpu_percent, 50);
+        assert_eq!(default.effective_workers(2), 1);
+        assert_eq!(default.clamp_requested_workers(Some(2), 2), 1);
+        assert_eq!(default.clamp_requested_workers(None, 2), 1);
+        // Three cores round down the same way; four is the first size that
+        // honours a request for two.
+        assert_eq!(default.clamp_requested_workers(Some(2), 3), 1);
+        assert_eq!(default.clamp_requested_workers(Some(2), 4), 2);
+    }
+
+    #[test]
     fn an_explicit_worker_request_can_only_lower_the_ceiling() {
         let half = ResourceLimits {
             cpu_percent: 50,

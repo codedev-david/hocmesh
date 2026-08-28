@@ -11,6 +11,16 @@ targets = [
 [advisories]
 unmaintained = "workspace"
 unsound = "all"
+ignore = [
+    # Unsoundness in glib::VariantStrIter's Iterator impls, fixed in glib
+    # 0.20. glib reaches this workspace only at 0.18.5, through the GTK3
+    # stack that Tauri's Linux webview is built on, and gtk3-rs ended at
+    # 0.18 -- so there is no version of this dependency tree that carries the
+    # fix while Tauri v2 uses GTK3. Nothing here constructs or iterates a
+    # glib Variant; it is unreachable from hocMESH code, and it is scoped to
+    # Linux desktop builds only. Revisit when Tauri moves to GTK4.
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18 is pinned by Tauri's GTK3 webview; VariantStrIter is never reached from this workspace" },
+]
 
 [licenses]
 confidence-threshold = 0.93
@@ -26,6 +36,37 @@ allow = [
     "Unlicense",
     "Zlib",
 ]
+
+# Named one crate at a time rather than added to `allow` above. MPL-2.0 is
+# file-level copyleft: linking these unmodified is compliant, but a blanket
+# allow would silently admit the next MPL dependency too, including one this
+# workspace might actually want to patch. All six arrive through Tauri --
+# five in the webview's CSS engine, one in its build script.
+[[licenses.exceptions]]
+name = "cssparser"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "cssparser-macros"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "dtoa-short"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "selectors"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "option-ext"
+allow = ["MPL-2.0"]
+
+# Apache-2.0 is already allowed; the LLVM exception only relaxes it further,
+# but SPDX makes it a distinct expression, so it has to be named.
+[[licenses.exceptions]]
+name = "target-lexicon"
+allow = ["Apache-2.0 WITH LLVM-exception"]
 
 [licenses.private]
 ignore = false

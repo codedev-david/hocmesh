@@ -130,6 +130,9 @@ jobs:
 
   native-installers:
     strategy:
+      # One platform's packaging break must not cancel the other two before
+      # they have said whether they work.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
@@ -148,8 +151,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
+      # All three packagers refuse to build unless the coordinator and the
+      # validator are sitting beside the node, so all three are named here.
+      # Not `--workspace`: that would drag in the desktop crate and its GTK
+      # and WebKit toolchain for an installer that carries no window.
       - name: Build client
-        run: cargo build --release -p hocmesh --features ${{ matrix.features }} --locked
+        run: cargo build --release -p hocmesh -p hocmesh-coordinator -p hocmesh-validator --features ${{ matrix.features }} --locked
       - name: Install WiX
         if: matrix.kind == 'msi'
         run: dotnet tool install --global wix --version 6.0.2
@@ -206,6 +213,9 @@ jobs:
 
   desktop-installers:
     strategy:
+      # One platform's packaging break must not cancel the other two before
+      # they have said whether they work.
+      fail-fast: false
       matrix:
         include:
           # 22.04 rather than latest: linuxdeploy is itself an AppImage, so
