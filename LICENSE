@@ -1,21 +1,73 @@
-MIT License
+hocMESH Proprietary License
 
-Copyright (c) 2026 hocMESH Contributors
+Copyright (c) 2026 hocMESH. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software and its source code, documentation, build artifacts and
+installers (together, the "Software") are the confidential and proprietary
+property of the copyright holder. They are licensed, not sold.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Grant
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+   No license, right or interest in the Software is granted except by a
+   separate written agreement signed by the copyright holder. Where such an
+   agreement grants a right to run a distributed binary, that right is limited
+   to running unmodified official builds on hardware the licensee controls,
+   for the licensee's own participation in the hocMESH network.
+
+2. Restrictions
+
+   Except to the extent that the following may not lawfully be prohibited,
+   you may not:
+
+   a. copy, publish, distribute, sublicense, sell, rent, lease or otherwise
+      make the Software available to any third party;
+   b. modify, adapt, translate or create derivative works of the Software;
+   c. reverse engineer, decompile or disassemble the Software, or otherwise
+      attempt to derive its source code from a distributed binary;
+   d. remove, obscure or alter any copyright, trademark or other proprietary
+      notice;
+   e. repackage, rebrand or redistribute any installer, or distribute a build
+      that is not an official signed release; or
+   f. use the Software to construct, operate or interoperate with a competing
+      compute market, or to falsify, replay or otherwise interfere with
+      hocMESH ledger records.
+
+3. Ledger integrity
+
+   Compute Units recorded on the hocMESH ledger have no monetary value, are
+   never bought, sold, traded or transferred, and confer no ownership,
+   security or other financial interest of any kind. Attempting to create,
+   trade or redeem them outside the network's own accounting is a breach of
+   this license and may also be unlawful.
+
+4. Confidentiality
+
+   The source code is confidential. Access granted to a contributor or
+   evaluator is for the agreed purpose only and does not permit disclosure.
+
+5. Termination
+
+   This license terminates automatically on any breach. On termination you
+   must cease all use and destroy every copy of the Software in your
+   possession.
+
+6. No warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+7. Limitation of liability
+
+   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+   OTHER DEALINGS IN THE SOFTWARE.
+
+8. Third-party components
+
+   The Software links third-party open source components under their own
+   licenses. Those licenses govern those components only, and nothing in this
+   license restricts a right you hold under them. The set of components and
+   their licenses is published with each release as a CycloneDX SBOM, and the
+   policy that admits them is in `deny.toml`.

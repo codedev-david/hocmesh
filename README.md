@@ -2,7 +2,11 @@
 
 **hocMESH = Mutual Exchange of Shared Hardware**
 
-hocMESH is an open, contribution-first distributed compute network. Participants contribute idle compute, earn non-monetary Compute Units (CU), bank those units, and later spend them on work executed by other participants.
+hocMESH is a contribution-first distributed compute network with open
+participation and closed source. Anyone may join and lend hardware; the
+software itself is proprietary and the repository is private. Participants
+contribute idle compute, earn non-monetary Compute Units (CU), bank those
+units, and later spend them on work executed by other participants.
 
 There is **no payment system, token, cryptocurrency, market, or purchasable credit** in this design.
 
@@ -81,6 +85,185 @@ The current executable workload is deterministic CPU prime-range computation. Th
 See `docs/HOCMESH_AI.md` for commands, interfaces, validation, and hardware/runtime boundaries, and `docs/DEPLOYMENT.md` for the runbook that takes this onto two or more real machines.
 
 See `docs/FULL_ORIGINAL_SPEC.md` and `docs/ROADMAP.md`.
+
+---
+
+# Architecture
+
+## The model: a torrent swarm run in the other order
+
+A torrent client downloads a file from many seeders and then becomes a seeder
+itself. hocMESH runs that trade in the other order: **you seed first.** You lend
+CPU, memory and GPU to other people's work, that earns Compute Units, and CU is
+what lets you later reach for other people's hardware. Nothing is bought, and
+nothing is given away — you get back what you put in, when you want it rather
+than when you earned it.
+
+That is why **there is no client and no server.** Every install is a whole peer:
+
+```text
+                       one hocMESH install
+   ┌────────────────────────────────────────────────────────────┐
+   │  hocmesh              node — serves work, submits work      │
+   │  hocmesh-coordinator  scheduler — hands shards out          │
+   │  hocmesh-validator    ledger replica — signs settlement     │
+   │  hocmesh-desktop      window (desktop installer only)       │
+   └────────────────────────────────────────────────────────────┘
+```
+
+The two installers differ in exactly one thing — whether the machine has a
+screen — so they **replace** each other rather than sitting side by side. A
+machine that never runs a coordinator or a validator still ships them, because
+the point is that any peer *can* become one.
+
+## Three planes
+
+hocMESH separates what a peer is allowed to be trusted about. Nothing in the
+system trusts one component for more than one of these.
+
+```text
+        control plane                accounting plane            data plane
+    ┌────────────────────┐       ┌──────────────────────┐   ┌──────────────────┐
+    │ hocmesh-coordinator│       │ hocmesh-validator xN │   │ model chunks     │
+    │ shard queue        │       │ append-only hash     │   │ tensor frames    │
+    │ capability registry│◄─────►│ chain, threshold-    │   │ peer HTTP seeding│
+    │ leases, rerouting  │       │ signed by a quorum   │   │ rarest-first     │
+    └────────────────────┘       └──────────────────────┘   └──────────────────┘
+       decides WHO runs it          decides WHAT WAS PAID       moves the BYTES
+       untrusted                    authoritative               integrity-checked
+```
+
+The coordinator is **deliberately untrusted for money**. It proposes settlement;
+it cannot perform it. A price is a closed-form function of the *work spec*, so
+any peer can recompute it, and a validator quorum refuses an entry whose
+arithmetic does not check out. That is why losing or compromising a coordinator
+costs you scheduling, never balances.
+
+## How a machine is chosen: proximity
+
+Latency between the peers doing the work is the thing that decides whether
+splitting a model across machines is worth doing at all, so it is measured
+directly rather than assumed.
+
+Every daemon probes a small sample of peers outbound and fits a **Vivaldi
+network coordinate** from the round trips it sees (`hocmesh-core/src/proximity.rs`).
+A coordinate is a position in a low-dimensional space plus a confidence, both
+refined by every measurement, so the predicted round trip between any two peers
+is a distance calculation and needs no probe between that specific pair.
+
+The coordinator uses those coordinates to rank workers by their distance **to
+the requester**, not to itself (`scoring_latency_ms`), and falls back to
+observed coordinator latency only for a peer that has no plausible coordinate
+yet. Probing outward needs no inbound port, which is what makes this work behind
+home NAT; answering other peers' probes does, so it stays opt-in behind
+`--probe-listen`.
+
+## Not all hardware is equal — where that is handled
+
+It is handled in **who gets picked**, not in what a job pays. Those are two
+different questions, and conflating them is what makes a compute market
+game-able.
+
+**What a job pays is a property of the job.** One mCU buys
+`REFERENCE_OPS_PER_MCU` = 8,192 multiply-adds, and `work_cost_mcu` derives the
+price from the spec, never from a measurement of the machine that ran it
+(`hocmesh-core/src/compute.rs`). So a fast machine and a slow machine earn
+*exactly the same CU* for the same shard — the fast one simply earns it sooner,
+and therefore earns more CU per hour. That is the correct incentive, and it is
+also what makes the price independently checkable: if payment depended on
+self-reported speed, every node would have a reason to lie and no validator
+could catch it.
+
+**Which machine gets the work is where hardware quality lives.**
+`hocmesh_ai::rank_candidates` scores every eligible device, lowest wins:
+
+```text
+score = network_latency_ms          proximity to the requester
+      + transfer_ms                 model bytes it still has to fetch / bandwidth
+      + load_fraction x 1000        how busy it already is
+      + recent_failures x 500       reliability penalty
+      - locality x 100              credit for already holding the weights
+      - memory_headroom_GiB         credit for spare device memory
+```
+
+So a big, idle, well-connected GPU that already has the model cached beats a
+small busy one — it just does not get paid more per shard for being that.
+
+Two things are deliberately *not* in this score yet, and they are the honest
+gaps: no premium for scarce resources (a 48 GB card and an 8 GB card are worth
+the same per shard), and no reputation-weighted history beyond a recent-failure
+count. `hocmesh-core/src/reputation.rs` holds the slashing arithmetic for the
+second; nothing wires it into ranking.
+
+## What an account is, and where the ledger lives
+
+**An account is a keypair, not a machine.** `hocmesh init` generates an Ed25519
+identity; the node ID is derived from the public key
+(`node_id_from_public_key`), and the private key never leaves the machine — the
+coordinator and the validators only ever see signatures. It is stored at
+`<home>/identity.json`, mode `0600` on Unix, and sealed with XChaCha20-Poly1305
+under an Argon2 key when `HOCMESH_IDENTITY_PASSPHRASE` is set, so the file on
+disk is not a readable key.
+
+Because the identity is a file and not a machine fingerprint, **the balance
+follows the key.** Copy `identity.json` to a new machine and your CU comes with
+it; lose it without a backup and the CU is unreachable, because nobody can
+reissue an authority they never held. There is no account server to ask.
+
+**The ledger is replicated, not stored anywhere in particular.** It is an
+append-only hash chain, and each entry carries threshold signatures from a
+validator quorum, so a height is only real once enough independent validators
+have signed it. Any peer can mirror the whole chain and re-derive every balance
+locally — `hocmesh audit` replays it and checks that it sums to zero. Your
+balance is therefore not a row somebody could edit; it is what the chain
+implies, and you can prove it without trusting the coordinator that scheduled
+the work.
+
+This is blockchain-shaped in exactly one respect — a replicated append-only
+chain nobody can rewrite — and deliberately unlike one in every other:
+
+- CU is **never bought, sold, traded or transferred.** There is no market and
+  no wallet-to-wallet send. You earn it by serving, and you spend it on work.
+- There is no mining, no proof-of-work race, no token, and no monetary value.
+- Membership is by **vouching**, not by stake: sitting validators sign a
+  threshold vouch to admit a new one, recorded on the chain itself.
+- Every identity starts at zero. The only issuance source is a bounded
+  community account, and every ordinary transaction sums to zero.
+
+See "Why this is not a blockchain or cryptocurrency" further down for the
+argument in full.
+
+## Component map
+
+| Crate | Kind | What it owns |
+|---|---|---|
+| `hocmesh-protocol` | lib | Wire types, canonical signing and auth, node IDs, hashing |
+| `hocmesh-core` | lib | Identity, hardware discovery, CU pricing, workloads, verification, Vivaldi proximity, reputation, tensors |
+| `hocmesh-ledger` | lib | Append-only chain, transaction validation, quorum certificates, replay and audit |
+| `hocmesh-node` (`hocmesh`) | **bin** | The peer: daemon, worker pool, job submission, mirroring, membership commands |
+| `hocmesh-coordinator` | **bin** | Scheduler, capability registry, leases, settlement intents, federation, recovery |
+| `hocmesh-validator` | **bin** | Ledger replica, threshold signing, set membership, sync and repair |
+| `hocmesh-desktop` | **bin** | Tray-and-window app; supervises the daemon, never replaces it |
+| `hocmesh-model` | lib | Model manifests, GGUF metadata, content-addressed chunk catalog |
+| `hocmesh-gpu` | lib | Device discovery and CUDA / ROCm / Metal backend adapters |
+| `hocmesh-ai` | lib | Model registry, candidate ranking, pipeline/tensor/batch planning, two-stage inference settlement |
+| `hocmesh-transport` | lib | Checksum-bound tensor framing, ordered delivery, replay rejection, route failover |
+| `hocmesh-integration-tests` | tests | Whole-stack proofs: quorum under partition, desktop driving a real daemon |
+
+## Where the vision stands
+
+The end goal is that a normal laptop can run a large model by borrowing the rest
+of the machine from peers nearby. Everything around that problem is built: the
+accounting that makes lending worth doing, the proximity map that finds near
+peers, the seeding that moves weights, the planner that cuts a model into layer
+ranges, and the transport that carries activations between stages.
+
+What does not exist yet is the piece in the middle — an execution engine that
+loads a *layer range* and runs a forward pass over an activation it was handed.
+Today a stage is executed by an external llama.cpp process, which loads whole
+models, not slices. `docs/DISTRIBUTED_INFERENCE.md` states that gap precisely,
+does the bandwidth arithmetic that decides which kinds of splitting can work
+over which links, and gives the build order.
 
 ---
 
@@ -252,7 +435,7 @@ The verification script runs formatting checks, compilation, tests, and Clippy.
 
 ---
 
-# Install the participant binary for the current user
+# Install the peer for the current user
 
 Linux/macOS:
 
@@ -266,7 +449,11 @@ Windows PowerShell:
 ./scripts/install-user.ps1
 ```
 
-These scripts compile only the `hocmesh` peer binary and copy it to a per-user binary directory. Tagged GitHub releases additionally provide native Windows MSI, macOS PKG, and Linux DEB installers. To build installers locally from an existing release binary:
+These scripts compile the whole peer -- `hocmesh`, `hocmesh-coordinator` and
+`hocmesh-validator` -- and copy all three into a per-user binary directory.
+Tagged GitHub releases additionally provide native Windows MSI, macOS PKG and
+Linux DEB installers, and a desktop installer that is the same peer with a
+window. To build installers locally from an existing release build:
 
 ```bash
 ./scripts/package-linux.sh target/release/hocmesh "$(cat VERSION)" dist amd64
@@ -1082,7 +1269,7 @@ This repository intentionally documents the remaining work instead of disguising
 2. Consensus is a quorum-certified linear log, not a complete BFT view-change protocol.
 3. The coordinator is still the centralized scheduler, although accounting is independently replicated.
 4. Public TLS is expected to be provided by a reverse proxy rather than the binaries directly.
-5. CUDA, ROCm, and Metal execution delegates to an external llama.cpp-compatible process; native in-process kernels are not bundled. `runtime-install` fetches a CPU build pinned by digest, which is enough to run inference but not to accelerate it.
+5. CUDA, ROCm, and Metal execution delegates to an external llama.cpp-compatible process; native in-process kernels are not bundled. `runtime-install` fetches a CPU build pinned by digest, which is enough to run inference but not to accelerate it. No engine can execute a *layer range*, so the pipeline and tensor plans cannot yet be run end to end across peers -- `docs/DISTRIBUTED_INFERENCE.md` has the arithmetic for which splits are even viable over a network, and the build order for closing this.
 6. Work verification currently recomputes deterministic CPU work.
 7. Community issuance authorization is bounded by validator policy but does not yet require a separate governance key/proposal process.
 8. Key storage is file-based rather than OS hardware-backed.
@@ -1117,4 +1304,8 @@ When extending hocMESH, preserve these invariants:
 
 # License
 
-MIT. See `LICENSE`.
+Proprietary. All rights reserved -- see `LICENSE`. hocMESH is closed source: the
+repository is private, and neither the source nor any installer may be
+redistributed. Third-party open source components keep their own licenses; the
+full set ships with every release as a CycloneDX SBOM, and `deny.toml` is the
+policy that admits them.

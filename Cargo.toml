@@ -18,7 +18,7 @@ resolver = "2"
 [workspace.package]
 version = "0.3.0"
 edition = "2024"
-license = "MIT"
+license = "LicenseRef-hocMESH-Proprietary"
 authors = ["hocMESH Contributors"]
 rust-version = "1.97"
 

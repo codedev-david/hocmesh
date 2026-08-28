@@ -30,7 +30,7 @@
     "active": true,
     "targets": ["msi", "nsis", "deb", "appimage", "dmg", "app"],
     "publisher": "hocMESH Contributors",
-    "copyright": "Copyright (c) hocMESH Contributors. MIT licensed.",
+    "copyright": "Copyright (c) 2026 hocMESH. All rights reserved.",
     "category": "DeveloperTool",
     "shortDescription": "Share spare compute on a hocMESH network.",
     "longDescription": "hocMESH Desktop runs and supervises a hocMESH node. It shows whether the node is contributing, exactly how much of this machine is being lent, and the ledger of compute units this node has earned and spent. Nothing is bought or sold: compute units are a record of work done for other people, redeemable only for work done for you.",

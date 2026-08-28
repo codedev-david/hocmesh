@@ -10,6 +10,7 @@ Primary deliverables:
 - `docs/FULL_SYSTEM_SPEC.md` — consolidated Compute Core architecture and end-state design.
 - `docs/HOCMESH_AI.md` — implemented AI architecture, commands, and runtime boundaries.
 - `docs/ARCHITECTURE.md` — implemented and future topology.
+- `docs/DISTRIBUTED_INFERENCE.md` — the arithmetic that decides how a model can be split across a network, and the build order for the missing execution engine.
 - `docs/LEDGER.md` — replicated CU accounting design.
 - `docs/PROTOCOL.md` — signed wire behavior (current protocol v3).
 - `docs/SECURITY.md` — threat model and hardening requirements.

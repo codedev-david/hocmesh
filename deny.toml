@@ -68,8 +68,12 @@ allow = ["MPL-2.0"]
 name = "target-lexicon"
 allow = ["Apache-2.0 WITH LLVM-exception"]
 
+# The workspace's own crates are proprietary and `publish = false`. There is
+# no SPDX identifier to allow -- `LicenseRef-hocMESH-Proprietary` is a
+# LicenseRef by construction -- and this check exists to police third-party
+# dependencies, which it still does.
 [licenses.private]
-ignore = false
+ignore = true
 
 [bans]
 multiple-versions = "warn"

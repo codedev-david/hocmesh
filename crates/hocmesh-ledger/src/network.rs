@@ -150,13 +150,17 @@ impl LedgerNetwork {
         *self.set_sequence.write().expect("set sequence lock") = at;
         Ok(true)
     }
-    pub async fn head_quorum(&self) -> Result<LedgerHead> {
-        let mh = membership_hash(&self.set())?;
+    /// Every validator head that is signed by the seat that sent it.
+    ///
+    /// Signature-checked but not agreed: one of these proves what a single
+    /// validator believes, which is enough to decide to retry and never enough
+    /// to decide something settled.
+    async fn signed_heads(&self, mh: &str) -> Vec<LedgerHead> {
         // Ask every validator at once. Awaiting them one at a time made a round
         // of consensus cost N round trips instead of one, so adding validators
         // slowed the whole network down - the opposite of what it should do.
-        let heads: Vec<LedgerHead> = join_all(self.set().members.iter().map(|m| {
-            let (http, mh) = (&self.http, &mh);
+        join_all(self.set().members.iter().map(|m| {
+            let http = &self.http;
             async move {
                 let r = http
                     .get(format!("{}/v1/ledger/head", m.url.trim_end_matches('/')))
@@ -177,7 +181,37 @@ impl LedgerNetwork {
         .await
         .into_iter()
         .flatten()
-        .collect();
+        .collect()
+    }
+
+    /// Has anybody already filled this height?
+    ///
+    /// One signed head is the whole bar, deliberately. A proposer asks this
+    /// only to decide whether a round that fell short was a refusal or a lost
+    /// race, and a lost race is repaired by building on a fresh head -- which
+    /// applies nothing and re-runs the same batch, so being wrong here costs an
+    /// attempt and nothing else. Waiting for a quorum to agree instead means a
+    /// proposer that lost the race is told its batch was rejected during the
+    /// window before the winner's write is visible to enough seats.
+    async fn height_is_taken(&self, sequence: u64) -> bool {
+        let Ok(mh) = membership_hash(&self.set()) else {
+            return false;
+        };
+        Self::a_head_reached(&self.signed_heads(&mh).await, sequence)
+    }
+
+    /// Does any of these heads sit at `sequence` or beyond?
+    ///
+    /// Split out from [`LedgerNetwork::height_is_taken`] so the rule it encodes
+    /// can be tested without a validator set behind it: **one** head is the
+    /// bar, not a quorum of them.
+    fn a_head_reached(heads: &[LedgerHead], sequence: u64) -> bool {
+        heads.iter().any(|h| h.sequence >= sequence)
+    }
+
+    pub async fn head_quorum(&self) -> Result<LedgerHead> {
+        let mh = membership_hash(&self.set())?;
+        let heads = self.signed_heads(&mh).await;
         let mut counts = std::collections::HashMap::<(u64, String), usize>::new();
         for h in &heads {
             *counts
@@ -704,11 +738,7 @@ impl LedgerNetwork {
             // rather than reading it out of a refusal message. A round that
             // fell short applied nothing anywhere, so re-proposing the same
             // batch on top of the new head is safe.
-            if self
-                .head_quorum()
-                .await
-                .is_ok_and(|h| h.sequence >= sequence)
-            {
+            if self.height_is_taken(sequence).await {
                 return Ok(Attempt::Deferred(format!(
                     "height {sequence} was filled by another proposer"
                 )));
@@ -840,5 +870,59 @@ impl LedgerNetwork {
             }
         }
         bail!("no validator could provide account history")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head(sequence: u64) -> LedgerHead {
+        LedgerHead {
+            sequence,
+            entry_hash: format!("hash-{sequence}"),
+            membership_hash: "members".into(),
+        }
+    }
+
+    /// The regression this exists for: a proposer that loses a race must be
+    /// told to retry, not told its batch was refused.
+    ///
+    /// Two proposers reach for the same height; the winner's certificate lands,
+    /// and for a moment only one validator has finished writing it down. The
+    /// loser's round comes back with every seat refusing. Asking a *quorum*
+    /// whether the height is taken says no during that window, which turns a
+    /// lost race into a hard rejection and fails the caller's transaction. One
+    /// signed head is the correct bar, because the only decision it drives is
+    /// whether to try again -- and a round that fell short applied nothing.
+    #[test]
+    fn one_validator_that_has_moved_on_is_enough_to_know_the_race_was_lost() {
+        let seats = [head(2), head(1), head(1), head(1)];
+        assert!(
+            LedgerNetwork::a_head_reached(&seats, 2),
+            "a single seat already at the height means somebody filled it"
+        );
+    }
+
+    #[test]
+    fn a_height_nobody_has_reached_is_still_open() {
+        let seats = [head(1), head(1), head(1), head(1)];
+        assert!(!LedgerNetwork::a_head_reached(&seats, 2));
+    }
+
+    /// Silence is not evidence that the height is free. With no heads at all
+    /// the round falls through to the availability check below it, which defers
+    /// on the backoff rather than deciding anything.
+    #[test]
+    fn no_answers_at_all_claims_nothing() {
+        assert!(!LedgerNetwork::a_head_reached(&[], 1));
+    }
+
+    /// A seat that has run far ahead counts too: the test is "at or beyond",
+    /// not "exactly here", so a proposer that stalled for several heights still
+    /// learns to rebuild rather than to give up.
+    #[test]
+    fn a_seat_far_ahead_also_settles_the_question() {
+        assert!(LedgerNetwork::a_head_reached(&[head(9)], 3));
     }
 }
