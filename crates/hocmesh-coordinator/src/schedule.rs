@@ -59,29 +59,35 @@ pub const STARVATION_WEIGHT: f64 = 1.25;
 /// property of the constant, not of any particular candidate.
 const _: () = assert!(STARVATION_WEIGHT > 1.0);
 
-/// How the four axes are combined. They sum to 1.
+/// How the five axes are combined. They sum to 1.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Weights {
     pub hardware: f64,
     pub network: f64,
     pub reliability: f64,
     pub locality: f64,
+    pub scarcity: f64,
 }
 
 impl Default for Weights {
     fn default() -> Self {
         Self {
-            hardware: 0.25,
-            network: 0.20,
-            reliability: 0.25,
-            locality: 0.30,
+            hardware: 0.22,
+            network: 0.18,
+            reliability: 0.22,
+            locality: 0.28,
+            // Deliberately the smallest of the five. It decides between nodes
+            // that are otherwise close, and is never enough on its own to send
+            // a shard to a node that is worse on every axis that measures
+            // whether the work will actually get done.
+            scarcity: 0.10,
         }
     }
 }
 
 impl Weights {
     fn total(&self) -> f64 {
-        self.hardware + self.network + self.reliability + self.locality
+        self.hardware + self.network + self.reliability + self.locality + self.scarcity
     }
 }
 
@@ -184,6 +190,7 @@ pub struct Fit {
     pub network: f64,
     pub reliability: f64,
     pub locality: f64,
+    pub scarcity: f64,
     pub starvation: f64,
     pub total: f64,
 }
@@ -400,11 +407,13 @@ pub fn fit(
     let reliability = standing + (1.0 - standing) * (1.0 - scale.exposure(candidate));
 
     let locality = locality(worker, candidate);
+    let scarcity = scarcity(worker, candidate);
 
     let fit = (weights.hardware * hardware
         + weights.network * network
         + weights.reliability * reliability
-        + weights.locality * locality)
+        + weights.locality * locality
+        + weights.scarcity * scarcity)
         / weights.total().max(f64::MIN_POSITIVE);
 
     let waited = (now - candidate.created_at).max(0) as f64;
@@ -415,9 +424,54 @@ pub fn fit(
         network,
         reliability,
         locality,
+        scarcity,
         starvation,
         total: fit + starvation,
     })
+}
+
+/// Scarcity: prefer the smallest machine that can do the job.
+///
+/// A 48 GB card and an 8 GB card earn exactly the same for the same shard, and
+/// they have to. The reward *is* `work_cost_mcu` of the spec, and every
+/// validator recomputes it from `split_work` before signing; a coordinator that
+/// paid a premium for scarce hardware would be proposing a settlement the
+/// quorum rejects on sight. Pricing is not available as a lever and should not
+/// be.
+///
+/// So the premium lives here, in ranking, where it costs nothing to be wrong
+/// about: a shard goes to the smallest lender that can hold it, which leaves
+/// the large one free for the work that only it can take. The large machine is
+/// not paid more for being large; it is left alone until being large is the
+/// point. That is the same thing an operator wanted from a premium, arrived at
+/// without touching a number the ledger has an opinion about.
+fn scarcity(worker: &WorkerProfile, candidate: &ShardCandidate) -> f64 {
+    // What fraction of everything the operator lent this shard would use. A
+    // node with exactly enough scores 1. A node with ten times as much scores
+    // 0.1, because handing it this shard spends nine parts of something scarce
+    // on nothing at all.
+    //
+    // A shard that declares no working set is not evidence either way, and is
+    // scored as the unknown it is rather than as a perfect fit for the biggest
+    // machine on the network.
+    let memory = if candidate.memory_bytes == 0 || worker.caps.shared_memory_bytes == 0 {
+        UNKNOWN
+    } else {
+        (candidate.memory_bytes as f64 / worker.caps.shared_memory_bytes as f64).clamp(0.0, 1.0)
+    };
+
+    // An accelerator lent to work that cannot touch it. `required_manifests` is
+    // empty exactly for CPU workloads, so this is a fact about the shard rather
+    // than a guess about what the operator meant. Halved, not refused: if the
+    // GPU node is the only one asking, it should still get the work.
+    let accelerator_wasted = candidate.required_manifests.is_empty()
+        && worker.caps.shared_gpu_percent > 0
+        && !worker.caps.gpus.is_empty();
+    if accelerator_wasted {
+        memory * 0.5
+    } else {
+        memory
+    }
 }
 
 /// Cache locality: how warm this node already is for this shard.
@@ -708,6 +762,124 @@ mod tests {
         let field = [c.clone()];
         fit(w, c, &Scale::of(&field), now, None, &Weights::default())
             .expect("candidate should be schedulable")
+    }
+
+    /// The premium for scarce hardware, stated the only way the ledger allows.
+    ///
+    /// Both machines are paid the same for this shard -- they must be, the
+    /// price is recomputed by every validator from the work itself. What
+    /// changes is who is offered it: the one that has just enough, so the one
+    /// with room to spare is still free when something needs the room.
+    #[test]
+    fn a_shard_goes_to_the_smallest_machine_that_can_hold_it() {
+        let mut small = worker("small", 6_000, 5_000);
+        small.caps.shared_memory_bytes = 2 << 30;
+        let mut large = worker("large", 6_000, 5_000);
+        large.caps.shared_memory_bytes = 64 << 30;
+
+        let mut heavy = shard("heavy", 0, 1_000);
+        heavy.memory_bytes = 1 << 30;
+
+        let tight = score(&small, &heavy, 1_000);
+        let roomy = score(&large, &heavy, 1_000);
+        assert!(
+            tight.scarcity > roomy.scarcity,
+            "the tighter fit should score higher: {} vs {}",
+            tight.scarcity,
+            roomy.scarcity
+        );
+        assert!(
+            tight.total > roomy.total,
+            "two nodes identical but for headroom ranked the wrong way round"
+        );
+        // Identical on every other axis, which is what makes the comparison
+        // about scarcity rather than about anything else.
+        assert_eq!(tight.hardware, roomy.hardware);
+        assert_eq!(tight.network, roomy.network);
+        assert_eq!(tight.reliability, roomy.reliability);
+        assert_eq!(tight.locality, roomy.locality);
+    }
+
+    /// Preferring the small machine must never become excluding the large one.
+    /// If it is the only node asking, it takes the work.
+    #[test]
+    fn the_large_machine_is_still_offered_work_nobody_else_wants() {
+        let mut large = worker("large", 6_000, 5_000);
+        large.caps.shared_memory_bytes = 64 << 30;
+        let mut heavy = shard("heavy", 0, 1_000);
+        heavy.memory_bytes = 1 << 30;
+
+        let field = [heavy.clone()];
+        assert!(
+            fit(
+                &large,
+                &heavy,
+                &Scale::of(&field),
+                1_000,
+                None,
+                &Weights::default()
+            )
+            .is_ok(),
+            "having room to spare is not a reason to be refused"
+        );
+        assert_eq!(
+            best(&large, &field, 1_000, None, &Weights::default(), 1)
+                .map(|(candidate, _)| candidate.assignment_id.clone()),
+            Some("heavy".to_string())
+        );
+    }
+
+    /// An accelerator is the scarcest thing on the network, and CPU work cannot
+    /// use one. Ranking a GPU node down for work that will never touch its GPU
+    /// is the same argument as the memory one, applied to the resource where it
+    /// matters most.
+    #[test]
+    fn a_gpu_node_is_ranked_down_for_work_that_cannot_use_a_gpu() {
+        let plain = worker("plain", 6_000, 5_000);
+        let mut accelerated = worker("accelerated", 6_000, 5_000);
+        accelerated.caps.shared_gpu_percent = 100;
+        accelerated.caps.gpus = vec![hocmesh_protocol::GpuCapability {
+            stable_id: "gpu-0".into(),
+            vendor: "test".into(),
+            name: "test".into(),
+            backend: "test".into(),
+            memory_mb: Some(48 * 1024),
+            driver_version: None,
+            compute_version: None,
+            supports_fp16: true,
+            supports_bf16: false,
+            supports_int8: true,
+            benchmark_bytes_per_second: None,
+            benchmark_p95_micros: None,
+        }];
+
+        let cpu_work = shard("cpu", 0, 1_000);
+        assert!(cpu_work.required_manifests.is_empty());
+        assert!(
+            score(&plain, &cpu_work, 1_000).scarcity
+                > score(&accelerated, &cpu_work, 1_000).scarcity,
+            "an idle accelerator should not be the preferred home for CPU work"
+        );
+
+        // Work that does need the model gets no such discount: the GPU is the
+        // reason to send it there.
+        let mut model_work = shard("model", 0, 1_000);
+        model_work.required_manifests = vec!["manifest".into()];
+        assert_eq!(
+            score(&accelerated, &model_work, 1_000).scarcity,
+            score(&plain, &model_work, 1_000).scarcity
+        );
+    }
+
+    /// A shard that says nothing about its working set is not evidence that the
+    /// biggest machine on the network is a perfect fit for it.
+    #[test]
+    fn a_shard_with_no_declared_working_set_scores_scarcity_as_unknown() {
+        let mut node = worker("node", 6_000, 5_000);
+        node.caps.shared_memory_bytes = 64 << 30;
+        let mut silent = shard("silent", 0, 1_000);
+        silent.memory_bytes = 0;
+        assert_eq!(score(&node, &silent, 1_000).scarcity, UNKNOWN);
     }
 
     #[test]
