@@ -43,7 +43,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libappindicator3-dev librsvg2-dev patchelf rpm
       - name: Build release binaries
         run: cargo build --release --workspace --features ${{ matrix.features }} --locked
       - name: Assemble release folder
@@ -76,6 +76,8 @@ jobs:
         run: |
           installer=$(./scripts/package-linux.sh target/release/hocmesh "${{ github.event.inputs.version || github.ref_name }}" dist amd64 | tail -1)
           echo "INSTALLER=$installer" >> "$GITHUB_ENV"
+          rpm_installer=$(./scripts/package-linux-rpm.sh target/release/hocmesh "${{ github.event.inputs.version || github.ref_name }}" dist x86_64 | tail -1)
+          echo "RPM_INSTALLER=$rpm_installer" >> "$GITHUB_ENV"
       - name: Build macOS installer
         if: runner.os == 'macOS'
         shell: bash
@@ -129,7 +131,8 @@ jobs:
         run: |
           $desktop = Get-ChildItem dist -Filter 'hocmesh-desktop*' -File | ForEach-Object { $_.FullName }
           if (-not $desktop) { throw "no desktop installer was produced" }
-          foreach ($artifact in @($env:ARCHIVE, $env:INSTALLER) + $desktop) {
+          $headless = @($env:ARCHIVE, $env:INSTALLER, $env:RPM_INSTALLER) | Where-Object { $_ }
+          foreach ($artifact in $headless + $desktop) {
             $hash = Get-FileHash -Algorithm SHA256 $artifact
             "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $artifact)" | Out-File -Encoding ascii "$artifact.sha256"
           }
@@ -155,6 +158,9 @@ jobs:
             ${{ env.INSTALLER }}
             ${{ env.INSTALLER }}.sha256
             ${{ env.INSTALLER }}.sha256.asc
+            dist/hocmesh-*.rpm
+            dist/hocmesh-*.rpm.sha256
+            dist/hocmesh-*.rpm.sha256.asc
             dist/hocmesh-desktop*
           if-no-files-found: error
 
@@ -192,4 +198,4 @@ jobs:
           draft: true
           prerelease: true
           files: |
-            artifacts/**/*.{zip,tar.gz,msi,exe,pkg,deb,dmg,AppImage,sha256,asc}
+            artifacts/**/*.{zip,tar.gz,msi,exe,pkg,deb,rpm,dmg,AppImage,sha256,asc}

@@ -1,0 +1,46 @@
+# The headless peer, for the machines this network is actually made of: servers
+# with no display. The .deb built from packaging/linux/control.in carries
+# exactly the same three binaries; this is the same package for the RPM half of
+# the world.
+
+# The binaries are already built and stripped by the release job. Letting rpm
+# build a -debuginfo subpackage from them fails on anything it cannot find
+# sources for, and there are no sources here to find.
+%global debug_package %{nil}
+%global _build_id_links none
+# Nothing here is a shared library and nothing here is linked against by
+# anything else, so the automatic dependency scanner has only wrong answers to
+# give: it would make the package depend on whatever the build machine's libc
+# happened to be called.
+%global __requires_exclude_from ^/usr/bin/.*$
+%global __provides_exclude_from ^/usr/bin/.*$
+
+Name:           hocmesh
+Version:        @VERSION@
+Release:        1%{?dist}
+Summary:        hocMESH distributed AI compute peer
+License:        Proprietary
+URL:            https://github.com/codedev-david/hocmesh
+BuildArch:      @ARCHITECTURE@
+
+# The desktop package installs the same three binaries to the same paths, so
+# rpm has to be told they are two versions of one thing. Without this,
+# installing the second one fails on a file conflict instead of replacing the
+# first. `Obsoletes` is what Debian spells `Replaces`.
+Conflicts:      hoc-mesh-desktop
+Obsoletes:      hoc-mesh-desktop
+
+%description
+A whole hocMESH peer for a machine with no screen: node, coordinator and
+validator. It serves -- lending CPU, memory and GPU to other people's work --
+and it spends what that earns on work of its own. Install hoc-mesh-desktop
+instead on a machine with a display; it is the same peer with a window.
+
+%files
+%license /usr/share/doc/hocmesh/LICENSE
+%doc /usr/share/doc/hocmesh/README.md
+/usr/bin/hocmesh
+/usr/bin/hocmesh-coordinator
+/usr/bin/hocmesh-validator
+
+%changelog

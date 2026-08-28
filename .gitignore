@@ -15,3 +15,12 @@ validators.json
 crates/hocmesh-desktop/binaries/
 # Written by tauri-build from capabilities/, regenerated every build.
 crates/hocmesh-desktop/gen/
+
+# Built or downloaded packages. `scripts/package-linux-*.sh` write into dist/,
+# but a package fetched by hand to test the tooling lands here and must not be
+# committed with the source.
+*.deb
+*.rpm
+*.msi
+*.pkg
+*.AppImage

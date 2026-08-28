@@ -227,6 +227,17 @@ jobs:
         if: matrix.kind == 'deb'
         shell: bash
         run: ./scripts/package-linux.sh target/release/hocmesh "$(cat VERSION)" dist amd64
+      # rpmbuild is not on the image, and neither is cpio, which is what
+      # unpacks the result below.
+      - name: Install RPM tooling
+        if: matrix.kind == 'deb'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm cpio
+      - name: Build and validate RPM
+        if: matrix.kind == 'deb'
+        shell: bash
+        run: ./scripts/package-linux-rpm.sh target/release/hocmesh "$(cat VERSION)" dist x86_64
       - name: Build and validate PKG
         if: matrix.kind == 'pkg'
         shell: bash
@@ -242,6 +253,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/hocmesh-deb"
           dpkg-deb --extract dist/*.deb "$RUNNER_TEMP/hocmesh-deb"
           "$RUNNER_TEMP/hocmesh-deb/usr/bin/hocmesh" --version
+      - name: Execute peer extracted from RPM
+        if: matrix.kind == 'deb'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/hocmesh-rpm"
+          (cd "$RUNNER_TEMP/hocmesh-rpm" && rpm2cpio "$GITHUB_WORKSPACE"/dist/*.rpm | cpio -idm)
+          "$RUNNER_TEMP/hocmesh-rpm/usr/bin/hocmesh" --version
       - name: Execute peer extracted from PKG
         if: matrix.kind == 'pkg'
         shell: bash
@@ -300,7 +318,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libappindicator3-dev librsvg2-dev patchelf rpm
       # The whole peer the app drives, shipped inside the same installer: node,
       # coordinator and validator. Built here so the window and the daemons it
       # starts come from one build. Not `--workspace`, which would rebuild the

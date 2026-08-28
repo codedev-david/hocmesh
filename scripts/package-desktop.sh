@@ -136,6 +136,7 @@ case "$(uname -s)" in
       *) arch=x86_64; debian_arch=amd64 ;;
     esac
     deb=$(copy_bundle deb "*.deb" "hocmesh-desktop_${version}_${debian_arch}.deb")
+    rpm=$(copy_bundle rpm "*.rpm" "hocmesh-desktop-$version-$arch.rpm")
     appimage=$(copy_bundle appimage "*.AppImage" "hocmesh-desktop-$version-$arch.AppImage")
 
     # An installer that lays down the window without the daemon would install
@@ -215,6 +216,39 @@ case "$(uname -s)" in
       }
     done
 
+    # The same check the .deb gets, because a Fedora or SUSE user installing a
+    # window with no daemon behind it has exactly the same broken install as a
+    # Debian one, and the bundler builds the two packages from separate code
+    # paths.
+    #
+    # `rpm` is not installed by default on Debian-family machines, so this says
+    # so rather than skipping: a package nobody looked inside is not a package
+    # anybody should be handed.
+    command -v rpm >/dev/null 2>&1 || {
+      echo "rpm is not installed, so $rpm cannot be verified; install the rpm package" >&2
+      exit 1
+    }
+    rpm_contents=$(rpm -qlp "$rpm" 2>/dev/null)
+    for expected in hocmesh hocmesh-coordinator hocmesh-validator hocmesh-desktop; do
+      grep -qE "/$expected\$" <<<"$rpm_contents" || {
+        echo "$expected is absent from $rpm" >&2
+        exit 1
+      }
+    done
+
+    # RPM spells the relationship differently from Debian: `Obsoletes` is what
+    # `Replaces` is called here, and without it installing this package
+    # alongside the headless one fails on a file conflict instead of upgrading.
+    rpm_provides=$(rpm -qp --provides "$rpm" 2>/dev/null)
+    grep -qE '(^|[[:space:]])hocmesh([[:space:]]|$)' <<<"$rpm_provides" || {
+      echo "$rpm does not provide hocmesh, so it cannot stand in for the headless package" >&2
+      exit 1
+    }
+    rpm -qp --obsoletes "$rpm" 2>/dev/null | grep -qE '(^|[[:space:]])hocmesh([[:space:]]|$)' || {
+      echo "$rpm does not obsolete hocmesh; installing it beside the headless package would fail on a file conflict" >&2
+      exit 1
+    }
+
     # The headless package names this one in Conflicts and Replaces, and has
     # to name it exactly. The bundler derives the package name from
     # productName with heck's kebab-case, so "hocMESH Desktop" becomes
@@ -240,7 +274,7 @@ case "$(uname -s)" in
       found=$(find "$appimage_stage/squashfs-root" -type f -name "$expected" -print -quit)
       [[ -n "$found" ]] || { echo "$expected is absent from $appimage" >&2; exit 1; }
     done
-    artifacts=("$deb" "$appimage")
+    artifacts=("$deb" "$rpm" "$appimage")
     ;;
   *)
     echo "unsupported platform: use scripts/package-desktop.ps1 on Windows" >&2
