@@ -299,6 +299,30 @@ coming: a tensor shard answers in a matrix, which is `RevealRequired`, and it
 would otherwise have walked straight into the issuance path the day it landed.
 The match in `audit_class` is exhaustive, so it cannot be added silently.
 
+## Verifying under load
+
+Everything above is about whether one answer is honest. A separate question is
+whether the accounting survives many answers arriving at once, and it needs a
+different instrument, because the failures it catches are races rather than
+lies.
+
+`hocmesh loadtest` submits concurrent jobs and then checks three things against
+the ledger the run just wrote:
+
+- every CU the coordinator reserved is a CU the account records as spent;
+- the account's own three figures agree — `balance_delta == earned - spent`;
+- ledger height never went backwards.
+
+It reports latency too, but latency is not part of the verdict. A run that is
+fast and loses a CU fails; a run that is slow does not, because a timing
+threshold on a shared runner produces red that nobody believes.
+
+`scripts/loadtest-local.sh` (and its `.ps1` peer) wraps that in a whole local
+network and finishes with `ledger-sync`, which re-verifies every entry from
+genesis against the validator set that was sitting at the time. The two claims
+are different and both worth making: the load test says the coordinator's
+arithmetic held, the audit says the quorum's did.
+
 ## Reproducing the numbers
 
     cargo run --release -p hocmesh-core --example verification_proof

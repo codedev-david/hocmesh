@@ -1223,7 +1223,64 @@ On Unix, the implementation attempts to set the file to mode `0600`.
 
 The private key never needs to be sent to the coordinator or validators.
 
-Back up this identity if you want to retain access to the CU associated with that node identity.
+## Your account is the key, not the machine
+
+Nothing about an account is tied to the hardware it was created on. The balance
+is not stored on your disk at all — it is what the ledger implies for your
+public key, so a new laptop is a copied key rather than a support request. There
+is nobody to ask: no part of the network ever held your private key, so no part
+of it can reissue one.
+
+That cuts both ways, and it is the reason these commands exist rather than an
+instruction to copy `identity.json` by hand. Lose the key with no backup and the
+CU behind it are unreachable forever.
+
+```bash
+hocmesh identity show                              # which account is this machine?
+export HOCMESH_IDENTITY_EXPORT_PASSPHRASE='...'    # a backup is always sealed
+hocmesh identity export --out ~/hocmesh-account.json
+hocmesh identity inspect --from ~/hocmesh-account.json   # whose is it? no passphrase needed
+```
+
+On the new machine:
+
+```bash
+export HOCMESH_IDENTITY_EXPORT_PASSPHRASE='...'
+hocmesh identity import --from ~/hocmesh-account.json
+hocmesh balance          # the same number the old machine read
+```
+
+Four properties are worth knowing, because each one exists to prevent a mistake
+that cannot be undone afterwards:
+
+- **A backup is always encrypted**, XChaCha20-Poly1305 under an Argon2id key,
+  even when the node it came from stores its own key unsealed. The copy people
+  actually make ends up in cloud sync or a chat message, and it should be inert
+  when it gets there.
+- **The account id and public key ride in the clear**, so `identity inspect`
+  can tell you whose account a file holds *before* you type a passphrase into
+  it. A backup whose header disagrees with the key inside it is refused
+  outright — otherwise that readable header would be attacker-controlled text.
+- **Importing over a different account requires `--force`**, because the key it
+  would overwrite may be the only copy of an account with a balance on it. So
+  does importing over an identity that cannot be opened: a key nobody can read
+  is still a key, and guessing what it was worth is not a safe default.
+- **A displaced key is renamed, never deleted** — it lands beside the new one as
+  `identity.json.replaced-<timestamp>`.
+
+Restoring the account that is already on the machine is a no-op, so "did my
+backup actually work?" is a safe question to ask.
+
+Two things this deliberately does **not** do. It does not bind the account to
+the machine — hardware binding would trade a recoverable loss for an
+unrecoverable one, and it would protect nothing, because the ledger's safety
+comes from signatures and quorum rather than from where a key is sitting. And it
+does not let anyone else recover the key for you, which is the same property
+read from the other side.
+
+Do not run two machines on one key at once. Nothing corrupts — every entry is
+still signed and still has to pass the same validation — but the two nodes
+compete for the same assignments and one of them loses each race.
 
 For a production peer, the next security step should be OS-native secure key storage:
 
@@ -1337,6 +1394,73 @@ partitioned, or a coordinator that lies about scheduling rather than about
 payment, is still untested. So is any of it on more than one machine.
 
 ---
+
+# Artificial load, locally and in CI
+
+Every genuinely hard bug this ledger has had was a race: a stale head read, a
+winner whose entry landed before its signed head was readable, a proposer
+refused by its own committed work. None of them are reachable by one person
+clicking through a demo, and all of them are reachable by a dozen jobs landing
+at once. So load generation is a shipped command rather than a benchmark script
+kept off to the side.
+
+```bash
+hocmesh loadtest --jobs 24 --concurrency 8 --shards 4
+hocmesh loadtest --duration-secs 60 --workload matrix --size 512
+hocmesh loadtest --jobs 40 --dry-run        # what will this cost, before spending it
+```
+
+A run reports the two things you would expect — submit latency, which is the
+ledger's *write* latency under concurrency, and settle latency from submit to
+last shard — and then does the part that makes it a test rather than a
+benchmark. It audits the economy it just stressed:
+
+```text
+Economy
+  reserved by submits : 6.288 CU
+  account recorded    : 6.288 CU spent
+  earned during run   : 0.000 CU
+  balance moved       : -6.288 CU
+  ledger height       : 65 -> 170 (+105)
+  CU conserved        : yes
+```
+
+Every CU the coordinator said it reserved has to be a CU the account records as
+spent, the account's own three numbers have to agree with each other afterwards,
+and the ledger must not have gone backwards. **A run that is fast and loses a CU
+fails.** A run that is slow does not: the exit status never depends on a latency
+threshold, because a latency threshold on a shared CI runner is a flaky test, and
+a flaky test teaches people to ignore red.
+
+`--dry-run` prices a plan through the same function the ledger will charge with,
+which is what lets a script wait for exactly enough CU rather than guessing at a
+sleep.
+
+## A whole network on one machine
+
+`hocmesh loadtest` needs a network to point at. These scripts build one —
+a four-validator quorum at threshold three, a coordinator, and worker nodes —
+mint community work so the requester can earn what the run will cost, apply the
+load, and then audit the ledger from genesis:
+
+```bash
+./scripts/loadtest-local.sh                                   # ~1 minute
+./scripts/loadtest-local.sh --jobs 40 --concurrency 10 --shards 8
+./scripts/loadtest-local.sh --keep                            # leave it up to poke at
+```
+
+```powershell
+./scripts/loadtest-local.ps1 -Jobs 40 -Concurrency 10 -Shards 8
+```
+
+The final audit is the stronger claim of the two. The load test passing means
+the coordinator's arithmetic held; `ledger-sync` re-verifying every entry from
+genesis, against the validator set that was sitting at the time, means the
+quorum's did.
+
+CI runs the same script on every push (the `loadtest` job) and keeps the JSON
+report and every process log as artifacts, including — especially — when the run
+fails.
 
 # Current workloads
 

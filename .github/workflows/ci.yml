@@ -132,6 +132,40 @@ jobs:
           path: target/hocmesh-coverage.lcov
           if-no-files-found: error
 
+  loadtest:
+    # The unit and integration suites prove each piece behaves; this proves the
+    # pieces still behave when they are all busy at once. Every hard bug this
+    # ledger has had was a race, and a race needs contention -- a whole network
+    # under simultaneous load is the only place it shows up.
+    #
+    # It fails on unsettled work, on CU that do not add up, or on a ledger that
+    # will not re-audit from genesis. It deliberately does not fail on being
+    # slow: a latency threshold on a shared CI runner is a flaky test, and a
+    # flaky test teaches people to ignore red.
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the three binaries a network needs
+        run: cargo build --release --locked -p hocmesh -p hocmesh-coordinator -p hocmesh-validator
+      - name: Load test a whole local network
+        run: ./scripts/loadtest-local.sh --skip-build --jobs 24 --concurrency 8 --shards 4 --json target/loadtest-report.json
+      - name: Upload the report
+        # Kept even when the run failed: the report is the evidence, and a
+        # failure is exactly when someone wants to read it.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hocmesh-loadtest-report
+          path: |
+            target/loadtest-report.json
+            target/loadtest/*.log
+          if-no-files-found: warn
+
   gpu-backend-contracts:
     strategy:
       matrix:

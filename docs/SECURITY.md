@@ -312,6 +312,46 @@ escape: a backup, a synced folder, a copied disk, a repository someone committed
 their working directory to. If a validator key does leak, the answer is now
 eviction - see *Validator set membership* above.
 
+### Moving an account, and why it is not bound to a machine
+
+The signing key *is* the account. The balance is not stored on the owner's disk;
+it is what the ledger implies for that public key. So a lost key is a lost
+account permanently — no part of the network ever held a copy, which is exactly
+why no part of it can reissue one.
+
+`hocmesh identity export` writes that key as a sealed backup and
+`hocmesh identity import` adopts it on another machine. The design decisions
+worth recording:
+
+- **Backups are always sealed**, independent of `HOCMESH_IDENTITY_PASSPHRASE`
+  and of whether the node stores its own key in the clear.
+  `HOCMESH_IDENTITY_EXPORT_PASSPHRASE` supplies the backup's passphrase and
+  falls back to the node's. The threat is not a targeted attacker with disk
+  access — that is the previous section's problem — it is that a *travelling*
+  copy ends up in cloud sync, a chat message, or a drawer, and it should be
+  inert when it gets there.
+- **The header is plaintext and therefore untrusted.** `node_id` and
+  `public_key_b64` are readable so `identity inspect` can identify a backup
+  before anyone types a passphrase into it, and an import recomputes both from
+  the sealed key and refuses any file where they disagree. Otherwise the check
+  would be answering with attacker-supplied text.
+- **Destructive imports are gated and reversible.** Replacing a different
+  account requires `--force`; so does replacing an identity that cannot be
+  opened, because an unreadable key is still a key and guessing its value is not
+  a safe default. Under `--force` the displaced file is renamed to
+  `identity.json.replaced-<unix>`, never unlinked.
+
+**Machine binding was rejected.** Deriving or sealing the key from hardware
+identifiers would convert a recoverable loss (a lost backup) into an
+unrecoverable one (a dead motherboard), and it would protect nothing the ledger
+depends on: no entry is trusted because of where its key was sitting, only
+because of the signature on it and the quorum that certified it. The same
+reasoning rules out escrowed recovery — anything that can restore an account for
+its owner can restore it for someone else.
+
+The residual risk is the honest one: an owner who loses both the backup and the
+passphrase has lost the CU. That is stated in the CLI output rather than hidden.
+
 ## Data privacy
 
 Transport encryption does not make provider-visible workload data magically private from the provider executing it.

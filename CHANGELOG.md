@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### An account can move to a new machine
+
+Nothing about an account was ever tied to the hardware it was made on — the
+balance is what the ledger implies for a public key, not a row on your disk —
+but until now the only way to act on that was to copy `identity.json` by hand
+and hope. `hocmesh identity show | export | import | inspect` makes it a
+supported operation.
+
+- A backup is **always** sealed (XChaCha20-Poly1305 under Argon2id), even when
+  the node it came from stores its own key unsealed, because the copy people
+  actually make ends up in cloud sync or a chat message.
+- The account id and public key stay readable, so `identity inspect` answers
+  "whose account is this?" without a passphrase — and a backup whose header
+  disagrees with the key inside it is refused, so that readable header can never
+  become attacker-controlled text you trusted.
+- Importing over a *different* account needs `--force`, and so does importing
+  over an identity that will not open. Under `--force` the displaced key is
+  renamed to `identity.json.replaced-<timestamp>`, never deleted.
+- Restoring the account already on the machine is a no-op, so "did my backup
+  work?" is a safe question.
+- `hocmesh identity …` dispatches **before** an identity can be created, so
+  asking about an account no longer mints one as a side effect.
+- Machine binding was considered and rejected: it would trade a recoverable loss
+  for an unrecoverable one and protect nothing, because the ledger's safety is
+  signatures and quorum, not the location of a key.
+
+### Artificial load is a shipped command
+
+Every hard bug this ledger has had was a race, and a race needs contention that
+a single developer machine never produces by hand.
+
+- `hocmesh loadtest` submits concurrent jobs and then **audits the economy it
+  just stressed**: reserved CU must equal recorded spend, the account's banked,
+  earned and consumed figures must agree, and ledger height must not go
+  backwards. It fails on unsettled work or CU that do not add up — never on
+  being slow, because a latency threshold on shared CI is a flaky test.
+- `--dry-run` prices a plan through the same function the ledger charges with,
+  so a harness can wait for exactly enough CU instead of guessing at a sleep.
+- `scripts/loadtest-local.sh` and `scripts/loadtest-local.ps1` stand up a whole
+  network — four validators at threshold three, a coordinator, worker nodes —
+  mint the community work that funds the run, apply the load, and finish by
+  re-auditing the ledger from genesis.
+- CI runs it on every push and keeps the JSON report and process logs as
+  artifacts, including when the run fails.
+
 ## v0.4.0 — one install, one peer
 
 ### There is no client and no server

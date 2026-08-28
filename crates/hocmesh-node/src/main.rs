@@ -1,10 +1,18 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use hocmesh::client::HocMeshClient;
-use hocmesh::{control, daemon, install};
+use hocmesh::loadtest::{LoadPlan, Workload};
+use hocmesh::{control, daemon, install, loadtest};
 use hocmesh_ai::{InferenceRequirements, PlanRequest, SubmitInferenceRequest};
 use hocmesh_core::compute::{split_work, work_cost_mcu};
-use hocmesh_core::{hardware, identity::NodeIdentity, limits::ResourceLimits, proximity::Vivaldi};
+use hocmesh_core::{
+    hardware,
+    identity::{
+        self, IDENTITY_EXPORT_PASSPHRASE_ENV, IDENTITY_PASSPHRASE_ENV, NodeIdentity, identity_path,
+    },
+    limits::ResourceLimits,
+    proximity::Vivaldi,
+};
 use hocmesh_gpu::{InferenceBackend, InferenceRequest, LlamaCppBackend};
 use hocmesh_ledger::{
     network::LedgerNetwork,
@@ -27,6 +35,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -298,6 +307,56 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         shards: u32,
     },
+    /// Put artificial load on a coordinator, then check the economy survived it.
+    ///
+    /// Reports latency and throughput like any load test, and then does the
+    /// part that makes it worth shipping: it re-adds the CU. Exit status is
+    /// about whether the work settled and the numbers agree, never about how
+    /// fast the machine happened to be.
+    Loadtest {
+        /// Jobs to submit. `0` runs until `--duration-secs` instead.
+        #[arg(long, default_value_t = 20)]
+        jobs: u64,
+        /// Jobs in flight at once. This is the contention knob.
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+        /// Shards per job.
+        #[arg(long, default_value_t = 4)]
+        shards: u32,
+        #[arg(long, value_enum, default_value_t = Workload::Collatz)]
+        workload: Workload,
+        /// Range width per job, or matrix dimension for `--workload matrix`.
+        #[arg(long, default_value_t = 200_000)]
+        size: u64,
+        /// Stop submitting after this long, whatever `--jobs` says.
+        #[arg(long)]
+        duration_secs: Option<u64>,
+        /// How long one job may take before it counts as a timeout.
+        #[arg(long, default_value_t = 120)]
+        timeout_secs: u64,
+        #[arg(long, default_value_t = 250)]
+        poll_ms: u64,
+        /// Also write the whole report here as JSON, for a pipeline to keep.
+        #[arg(long)]
+        json: Option<PathBuf>,
+        /// Print what this run would cost and submit nothing.
+        ///
+        /// The price is deterministic and knowable up front, so a script can
+        /// wait until the account can afford the run instead of finding out
+        /// halfway through that it is broke -- which would look exactly like
+        /// the settlement failure this command exists to detect.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Back up, move, or look at the keypair this account *is*.
+    ///
+    /// Nothing about an account is tied to the machine it was made on. The
+    /// balance follows the key, so a new laptop is a copied key and not a
+    /// support request -- there is nobody to ask, because nobody ever held it.
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
     /// Take back the escrow on shards of your job that nobody ever delivered.
     Reclaim {
         job_id: String,
@@ -451,9 +510,16 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    // Taken out before `load_or_create`, on purpose: these are the commands you
+    // reach for when the key on this machine is the thing in question, and
+    // minting one as a side effect of asking about it is the wrong answer.
+    let command = match cli.command {
+        Command::Identity { action } => return run_identity(&cli.home, &action),
+        other => other,
+    };
     let identity = NodeIdentity::load_or_create(&cli.home)?;
     let client = HocMeshClient::new(cli.coordinator, identity.clone());
-    match cli.command {
+    match command {
         Command::Init => {
             let mut caps = hardware::detect_capabilities(true);
             // Register with the same share the daemon will advertise, so an
@@ -1543,6 +1609,66 @@ stored at: {}",
                 cert.entry.sequence, cert.entry.entry_hash
             );
         }
+        Command::Loadtest {
+            jobs,
+            concurrency,
+            shards,
+            workload,
+            size,
+            duration_secs,
+            timeout_secs,
+            poll_ms,
+            json,
+            dry_run,
+        } => {
+            let plan = LoadPlan {
+                jobs,
+                concurrency,
+                shards,
+                workload,
+                size,
+                duration: duration_secs.map(Duration::from_secs),
+                timeout: Duration::from_secs(timeout_secs),
+                poll: Duration::from_millis(poll_ms),
+            };
+            if dry_run {
+                plan.validate()?;
+                // One machine-readable line, because the caller most likely to
+                // want this is a shell script deciding whether to wait.
+                println!("total_mcu={}", plan.cost_mcu());
+                println!("per_job_mcu={}", plan.job_cost_mcu(0));
+                println!(
+                    "{} jobs x {} shards of {:?}, size {} -> {:.3} CU",
+                    plan.jobs,
+                    plan.shards,
+                    plan.workload,
+                    plan.size,
+                    plan.cost_mcu() as f64 / 1000.0
+                );
+                return Ok(());
+            }
+            let report = loadtest::run(&client, plan).await?;
+            report.print();
+            if let Some(path) = &json {
+                std::fs::write(path, serde_json::to_string_pretty(&report)?)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                println!(
+                    "
+Wrote {}",
+                    path.display()
+                );
+            }
+            // Printed first, then failed: a pipeline that only keeps the exit
+            // code still gets the numbers in its log.
+            if !report.passed() {
+                bail!("load test failed")
+            }
+        }
+        // Taken out above, before an identity could be created. Left here doing
+        // the real work rather than panicking, so that if that dispatch is ever
+        // dropped these commands still behave -- they just lose the guarantee
+        // that looking at an account cannot bring one into existence.
+        Command::Identity { action } => run_identity(&cli.home, &action)?,
     }
     Ok(())
 }
@@ -1704,6 +1830,152 @@ fn load_set(path: &str) -> Result<ValidatorSet> {
 /// node falls back to "offer it when a GPU is lent", which is what every node
 /// did before there was a flag. Keeping it distinct is what lets an upgrade
 /// leave existing machines exactly where they were.
+/// The passphrase sealing this machine's own key, if there is one.
+fn node_passphrase() -> Option<String> {
+    std::env::var(IDENTITY_PASSPHRASE_ENV)
+        .ok()
+        .filter(|p| !p.is_empty())
+}
+
+/// The passphrase for a backup file.
+///
+/// Falls back to the node's own, so one passphrase is enough for anyone who
+/// wants it to be, while still letting an operator run a node unsealed on a
+/// machine only they can reach and refuse to let that key travel in the clear.
+fn backup_passphrase() -> Option<String> {
+    std::env::var(IDENTITY_EXPORT_PASSPHRASE_ENV)
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(node_passphrase)
+}
+
+fn open_this_machine(home: &Path) -> Result<NodeIdentity> {
+    let local = node_passphrase();
+    NodeIdentity::load_existing(home, local.as_deref())?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no account in {} yet -- run `hocmesh init`, or `hocmesh identity import` to \
+             bring an existing one here",
+            home.display()
+        )
+    })
+}
+
+fn run_identity(home: &Path, action: &IdentityAction) -> Result<()> {
+    match action {
+        IdentityAction::Show => {
+            let path = identity_path(home);
+            match NodeIdentity::load_existing(home, node_passphrase().as_deref()) {
+                Ok(Some(id)) => {
+                    let sealed = std::fs::read_to_string(&path)
+                        .map(|r| !r.contains("secret_key_b64"))
+                        .unwrap_or(false);
+                    println!(
+                        "Account: {}\nPublic key: {}\nKey file: {}\nAt rest: {}",
+                        id.node_id(),
+                        id.public_key_b64(),
+                        path.display(),
+                        if sealed {
+                            "sealed with a passphrase".to_string()
+                        } else {
+                            format!("stored unsealed -- set {IDENTITY_PASSPHRASE_ENV} to seal it")
+                        }
+                    );
+                    println!(
+                        "\nThis key is the account. Your balance follows it, not this machine,\n\
+                         and no part of the network holds a copy: back it up with\n\
+                         `hocmesh identity export --out <file>`."
+                    );
+                }
+                Ok(None) => println!(
+                    "No account in {} yet. One is created the first time this node runs,\n\
+                     or `hocmesh identity import --from <file>` brings an existing one here.",
+                    home.display()
+                ),
+                Err(e) => return Err(e),
+            }
+        }
+        IdentityAction::Export { out, force } => {
+            let Some(pass) = backup_passphrase() else {
+                anyhow::bail!(
+                    "a backup is always encrypted; set {IDENTITY_EXPORT_PASSPHRASE_ENV} (or \
+                     {IDENTITY_PASSPHRASE_ENV}) to the passphrase that should seal it"
+                )
+            };
+            let id = open_this_machine(home)?;
+            identity::write_backup(out, &id.export_backup(&pass)?, *force)?;
+            println!(
+                "Wrote a sealed backup of {} to {}.\n\n\
+                 Keep it somewhere you will still have after this machine is gone, and keep\n\
+                 the passphrase somewhere else. Losing both loses the account: there is no\n\
+                 reset, because nobody but you ever had the key.",
+                id.node_id(),
+                out.display()
+            );
+        }
+        IdentityAction::Import { from, force } => {
+            let Some(pass) = backup_passphrase() else {
+                anyhow::bail!(
+                    "set {IDENTITY_EXPORT_PASSPHRASE_ENV} (or {IDENTITY_PASSPHRASE_ENV}) to \
+                     the passphrase this backup was sealed with"
+                )
+            };
+            let backup = identity::read_backup(from)?;
+            let local = node_passphrase();
+            let id = identity::import_backup(home, &backup, &pass, local.as_deref(), *force)?;
+            println!(
+                "This machine now signs as {}.\nKey file: {}",
+                id.node_id(),
+                identity_path(home).display()
+            );
+            println!(
+                "\nThe balance was never stored here -- it is what the ledger implies for this\n\
+                 account, so `hocmesh balance` reads the same number it read on the old machine.\n\
+                 Do not run both machines on this key at once."
+            );
+        }
+        IdentityAction::Inspect { from } => {
+            let b = identity::read_backup(from)?;
+            println!(
+                "Backup of: {}\nPublic key: {}\nFormat: {} v{}\nCreated: {}\nSealed: yes",
+                b.node_id, b.public_key_b64, b.format, b.version, b.created_at
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityAction {
+    /// Show which account this machine signs as, and where the key lives.
+    Show,
+    /// Write a sealed copy of this account that another machine can adopt.
+    ///
+    /// Always encrypted, so it can be kept somewhere a raw key should never go.
+    Export {
+        /// Where to write the backup.
+        #[arg(long)]
+        out: PathBuf,
+        /// Replace a backup file that is already there.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Adopt an exported account on this machine.
+    Import {
+        /// The backup to restore.
+        #[arg(long)]
+        from: PathBuf,
+        /// Replace the account already on this machine. The key it displaces is
+        /// renamed, never deleted.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Say whose account a backup holds, without opening it.
+    Inspect {
+        #[arg(long)]
+        from: PathBuf,
+    },
+}
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum AiSharing {
     On,
