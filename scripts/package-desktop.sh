@@ -2,11 +2,17 @@
 set -euo pipefail
 
 # Builds the desktop installers -- a .dmg on macOS, a .deb and an .AppImage on
-# Linux -- each carrying the window *and* the node it supervises.
+# Linux -- each carrying a whole hocMESH peer: the node, the coordinator, the
+# validator, and the window that drives them.
 #
-# The node is passed in rather than built here so that the app and the daemon
-# it will start always come from one build, the same rule package-linux.sh
-# enforces for the three command line binaries.
+# There is no smaller "desktop-only" install. A hocMESH peer serves before it
+# consumes, and a machine that can join a mesh but not start or validate one is
+# a half-install that looks complete. The headless packages built by
+# package-linux.sh carry exactly the same three binaries without the window,
+# and the two replace each other rather than co-existing.
+#
+# The binaries are passed in rather than built here so that the window and the
+# daemons it drives always come from one build.
 
 if [[ $# -lt 3 || $# -gt 4 ]]; then
   echo "usage: $0 <hocmesh-binary> <version> <output-dir> [tauri-cli-version]" >&2
@@ -15,6 +21,8 @@ fi
 
 binary_dir=$(cd "$(dirname "$1")" && pwd -P)
 binary="$binary_dir/$(basename "$1")"
+coordinator="$binary_dir/hocmesh-coordinator"
+validator="$binary_dir/hocmesh-validator"
 version=${2#v}
 mkdir -p "$3"
 output_dir=$(cd "$3" && pwd -P)
@@ -23,6 +31,12 @@ repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 desktop_dir="$repository_root/crates/hocmesh-desktop"
 
 [[ -f "$binary" ]] || { echo "hocmesh binary not found: $binary" >&2; exit 1; }
+for peer in "$coordinator" "$validator"; do
+  [[ -f "$peer" ]] || {
+    echo "expected to package $peer alongside $binary; build the whole peer first" >&2
+    exit 1
+  }
+done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "installer version must be numeric major.minor.patch: $version" >&2
   exit 1
@@ -40,17 +54,20 @@ repository_version=$(tr -d '[:space:]' < "$repository_root/VERSION")
 }
 
 # Tauri names a sidecar for the triple it was built for and strips that suffix
-# when it bundles, which is what lands the node next to the app as plain
-# hocmesh-node -- the first place supervisor::candidate_paths looks.
+# when it bundles, which is what lands each binary next to the app under its
+# real name -- `hocmesh` being the first place supervisor::candidate_paths
+# looks, and the command an operator types in a terminal.
 #
-# hocmesh-node, not hocmesh: the .deb below unpacks into /usr/bin, the same
-# place the standalone client package puts its own hocmesh, and dpkg refuses
-# to let two packages own one path. Sharing the name would make the desktop
-# installer and the client installer mutually exclusive on one machine.
+# On Linux these unpack into /usr/bin, the same paths the headless package
+# claims. That is deliberate and declared: tauri.bundle.json marks this package
+# as providing, conflicting with and replacing `hocmesh`, so apt installs one
+# or the other rather than refusing both.
 host_triple=$(rustc -vV | sed -n 's/^host: //p')
 [[ -n "$host_triple" ]] || { echo "could not read the host target triple from rustc" >&2; exit 1; }
 mkdir -p "$desktop_dir/binaries"
-install -m 0755 "$binary" "$desktop_dir/binaries/hocmesh-node-$host_triple"
+install -m 0755 "$binary" "$desktop_dir/binaries/hocmesh-$host_triple"
+install -m 0755 "$coordinator" "$desktop_dir/binaries/hocmesh-coordinator-$host_triple"
+install -m 0755 "$validator" "$desktop_dir/binaries/hocmesh-validator-$host_triple"
 
 # Both of these are sent to stderr so that the only thing this script writes
 # to stdout is the artifact paths a caller wants to capture.
@@ -91,7 +108,7 @@ case "$(uname -s)" in
     dmg_mount=$(mktemp -d)
     trap 'hdiutil detach "$dmg_mount" >/dev/null 2>&1 || true; rm -rf -- "$dmg_mount"' EXIT
     hdiutil attach -nobrowse -readonly -mountpoint "$dmg_mount" "$dmg" >/dev/null
-    for expected in hocmesh-node hocmesh-desktop; do
+    for expected in hocmesh hocmesh-coordinator hocmesh-validator hocmesh-desktop; do
       # Assigned rather than piped into grep: grep -q exits on the first match,
       # which hands the producer a SIGPIPE that pipefail then reports as a
       # failure of the very check that just succeeded.
@@ -118,28 +135,32 @@ case "$(uname -s)" in
     # exits on the first match, which hands dpkg-deb a SIGPIPE that pipefail
     # then reports as a failure of the very check that just succeeded.
     deb_contents=$(dpkg-deb --contents "$deb")
-    for expected in hocmesh-node hocmesh-desktop; do
+    for expected in hocmesh hocmesh-coordinator hocmesh-validator hocmesh-desktop; do
       grep -qE "/$expected\$" <<<"$deb_contents" || {
         echo "$expected is absent from $deb" >&2
         exit 1
       }
     done
 
-    # The other half of the same rule. hocmesh_<version>_<arch>.deb already
-    # owns /usr/bin/hocmesh, and dpkg will not install a second package that
-    # claims it -- so a desktop .deb carrying that exact path would be
-    # uninstallable on any machine with the client, and vice versa. This is the
-    # check that catches a sidecar accidentally renamed back.
-    if grep -qE "/usr/bin/hocmesh\$" <<<"$deb_contents"; then
-      echo "$deb claims /usr/bin/hocmesh, which the client package owns" >&2
-      exit 1
-    fi
+    # This package and the headless one both own /usr/bin/hocmesh, and dpkg
+    # will not install a second package claiming a path the first one has
+    # unless the relationship is declared. Without these three fields apt
+    # rejects whichever is installed second with "trying to overwrite
+    # '/usr/bin/hocmesh'", so they are checked in the built artifact rather
+    # than trusted to survive a config edit.
+    deb_control=$(dpkg-deb --field "$deb")
+    for relation in Provides Conflicts Replaces; do
+      grep -qE "^$relation:.*hocmesh" <<<"$deb_control" || {
+        echo "$deb does not declare $relation: hocmesh; it would not install alongside or in place of the headless package" >&2
+        exit 1
+      }
+    done
 
     chmod +x "$appimage"
     appimage_stage=$(mktemp -d)
     trap 'rm -rf -- "$appimage_stage"' EXIT
     (cd "$appimage_stage" && "$appimage" --appimage-extract >/dev/null)
-    for expected in hocmesh-node hocmesh-desktop; do
+    for expected in hocmesh hocmesh-coordinator hocmesh-validator hocmesh-desktop; do
       found=$(find "$appimage_stage/squashfs-root" -type f -name "$expected" -print -quit)
       [[ -n "$found" ]] || { echo "$expected is absent from $appimage" >&2; exit 1; }
     done

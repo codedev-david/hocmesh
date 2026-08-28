@@ -33,7 +33,7 @@ The source package was generated in an environment that did not provide a local 
 11. Each assignment reward may settle only once.
 12. Validators persist one vote per ledger sequence before returning a signature.
 13. A quorum certificate is required before distributed-ledger state changes.
-14. Participant clients can mirror and audit the entire ledger.
+14. Every peer can mirror and audit the entire ledger.
 15. Do not add arbitrary remote shell/binary execution.
 
 ## Highest-value immediate improvements

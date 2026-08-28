@@ -1,6 +1,17 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
-    "externalBin": ["binaries/hocmesh-node"]
+    "externalBin": [
+      "binaries/hocmesh",
+      "binaries/hocmesh-coordinator",
+      "binaries/hocmesh-validator"
+    ],
+    "linux": {
+      "deb": {
+        "provides": ["hocmesh"],
+        "conflicts": ["hocmesh"],
+        "replaces": ["hocmesh"]
+      }
+    }
   }
 }

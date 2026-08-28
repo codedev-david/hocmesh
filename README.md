@@ -14,7 +14,7 @@ This repository is a Rust implementation of hocMESH Compute Core and the hocMESH
 
 This repository contains working source for three native Rust programs:
 
-- `hocmesh` — participant/client/worker CLI
+- `hocmesh` — the peer CLI: it serves hardware and it spends what that earns
 - `hocmesh-coordinator` — workload scheduler and node control plane
 - `hocmesh-validator` — replicated CU ledger validator
 
@@ -266,7 +266,7 @@ Windows PowerShell:
 ./scripts/install-user.ps1
 ```
 
-These scripts compile only the `hocmesh` participant client and copy it to a per-user binary directory. Tagged GitHub releases additionally provide native Windows MSI, macOS PKG, and Linux DEB installers. To build installers locally from an existing release binary:
+These scripts compile only the `hocmesh` peer binary and copy it to a per-user binary directory. Tagged GitHub releases additionally provide native Windows MSI, macOS PKG, and Linux DEB installers. To build installers locally from an existing release binary:
 
 ```bash
 ./scripts/package-linux.sh target/release/hocmesh "$(cat VERSION)" dist amd64
@@ -316,7 +316,9 @@ Build the installers, which lay the app and the node down together so the app fi
 
 That produces an MSI and an NSIS setup executable on Windows, a `.dmg` on macOS, and a `.deb` and an `.AppImage` on Linux; tagged releases carry all of them. `crates/hocmesh-desktop/BUNDLING.md` covers how the node is embedded and what each platform needs installed first.
 
-These are a different installer from the client packages further up. The desktop installer carries the window and the node it drives, and is all a person contributing a machine needs. The client installer carries the three command line binaries — node, coordinator and validator — and no window, which is what a headless server or anyone running a coordinator or a validator wants. Both can be installed on one machine: the node inside the desktop package is called `hocmesh-node` precisely so the desktop `.deb` and the client `.deb` do not both claim `/usr/bin/hocmesh`, and the app prefers the node it shipped with over whatever is on `PATH`.
+There is no client build and no server build. Every hocMESH install is a whole peer — node, coordinator and validator — because the model is a torrent swarm run in the other order: you seed first, lending CPU, memory and GPU to other people's work, and what that earns is what lets you later reach for somebody else's hardware. Both installers above carry all three binaries. The only difference is whether the machine has a screen: the desktop installer adds the window over the same peer, the headless installers further up leave it out.
+
+So they replace each other rather than sitting side by side. Both lay down `/usr/bin/hocmesh` as the command an operator types, and each declares that in package metadata — the desktop `.deb` carries `Provides`, `Conflicts` and `Replaces: hocmesh`, the headless one `Conflicts` and `Replaces: hoc-mesh-desktop` — so installing either on a machine that has the other swaps it cleanly instead of failing on a file collision. The app still prefers the node it shipped with, beside its own binary, over whatever is on `PATH`.
 
 ---
 

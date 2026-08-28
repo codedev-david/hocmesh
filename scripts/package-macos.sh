@@ -42,7 +42,7 @@ install -m 0644 README.md LICENSE "$stage/root/usr/local/share/doc/hocmesh/"
 artifact="$output_dir/hocmesh-${version}.pkg"
 pkgbuild \
   --root "$stage/root" \
-  --identifier org.hocmesh.compute.client \
+  --identifier org.hocmesh.peer \
   --version "$version" \
   --install-location / \
   "$artifact"

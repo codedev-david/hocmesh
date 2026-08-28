@@ -7,14 +7,29 @@ param(
 )
 
 # Builds the desktop installers: an MSI and an NSIS setup executable, each
-# carrying the window *and* the node it supervises.
+# carrying a whole hocMESH peer -- the node, the coordinator, the validator,
+# and the window that drives them.
 #
-# The node is passed in rather than built here so that the app and the daemon
-# it will start always come from one build, the same rule package-windows.ps1
-# enforces for the three command line binaries.
+# There is no smaller "desktop-only" install. A hocMESH peer serves before it
+# consumes, and a machine that can join a mesh but not start or validate one is
+# a half-install that looks complete. package-windows.ps1 builds exactly the
+# same three binaries without the window, for a machine with no screen.
+#
+# The binaries are passed in rather than built here so that the window and the
+# daemons it drives always come from one build.
 
 $ErrorActionPreference = "Stop"
 $binaryPath = (Resolve-Path -LiteralPath $Binary).Path
+$binaryDir = Split-Path -Parent $binaryPath
+$peers = @{
+    "hocmesh-coordinator" = Join-Path $binaryDir "hocmesh-coordinator.exe"
+    "hocmesh-validator"   = Join-Path $binaryDir "hocmesh-validator.exe"
+}
+foreach ($peer in $peers.Values) {
+    if (-not (Test-Path -LiteralPath $peer)) {
+        throw "expected to package $peer alongside $binaryPath; build the whole peer first"
+    }
+}
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $desktopDir = Join-Path $repositoryRoot "crates\hocmesh-desktop"
 
@@ -33,18 +48,16 @@ if ($configuredVersion -ne $repositoryVersion) {
 }
 
 # Tauri names a sidecar for the triple it was built for and strips that suffix
-# when it bundles, which is what lands the node next to the app as plain
-# hocmesh-node.exe -- the first place supervisor::candidate_paths looks.
-#
-# hocmesh-node rather than hocmesh so that one name is used on every platform.
-# Windows would tolerate either, since this app installs to its own directory,
-# but the Linux .deb shares /usr/bin with the standalone client package and
-# dpkg refuses to let two packages own one path.
+# when it bundles, which is what lands each binary next to the app under its
+# real name -- `hocmesh.exe` being the first place supervisor::candidate_paths
+# looks, and the command an operator types in a terminal.
 $hostTriple = (& rustc -vV | Select-String -Pattern '^host: (.+)$').Matches[0].Groups[1].Value
 $sidecarDir = Join-Path $desktopDir "binaries"
 New-Item -ItemType Directory -Force -Path $sidecarDir | Out-Null
-$sidecar = Join-Path $sidecarDir "hocmesh-node-$hostTriple.exe"
-Copy-Item -LiteralPath $binaryPath -Destination $sidecar -Force
+Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $sidecarDir "hocmesh-$hostTriple.exe") -Force
+foreach ($name in $peers.Keys) {
+    Copy-Item -LiteralPath $peers[$name] -Destination (Join-Path $sidecarDir "$name-$hostTriple.exe") -Force
+}
 
 if (-not (Get-Command cargo-tauri -ErrorAction SilentlyContinue)) {
     # Out-Host, here and below, so that the only thing this script writes to
@@ -88,7 +101,7 @@ $extract = Join-Path ([System.IO.Path]::GetTempPath()) "hocmesh-desktop-msi-$cle
 if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
 $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @("/a", $msi, "/qn", "TARGETDIR=$extract")
 if ($process.ExitCode -ne 0) { throw "MSI administrative extraction failed: $($process.ExitCode)" }
-foreach ($expected in @("hocmesh-node.exe", "hocmesh-desktop.exe")) {
+foreach ($expected in @("hocmesh.exe", "hocmesh-coordinator.exe", "hocmesh-validator.exe", "hocmesh-desktop.exe")) {
     if (-not (Get-ChildItem $extract -Filter $expected -Recurse -File | Select-Object -First 1)) {
         throw "$expected is absent from $msi"
     }

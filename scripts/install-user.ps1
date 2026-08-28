@@ -1,8 +1,10 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
-cargo build --release -p hocmesh
+cargo build --release -p hocmesh -p hocmesh-coordinator -p hocmesh-validator
 $Dest = Join-Path $env:LOCALAPPDATA "hocMESH\bin"
 New-Item -ItemType Directory -Force $Dest | Out-Null
-Copy-Item target\release\hocmesh.exe (Join-Path $Dest "hocmesh.exe") -Force
-Write-Host "Installed hocMESH participant client to $Dest\hocmesh.exe"
+foreach ($exe in @("hocmesh.exe", "hocmesh-coordinator.exe", "hocmesh-validator.exe")) {
+    Copy-Item (Join-Path "target\release" $exe) (Join-Path $Dest $exe) -Force
+}
+Write-Host "Installed the hocMESH peer to $Dest"
 Write-Host "Add $Dest to PATH or run the executable directly."

@@ -151,11 +151,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
-      # All three packagers refuse to build unless the coordinator and the
-      # validator are sitting beside the node, so all three are named here.
-      # Not `--workspace`: that would drag in the desktop crate and its GTK
-      # and WebKit toolchain for an installer that carries no window.
-      - name: Build client
+      # The whole peer: node, coordinator and validator. All three packagers
+      # refuse to build unless the coordinator and the validator are sitting
+      # beside the node. Not `--workspace`: that would drag in the desktop
+      # crate and its GTK and WebKit toolchain for an installer that carries
+      # no window.
+      - name: Build peer
         run: cargo build --release -p hocmesh -p hocmesh-coordinator -p hocmesh-validator --features ${{ matrix.features }} --locked
       - name: Install WiX
         if: matrix.kind == 'msi'
@@ -172,22 +173,22 @@ jobs:
         if: matrix.kind == 'msi'
         shell: pwsh
         run: ./scripts/package-windows.ps1 -Binary target/release/hocmesh.exe -Version (Get-Content VERSION -Raw).Trim() -OutputDirectory dist
-      - name: Execute client extracted from DEB
+      - name: Execute peer extracted from DEB
         if: matrix.kind == 'deb'
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/hocmesh-deb"
           dpkg-deb --extract dist/*.deb "$RUNNER_TEMP/hocmesh-deb"
           "$RUNNER_TEMP/hocmesh-deb/usr/bin/hocmesh" --version
-      - name: Execute client extracted from PKG
+      - name: Execute peer extracted from PKG
         if: matrix.kind == 'pkg'
         shell: bash
         run: |
           pkgutil --expand-full dist/*.pkg "$RUNNER_TEMP/hocmesh-pkg"
-          client=$(find "$RUNNER_TEMP/hocmesh-pkg" -type f -path '*/usr/local/bin/hocmesh' -print -quit)
-          test -n "$client"
-          "$client" --version
-      - name: Execute client extracted from MSI
+          peer=$(find "$RUNNER_TEMP/hocmesh-pkg" -type f -path '*/usr/local/bin/hocmesh' -print -quit)
+          test -n "$peer"
+          "$peer" --version
+      - name: Execute peer extracted from MSI
         if: matrix.kind == 'msi'
         shell: pwsh
         run: |
@@ -195,10 +196,10 @@ jobs:
           $extract = Join-Path $env:RUNNER_TEMP "hocmesh-msi"
           $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/a', $msi, '/qn', "TARGETDIR=$extract")
           if ($process.ExitCode -ne 0) { throw "MSI administrative extraction failed: $($process.ExitCode)" }
-          $client = Get-ChildItem $extract -Filter hocmesh.exe -Recurse | Select-Object -First 1
-          if (-not $client) { throw "hocmesh.exe is absent from MSI" }
-          & $client.FullName --version
-      - name: Smoke-test packaged client
+          $peer = Get-ChildItem $extract -Filter hocmesh.exe -Recurse | Select-Object -First 1
+          if (-not $peer) { throw "hocmesh.exe is absent from MSI" }
+          & $peer.FullName --version
+      - name: Smoke-test packaged peer
         shell: pwsh
         run: |
           $artifact = Get-ChildItem dist -File | Select-Object -First 1
@@ -207,7 +208,7 @@ jobs:
       - name: Upload installer
         uses: actions/upload-artifact@v7
         with:
-          name: hocmesh-client-${{ matrix.kind }}
+          name: hocmesh-headless-${{ matrix.kind }}
           path: dist/*
           if-no-files-found: error
 
@@ -238,10 +239,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libappindicator3-dev librsvg2-dev patchelf
-      # The daemon the app supervises, shipped inside the same installer. Built
-      # here so that the window and the node it starts come from one build.
-      - name: Build node binary
-        run: cargo build --release -p hocmesh --locked
+      # The whole peer the app drives, shipped inside the same installer: node,
+      # coordinator and validator. Built here so the window and the daemons it
+      # starts come from one build. Not `--workspace`, which would rebuild the
+      # desktop crate twice -- `cargo tauri build` compiles it below.
+      - name: Build peer binaries
+        run: cargo build --release -p hocmesh -p hocmesh-coordinator -p hocmesh-validator --locked
       - name: Build desktop installers (Unix)
         if: runner.os != 'Windows'
         shell: bash

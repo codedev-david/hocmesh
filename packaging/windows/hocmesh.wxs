@@ -1,21 +1,22 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
-    Id="hocMESH.Compute.Client"
-    Name="hocMESH Compute Client"
+    Id="hocMESH"
+    Name="hocMESH"
     Manufacturer="hocMESH Contributors"
     Version="$(HocMeshVersion)"
     UpgradeCode="8A83C7C3-3369-4C5F-A907-BB5660EA6422"
     Scope="perMachine">
-    <MajorUpgrade DowngradeErrorMessage="A newer hocMESH Compute Client is already installed." />
+    <MajorUpgrade DowngradeErrorMessage="A newer hocMESH is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="hocMESH">
-        <!-- All three binaries ship together. A machine that has `hocmesh`
-             but not `hocmesh-coordinator` cannot start a mesh, only join one
-             that somebody else already started, which makes the installer a
+        <!-- All three binaries ship together. Every hocMESH install is a
+             whole peer: a machine that has `hocmesh` but not
+             `hocmesh-coordinator` cannot start a mesh, only join one
+             somebody else already started, which makes the installer a
              half-install that looks complete. -->
-        <Component Id="HocMeshClient" Guid="*" Bitness="always64">
+        <Component Id="HocMeshNode" Guid="*" Bitness="always64">
           <File Id="HocMeshExecutable" Source="$(HocMeshExe)" KeyPath="yes" />
           <Environment
             Id="HocMeshPath"
@@ -34,8 +35,8 @@
       </Directory>
     </StandardDirectory>
 
-    <Feature Id="MainFeature" Title="hocMESH Compute Client" Level="1">
-      <ComponentRef Id="HocMeshClient" />
+    <Feature Id="MainFeature" Title="hocMESH" Level="1">
+      <ComponentRef Id="HocMeshNode" />
       <ComponentRef Id="HocMeshCoordinator" />
       <ComponentRef Id="HocMeshValidator" />
     </Feature>

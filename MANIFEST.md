@@ -4,7 +4,7 @@ This archive is a source repository for **hocMESH Compute v0.3.0**.
 
 Primary deliverables:
 
-- `README.md` — compile, install, run, validator, client, and ledger walkthrough.
+- `README.md` — compile, install, run, peer, validator, and ledger walkthrough.
 - `CODEX_HANDOFF.md` — prioritized engineering instructions for Codex CLI.
 - `docs/FULL_ORIGINAL_SPEC.md` — complete original end-goal product specification.
 - `docs/FULL_SYSTEM_SPEC.md` — consolidated Compute Core architecture and end-state design.

@@ -17,7 +17,7 @@
 | Resource graph | Implemented | Vertices are registered machines; edges are predicted RTT from measured coordinates, else the route through the coordinator, else an explicit placeholder. Greedy min-diameter clustering for co-scheduled work. Read at `/v1/topology` |
 | Scheduling by hardware/network/reliability/locality | Implemented | `poll_work` scores a bounded oldest-first window: benchmark converted to mCU/s through `REFERENCE_OPS_PER_MCU` with a hard refusal past the lease, round trip amortised against shard size, exposure limited by audit standing, affinity to shards and manifests already held, and a starvation bonus that outranks any fit |
 | Coordinator rebuild from the chain | Implemented | `rebuild` replays certified entries into an empty database; shard ids are derived, so a replacement finishes a half-done job without re-offering or re-paying a settled shard |
-| Client mirror and offline audit | Implemented | Validator quorum sync/audit commands |
+| Peer mirror and offline audit | Implemented | Validator quorum sync/audit commands |
 | Snapshot bootstrap and out-of-band checkpoints | Implemented | `snapshot`/`ledger-restore` write and adopt a quorum-signed state file; it is refused unless certificate, checkpoint and state hash all agree against the operator's own validator set, and refused again over a store that already holds a chain |
 | Indexed account history | Implemented | Every posting is indexed on `(account_id, sequence, posting_index)` as it is applied; validators serve `/v1/ledger/history/{account}` and `ledger-history` reads it from a mirror or off the network, paging newest-first on a sequence cursor that never splits one entry |
 | Operator resource limits | Implemented | Persisted share of CPU/memory/GPU plus a separate `--ai on\|off\|auto` consent to serve inference; advertised capacity is the share, not the machine |
@@ -62,17 +62,17 @@
 | Ledger view | Implemented | Balance and newest-first paged history read through the daemon's control endpoint, each page marked with whether a validator quorum stood behind it; a balance whose history page is missing shows as a total over an empty table rather than as no ledger |
 | Settings and limits | Implemented | Coordinator, worker ceiling, AI consent and the CPU/memory/GPU shares, persisted and applied to a running node without a restart. The settings file is a consent record: the app writes what the operator set and never widens a share on its own |
 | End-to-end proof | Implemented | An integration test drives the app's own layers against a real coordinator and daemon: cold snapshot, start, work completed, a paid ledger entry, a limit changed and read back off disk, then stop |
-| Installers | Implemented | Tauri bundler MSI and NSIS setup on Windows, DMG on macOS, DEB and AppImage on Linux, each carrying the node as a sidecar beside the app; `scripts/package-desktop.*` open what they produced and fail unless both executables are inside |
-| Coexistence with the client installer | Implemented | The sidecar is named `hocmesh-node`, not `hocmesh`, because Tauri's Debian bundler unpacks into `/usr/bin` and dpkg refuses to let the desktop package and `hocmesh-compute-client` both own `/usr/bin/hocmesh`; `package-desktop.sh` fails the build if the `.deb` ever claims that path, and `NODE_BINARIES` still falls back to a client-installed `hocmesh` on `PATH` |
+| Installers | Implemented | Tauri bundler MSI and NSIS setup on Windows, DMG on macOS, DEB and AppImage on Linux, each carrying node, coordinator and validator as sidecars beside the app; `scripts/package-desktop.*` open what they produced and fail unless all four executables are inside |
+| One peer per machine | Implemented | The desktop installer carries the whole peer — node, coordinator and validator — so it is the headless install plus a window rather than a second, different product. The two Linux packages therefore claim the same `/usr/bin/hocmesh` and declare that they replace each other: `Provides`/`Conflicts`/`Replaces: hocmesh` on the desktop `.deb`, `Conflicts`/`Replaces: hoc-mesh-desktop` on the headless one. `package-desktop.sh` reads those fields back out of the built package with `dpkg-deb --field`, so dropping them fails the build |
 
 ## Distribution
 
 | Component | Status | Evidence / boundary |
 |---|---|---|
-| Windows installer | Implemented | WiX-built MSI, ICE validation, administrative extraction, client execution smoke test |
-| macOS installer | Implemented | Native PKG, payload inspection, extracted client execution smoke test |
-| Linux installer | Implemented | Native DEB, metadata/content validation, extracted client execution smoke test |
-| Desktop installers | Implemented | Built and content-checked on all three platforms in CI, published alongside the client installers on a tagged release |
+| Windows installer | Implemented | WiX-built MSI, ICE validation, administrative extraction, peer execution smoke test |
+| macOS installer | Implemented | Native PKG, payload inspection, extracted peer execution smoke test |
+| Linux installer | Implemented | Native DEB, metadata/content validation, extracted peer execution smoke test |
+| Desktop installers | Implemented | Built and content-checked on all three platforms in CI, published alongside the headless installers on a tagged release |
 | Release integrity | Implemented | Per-artifact SHA-256 checksums and CycloneDX SBOM |
 | Platform signing | Deployment configuration required | Installers are unsigned until release signing identities are supplied |
 

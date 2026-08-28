@@ -1,11 +1,15 @@
-Package: hocmesh-compute-client
+Package: hocmesh
 Version: @VERSION@
 Section: utils
 Priority: optional
 Architecture: @ARCHITECTURE@
 Depends: libc6 (>= 2.35)
+Conflicts: hoc-mesh-desktop
+Replaces: hoc-mesh-desktop
 Maintainer: hocMESH Contributors
 Homepage: https://github.com/codedev-david/hocmesh
-Description: hocMESH distributed AI compute client
- Provides authenticated compute participation, model chunk storage and seeding,
- GPU capability discovery, AI scheduling, and inference execution.
+Description: hocMESH distributed AI compute peer
+ A whole hocMESH peer for a machine with no screen: node, coordinator and
+ validator. It serves -- lending CPU, memory and GPU to other people's work --
+ and it spends what that earns on work of its own. Install hoc-mesh-desktop
+ instead on a machine with a display; it is the same peer with a window.

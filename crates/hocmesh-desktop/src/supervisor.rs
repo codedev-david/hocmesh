@@ -24,26 +24,18 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-/// The node executable's names on this platform, most specific first.
+/// The node executable's name on this platform.
 ///
-/// `hocmesh-node` is the copy this app's own installer lays down beside the
-/// window. It is deliberately *not* called `hocmesh`: on Linux both the
-/// desktop package and the standalone client package unpack into `/usr/bin`,
-/// and dpkg refuses to let two packages own one path, so sharing the name
-/// would make the two installers mutually exclusive on the same machine.
-///
-/// `hocmesh` is the standalone client's own name, which is what a machine
-/// that has only the command line install will have on its `PATH`. Keeping it
-/// in the list is what lets an AppImage -- or a desktop install whose sidecar
-/// has been removed -- still drive a node the operator installed separately.
-pub const NODE_BINARIES: [&str; 2] = if cfg!(windows) {
-    ["hocmesh-node.exe", "hocmesh.exe"]
+/// One name, not a per-package one. Every hocMESH install is a whole peer, and
+/// the two installers differ only in whether the machine has a screen: both
+/// lay down `hocmesh` as the command an operator types, and the desktop one
+/// adds a window over it. The packages therefore replace each other rather
+/// than sitting side by side, which is what lets this stay a single name.
+pub const NODE_BINARY: &str = if cfg!(windows) {
+    "hocmesh.exe"
 } else {
-    ["hocmesh-node", "hocmesh"]
+    "hocmesh"
 };
-
-/// The name this app's own installer gives the node it ships.
-pub const NODE_BINARY: &str = NODE_BINARIES[0];
 
 /// What the operator asked the node to do, before it is turned into argv.
 ///
@@ -128,21 +120,19 @@ impl RunState {
 ///
 /// Beside the app first: an installer lays both binaries down together, and
 /// that copy is the one whose version matches this window. Only then the
-/// operator's `PATH`, which may hold an older build from a different install.
-/// Within each directory the shipped name is tried before the command line
-/// install's, so a machine carrying both is driven by the node that was built
-/// with this window rather than whichever one apt happened to update last.
+/// operator's `PATH`, which may hold an older build from a checkout or a
+/// per-user install.
 pub fn candidate_paths(app_dir: Option<&Path>, path_var: Option<&str>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(dir) = app_dir {
-        candidates.extend(NODE_BINARIES.iter().map(|name| dir.join(name)));
+        candidates.push(dir.join(NODE_BINARY));
     }
     if let Some(path) = path_var {
         for entry in std::env::split_paths(path) {
             if entry.as_os_str().is_empty() {
                 continue;
             }
-            candidates.extend(NODE_BINARIES.iter().map(|name| entry.join(name)));
+            candidates.push(entry.join(NODE_BINARY));
         }
     }
     candidates
@@ -333,8 +323,7 @@ fn detach(_command: &mut Command) {}
 pub fn start_blocker(node_binary: Option<&Path>, coordinator: &str) -> Option<String> {
     if node_binary.is_none() {
         return Some(format!(
-            "{} was not found beside this app or on PATH",
-            NODE_BINARIES.join(" or ")
+            "{NODE_BINARY} was not found beside this app or on PATH"
         ));
     }
     if coordinator.trim().is_empty() {
@@ -471,73 +460,63 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_node_is_not_named_after_the_command_line_client() {
-        // Both packages unpack into /usr/bin on Linux, and dpkg refuses to let
-        // two packages own one path: if this app's sidecar were also called
-        // `hocmesh`, installing the desktop package on a machine that has the
-        // command line package -- or the reverse -- would fail outright with
-        // "trying to overwrite '/usr/bin/hocmesh'". The names have to differ,
-        // and both have to be looked for.
-        let shipped = NODE_BINARIES[0];
-        let command_line_client = NODE_BINARIES[1];
-        assert_ne!(shipped, command_line_client);
-        assert_eq!(NODE_BINARY, shipped);
-        assert!(shipped.starts_with("hocmesh-node"));
-        assert!(command_line_client.starts_with("hocmesh.") || command_line_client == "hocmesh");
+    fn the_node_the_app_drives_is_the_command_an_operator_types() {
+        // There is no separate "desktop copy" of the node. Every hocMESH
+        // install is a whole peer -- it serves and it consumes -- and the two
+        // installers differ only in whether the machine has a screen, so both
+        // put the same `hocmesh` on PATH and the packages replace each other
+        // rather than co-existing. A second name here would mean a desktop
+        // user's terminal and their window were driving different binaries.
+        assert!(NODE_BINARY == "hocmesh" || NODE_BINARY == "hocmesh.exe");
     }
 
     #[test]
-    fn a_node_installed_only_by_the_command_line_package_is_still_found() {
-        // An AppImage carries its own node, but a .deb user who installed the
-        // client package and then removed the desktop one still has a working
-        // daemon on PATH under the other name. The window must drive it.
-        let root = scratch("locate-cli");
+    fn a_node_the_operator_installed_separately_is_still_found_on_path() {
+        // Running the window straight out of a checkout, or from an AppImage
+        // whose sidecar was removed, still has to drive a node the operator
+        // put on PATH themselves.
+        let root = scratch("locate-path");
         let empty = root.join("empty");
         let on_path = root.join("on-path");
         fs::create_dir_all(&empty).unwrap();
         fs::create_dir_all(&on_path).unwrap();
-        fs::write(on_path.join(NODE_BINARIES[1]), b"x").unwrap();
+        fs::write(on_path.join(NODE_BINARY), b"x").unwrap();
 
         let found = locate_node(Some(&empty), Some(on_path.to_str().unwrap())).unwrap();
-        assert_eq!(found, on_path.join(NODE_BINARIES[1]));
+        assert_eq!(found, on_path.join(NODE_BINARY));
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn the_shipped_node_wins_over_a_command_line_one_in_the_same_directory() {
-        // On a machine carrying both packages the window has to drive the node
-        // it was built with, not whichever one apt updated last.
-        let root = scratch("locate-both");
-        let dir = root.join("bin");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(NODE_BINARIES[0]), b"x").unwrap();
-        fs::write(dir.join(NODE_BINARIES[1]), b"x").unwrap();
+    fn the_node_beside_the_app_beats_one_further_along_path() {
+        // The installer lays the window and the node down together, so that
+        // copy is the one whose version matches this window; a stale build
+        // earlier on PATH must not win.
+        let root = scratch("locate-order");
+        let beside = root.join("app");
+        let on_path = root.join("on-path");
+        fs::create_dir_all(&beside).unwrap();
+        fs::create_dir_all(&on_path).unwrap();
+        fs::write(beside.join(NODE_BINARY), b"x").unwrap();
+        fs::write(on_path.join(NODE_BINARY), b"x").unwrap();
 
         assert_eq!(
-            locate_node(Some(&dir), Some("")).unwrap(),
-            dir.join(NODE_BINARIES[0])
-        );
-        assert_eq!(
-            locate_node(None, Some(dir.to_str().unwrap())).unwrap(),
-            dir.join(NODE_BINARIES[0])
+            locate_node(Some(&beside), Some(on_path.to_str().unwrap())).unwrap(),
+            beside.join(NODE_BINARY)
         );
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn every_directory_is_exhausted_before_the_next_one_is_tried() {
-        // Ordering is by directory first and name second: a stale copy earlier
-        // on PATH must not beat the shipped node sitting beside the app.
+    fn every_directory_is_tried_once_in_order() {
         let candidates = candidate_paths(Some(Path::new("/app")), Some("/usr/bin"));
         let names: Vec<String> = candidates
             .iter()
             .map(|c| c.to_string_lossy().replace('\\', "/"))
             .collect();
-        assert_eq!(names.len(), NODE_BINARIES.len() * 2);
+        assert_eq!(names.len(), 2);
         assert!(names[0].starts_with("/app/"));
-        assert!(names[1].starts_with("/app/"));
-        assert!(names[2].starts_with("/usr/bin/"));
-        assert!(names[3].starts_with("/usr/bin/"));
+        assert!(names[1].starts_with("/usr/bin/"));
     }
 
     #[test]

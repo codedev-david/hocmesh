@@ -38,7 +38,7 @@ The release folder must include:
 - `docs/`
 - `config/`
 
-Native participant-client installers are produced from the release binary with
+Headless installers are produced from the release binaries with
 `scripts/package-linux.sh`, `scripts/package-macos.sh`, and
 `scripts/package-windows.ps1`. Each packager validates the resulting DEB, PKG,
 or MSI structure before it is uploaded.
@@ -46,8 +46,9 @@ or MSI structure before it is uploaded.
 Desktop-app installers are produced from the same release binary with
 `scripts/package-desktop.sh` (macOS DMG, Linux DEB and AppImage) and
 `scripts/package-desktop.ps1` (Windows MSI and NSIS setup executable). These
-carry the window *and* the node it supervises, so each packager opens what it
-produced and fails unless both executables are inside. Linux hosts need
+carry the window *and* the whole peer it supervises -- node, coordinator and
+validator -- so each packager opens what it produced and fails unless all four
+executables are inside. Linux hosts need
 `libwebkit2gtk-4.1-dev`, `libjavascriptcoregtk-4.1-dev`, `libsoup-3.0-dev`,
 `libappindicator3-dev`, `librsvg2-dev`, and `patchelf`;
 `crates/hocmesh-desktop/BUNDLING.md` has the details.
@@ -66,7 +67,7 @@ GitHub release process:
 - Pushing a `v*` tag runs `.github/workflows/release.yml`.
 - The workflow builds Windows x86_64, Linux x86_64, and macOS arm64 release
   artifacts.
-- Each platform publishes a full archive, a native participant-client installer
+- Each platform publishes a full archive, a headless installer
   (DEB, MSI, or PKG), and the desktop-app installers for that platform, with a
   `.sha256` checksum for each.
 - The workflow creates a draft prerelease so checksums, release notes, and

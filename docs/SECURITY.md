@@ -18,7 +18,7 @@ A remote requester must not receive:
 
 ## Current execution model
 
-The Rust worker matches an allow-listed `WorkSpec` enum and runs native trusted code shipped with the hocMESH client.
+The Rust worker matches an allow-listed `WorkSpec` enum and runs native trusted code shipped with the hocMESH peer.
 
 This is significantly safer than accepting arbitrary uploaded programs.
 
@@ -110,8 +110,8 @@ validator that automatically signed for whoever asked would make admission free
 and destroy the whole defence.
 
 ```
-hocmesh-node membership-vouch  --validators set.json --action join --member m.json --threshold 4
-hocmesh-node membership-commit --validators set.json --action join --member m.json --threshold 4 \
+hocmesh membership-vouch  --validators set.json --action join --member m.json --threshold 4
+hocmesh membership-commit --validators set.json --action join --member m.json --threshold 4 \
                                --vouches vouches.json --out set.next.json
 ```
 
