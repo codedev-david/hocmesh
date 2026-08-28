@@ -102,14 +102,16 @@ than when you earned it.
 
 That is why **there is no client and no server.** Every install is a whole peer:
 
-```text
-                       one hocMESH install
-   ┌────────────────────────────────────────────────────────────┐
-   │  hocmesh              node — serves work, submits work      │
-   │  hocmesh-coordinator  scheduler — hands shards out          │
-   │  hocmesh-validator    ledger replica — signs settlement     │
-   │  hocmesh-desktop      window (desktop installer only)       │
-   └────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph one["One hocMESH install"]
+        direction TB
+        node["<b>hocmesh</b><br/>node — serves work, submits work"]
+        coord["<b>hocmesh-coordinator</b><br/>scheduler — hands shards out"]
+        val["<b>hocmesh-validator</b><br/>ledger replica — signs settlement"]
+        ui["<b>hocmesh-desktop</b><br/>tray and window<br/><i>desktop installer only</i>"]
+        ui -. "supervises the daemon,<br/>never replaces it" .-> node
+    end
 ```
 
 The two installers differ in exactly one thing — whether the machine has a
@@ -122,16 +124,20 @@ the point is that any peer *can* become one.
 hocMESH separates what a peer is allowed to be trusted about. Nothing in the
 system trusts one component for more than one of these.
 
-```text
-        control plane                accounting plane            data plane
-    ┌────────────────────┐       ┌──────────────────────┐   ┌──────────────────┐
-    │ hocmesh-coordinator│       │ hocmesh-validator xN │   │ model chunks     │
-    │ shard queue        │       │ append-only hash     │   │ tensor frames    │
-    │ capability registry│◄─────►│ chain, threshold-    │   │ peer HTTP seeding│
-    │ leases, rerouting  │       │ signed by a quorum   │   │ rarest-first     │
-    └────────────────────┘       └──────────────────────┘   └──────────────────┘
-       decides WHO runs it          decides WHAT WAS PAID       moves the BYTES
-       untrusted                    authoritative               integrity-checked
+```mermaid
+flowchart LR
+    subgraph CTRL["Control plane"]
+        C["<b>hocmesh-coordinator</b><br/>shard queue<br/>capability registry<br/>leases, rerouting<br/><br/>decides WHO runs it<br/><i>untrusted</i>"]
+    end
+    subgraph ACCT["Accounting plane"]
+        V["<b>hocmesh-validator</b> × N<br/>append-only hash chain<br/>threshold-signed by a quorum<br/><br/>decides WHAT WAS PAID<br/><i>authoritative</i>"]
+    end
+    subgraph DATA["Data plane"]
+        D["model chunks, tensor frames<br/>peer HTTP seeding<br/>rarest-first<br/><br/>moves the BYTES<br/><i>integrity-checked</i>"]
+    end
+    C -->|"<i>proposes</i> settlement —<br/>cannot perform it"| V
+    V -.->|"refuses arithmetic<br/>that does not check out"| C
+    C -.->|"tells peers where to fetch"| D
 ```
 
 The coordinator is **deliberately untrusted for money**. It proposes settlement;
@@ -139,6 +145,45 @@ it cannot perform it. A price is a closed-form function of the *work spec*, so
 any peer can recompute it, and a validator quorum refuses an entry whose
 arithmetic does not check out. That is why losing or compromising a coordinator
 costs you scheduling, never balances.
+
+## The life of a job
+
+Nothing here trusts one component with more than one thing. The coordinator
+decides *who runs it*; only the validator quorum decides *what was paid*; and
+the requester can check the whole result without trusting either.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Requester peer
+    participant C as Coordinator — untrusted
+    participant W as Worker peer
+    participant V as Validator quorum
+
+    R->>C: submit WorkSpec + shard count
+    Note over C: price is a closed-form function<br/>of the work spec — any peer<br/>can recompute it
+    C->>V: propose JobReserve — escrow the requester's CU
+    V-->>C: quorum certificate, threshold-signed
+    C->>W: assignment + lease
+    Note over W: execute — allow-listed workload only,<br/>never arbitrary code
+    W->>C: result + proof
+    Note over C: verify by recompute
+    C->>V: propose ProviderReward — escrow to worker
+    Note over V: postings must sum to zero,<br/>or the entry is refused
+    V-->>C: quorum certificate
+    C-->>R: job complete
+    V-->>R: mirror the chain
+    Note over R: hocmesh audit — replay from genesis.<br/>Your balance is what the chain implies,<br/>not a row anyone can edit
+```
+
+If the worker never returns, the lease expires and a `JobRefund` returns the
+shard's escrow to whoever funded it — the requester, or the community issuance
+account for a sponsored job, because minted CU refunding to a node would be free
+minting. The refund carries **the same claim key as the reward it replaces**, so
+a shard settles exactly once, as one or the other. If the coordinator dies, the
+escrow is still on the chain and settlement recovers; if the coordinator lies,
+the quorum refuses the entry. **Losing or compromising a coordinator costs you
+scheduling, never balances.**
 
 ## How a machine is chosen: proximity
 
@@ -177,6 +222,15 @@ could catch it.
 
 **Which machine gets the work is where hardware quality lives.**
 `hocmesh_ai::rank_candidates` scores every eligible device, lowest wins:
+
+```mermaid
+flowchart LR
+    A["every device the<br/>registry knows about"] --> F{"eligible?<br/>has the capability,<br/>inside its owner's limits"}
+    F -- no --> N(["never considered"])
+    F -- yes --> S["score it — <b>lowest wins</b><br/><i>see the formula below</i>"]
+    S --> W(["the winner runs the shard"])
+    W --> P(["…and earns <b>exactly the same CU</b><br/>as the slowest eligible machine<br/>would have earned for it"])
+```
 
 ```text
 score = network_latency_ms          proximity to the requester
@@ -219,6 +273,39 @@ locally — `hocmesh audit` replays it and checks that it sums to zero. Your
 balance is therefore not a row somebody could edit; it is what the chain
 implies, and you can prove it without trusting the coordinator that scheduled
 the work.
+
+### Why editing the file on your disk changes nothing
+
+The ledger is not a JSON file you could open and retype — it is a SQLite
+database of **quorum certificates**, each one a signed statement from a
+threshold of validators about an entry whose contents are hashed into it. Your
+copy is a *mirror*, and no peer trusts anybody's mirror. `hocmesh audit` replays
+it from genesis and rejects it at the first thing that does not line up:
+
+```mermaid
+flowchart TB
+    S(["hocmesh audit — replay from genesis"]) --> A{"threshold signatures valid,<br/>against the validator set<br/>sitting <i>at that entry</i>?"}
+    A -- no --> X(["reject — the chain is not real"])
+    A -- yes --> B{"sequence and previous_hash<br/>continue the chain?"}
+    B -- no --> X
+    B -- yes --> D{"claim key never seen before?<br/>no work paid for twice"}
+    D -- no --> X
+    D -- yes --> E{"postings sum to zero?<br/>CU conserved exactly"}
+    E -- no --> X
+    E -- yes --> F["apply entry, advance state"]
+    F --> A
+```
+
+Change one byte and the signatures no longer cover it. Re-sign it yourself and
+you are not a quorum. Forge the chain forward and it fails `broken chain at
+sequence N`. Give yourself CU out of nowhere and it fails `CU conservation
+violated`. **To actually move a balance you would need the private keys of a
+threshold of validators** — that is a key compromise, not a file edit, and it is
+exactly why the validator set is admitted by vouching rather than left open.
+
+The one file worth protecting on your own disk is therefore not the ledger, it
+is `identity.json` — your key. That one is sealed with XChaCha20-Poly1305 under
+an Argon2id key when `HOCMESH_IDENTITY_PASSPHRASE` is set.
 
 This is blockchain-shaped in exactly one respect — a replicated append-only
 chain nobody can rewrite — and deliberately unlike one in every other:
@@ -273,6 +360,22 @@ of a single model across machines**, and no release should be read as claiming
 it does. `docs/DISTRIBUTED_INFERENCE.md` states that gap precisely, does the
 bandwidth arithmetic that decides which kinds of splitting can work over which
 links, and gives the build order — step 1 of which is done.
+
+```mermaid
+flowchart LR
+    subgraph BUILT["Built and shipping in v0.4"]
+        direction TB
+        A["proximity map<br/><i>Vivaldi coordinates</i>"]
+        B["layer-range planner<br/><i>byte spans per stage</i>"]
+        C["content-addressed<br/>chunk seeding"]
+        D["tensor transport<br/><i>checksum-bound framing</i>"]
+        E["ledger, escrow,<br/>settlement, audit"]
+    end
+    subgraph GAP["Missing — and load-bearing"]
+        F["an engine that loads <b>a layer range</b><br/>and runs a forward pass over<br/>an activation handed to it"]
+    end
+    BUILT ==> GAP ==> G(["distributed inference of one<br/>model across many machines"])
+```
 
 ---
 
@@ -1270,29 +1373,72 @@ This is intentionally expensive verification for an MVP. Future workload types n
 
 The implemented architecture is:
 
-```text
-hocMESH AI
-   │
-   ├── model registry
-   ├── content-addressed model chunks
-   ├── peer-to-peer model seeding
-   ├── CUDA backend
-   ├── ROCm backend
-   ├── Metal backend
-   ├── GGUF / safetensors manifests
-   ├── GPU capability benchmark
-   ├── latency-aware scheduler
-   ├── pipeline parallelism
-   ├── model parallelism
-   ├── batch parallelism
-   ├── tensor transport
-   └── failure-aware rerouting
-         │
-         ▼
-hocMESH Compute Core
+```mermaid
+flowchart TB
+    subgraph AI["hocMESH AI"]
+        direction LR
+        subgraph MODEL["Model"]
+            M1["model registry"]
+            M2["GGUF / safetensors manifests"]
+            M3["content-addressed chunks"]
+            M4["peer-to-peer seeding"]
+        end
+        subgraph HW["Hardware"]
+            H1["CUDA backend"]
+            H2["ROCm backend"]
+            H3["Metal backend"]
+            H4["GPU capability benchmark"]
+        end
+        subgraph PLAN["Planning and movement"]
+            P1["latency-aware scheduler"]
+            P2["pipeline parallelism"]
+            P3["model / tensor parallelism"]
+            P4["batch parallelism"]
+            P5["tensor transport"]
+            P6["failure-aware rerouting"]
+        end
+    end
+    AI ==> CORE(["hocMESH Compute Core<br/><i>identity, pricing, ledger, settlement</i>"])
 ```
 
 Batch inference and authenticated scheduling/rerouting run end to end. Pipeline and model/tensor planning plus ordered tensor transport are implemented as the control/data plane; actual partial-layer and collective kernels remain the responsibility of the configured backend runtime.
+
+Payment for inference is **two-stage**, because a provider that returns tokens
+has not yet been shown to have returned *good* tokens:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Requester
+    participant C as Coordinator
+    participant P as Provider peer
+    participant V as Validator quorum
+
+    R->>C: submit inference job
+    C->>V: InferenceReserve — escrow the requester's CU
+    P->>C: tokens + signed receipt
+    C->>V: InferenceReceipt — escrow to a holding account
+    Note over V: hocmesh:holding:{assignment_id}<br/>the provider cannot spend it yet
+    alt requester signs an acceptance
+        C->>V: InferenceReward — holding to the provider
+    else requester signs a dispute
+        C->>V: InferenceDispute — holding to the commons
+    else requester never answers, window closes
+        C->>V: InferenceExpiry — holding to the commons
+    end
+    Note over V: every branch empties the holding<br/>account and sums to zero
+```
+
+A dispute does **not** refund the requester — the CU goes to the commons, so
+rejecting good work costs exactly what accepting it would have and buys the
+requester nothing, while a provider whose output the requester will not stand
+behind is paid nothing. If the requester simply goes quiet, `InferenceExpiry`
+sweeps the holding account to the commons, but only after `SETTLEMENT_WINDOW_SECS`
+— that window is the provider's protection, and until it closes nobody but the
+requester can touch the balance. If no output ever arrives at all, the escrow
+never reaches a holding account and `InferenceRefund` returns it to the
+requester. Reward, dispute and expiry all ride the **same claim key**, so a
+batch settles exactly once and in exactly one direction.
 
 ---
 
