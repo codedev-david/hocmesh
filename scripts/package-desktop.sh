@@ -222,10 +222,11 @@ case "$(uname -s)" in
     # packages that both own /usr/bin/hocmesh and neither of which has heard
     # of the other. Read the name off the built package rather than assuming
     # the casing rule.
-    desktop_package=$(sed -n 's/^Package:[[:space:]]*//p' <<<"$deb_control" | head -1)
+    desktop_package=$(dpkg-deb --field "$deb" Package | head -1)
     [[ -n "$desktop_package" ]] || { echo "$deb has no Package field" >&2; exit 1; }
     for relation in Conflicts Replaces; do
-      grep -qE "^$relation:.*$desktop_package" "$repository_root/packaging/linux/control.in" || {
+      value=$(awk -v f="$relation" 'BEGIN { f = tolower(f) ":" } tolower($1) == f { sub(/^[^:]*:[[:space:]]*/, ""); print }' "$repository_root/packaging/linux/control.in")
+      [[ "$value" =~ (^|[^[:alnum:]_-])"$desktop_package"($|[^[:alnum:]_-]) ]] || {
         echo "packaging/linux/control.in does not name $desktop_package in $relation; the headless package would not replace this one" >&2
         exit 1
       }
