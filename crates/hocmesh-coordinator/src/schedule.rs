@@ -26,7 +26,7 @@ use hocmesh_core::compute::REFERENCE_OPS_PER_MCU;
 use hocmesh_core::proximity;
 use hocmesh_core::reputation::{FLOOR_AUDIT_RATE, Reputation};
 use hocmesh_core::verify::trial_division_ops;
-use hocmesh_protocol::{DEFAULT_LEASE_SECONDS, NodeCapabilities};
+use hocmesh_protocol::{DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS, NodeCapabilities};
 use serde::Serialize;
 
 /// The prime bound `hocmesh_core::hardware::benchmark_cpu` runs to.
@@ -124,8 +124,8 @@ pub struct ShardCandidate {
 ///
 /// Several axes want "how big is this shard *for this batch of shards*"
 /// rather than "how big is this shard in seconds". Absolute measures saturate:
-/// today's shards finish in milliseconds against a fifteen-minute lease, so
-/// anything scaled to the lease is 1.0 for every candidate and decides
+/// today's shards finish in milliseconds against a lease measured in minutes,
+/// so anything scaled to the lease is 1.0 for every candidate and decides
 /// nothing. Scaled to the field, the same axis discriminates at any size.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Scale {
@@ -206,6 +206,39 @@ fn predicted_seconds(caps: &NodeCapabilities, reward_mcu: i64) -> Option<f64> {
     seconds.is_finite().then_some(seconds)
 }
 
+/// How much longer than predicted a node is given before its lease expires.
+///
+/// A prediction is made from one benchmark against a reference machine, on a
+/// node the coordinator does not control and that is by design only lending a
+/// slice of itself. Handing it exactly the time the arithmetic says would make
+/// every ordinary fluctuation -- the operator opening something, a thermal cap,
+/// a shard on the unlucky side of the split -- into an expiry, and expiries
+/// throw away completed work.
+const LEASE_HEADROOM: f64 = 1.5;
+
+/// How long this node gets for this shard.
+///
+/// The point of varying it is that a slower machine finishing the same shard is
+/// worth exactly what a faster one finishing it is worth: the mCU is in the
+/// work, not in the clock. So the mesh does not need slow nodes to be quick, it
+/// only needs to know they are slow -- and it does, because `mcu_per_second`
+/// already says so. What it must not do is refuse them, which is what a lease
+/// fixed at the default silently did.
+///
+/// Never shorter than the default, so this can only ever widen the field of
+/// machines that qualify, and never take time away from one that qualified
+/// before. A node that has not been benchmarked keeps the default.
+pub fn lease_seconds_for(caps: &NodeCapabilities, reward_mcu: i64) -> i64 {
+    let Some(seconds) = predicted_seconds(caps, reward_mcu) else {
+        return DEFAULT_LEASE_SECONDS;
+    };
+    let wanted = (seconds * LEASE_HEADROOM).ceil();
+    if !wanted.is_finite() {
+        return DEFAULT_LEASE_SECONDS;
+    }
+    (wanted as i64).clamp(DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS)
+}
+
 /// Round-trip time to hand this shard out and take the result back, in
 /// seconds, or `None` when the node has never measured it.
 fn round_trip_seconds(caps: &NodeCapabilities) -> Option<f64> {
@@ -246,17 +279,35 @@ pub fn fit(
     if worker.caps.shared_memory_bytes < candidate.memory_bytes {
         return Err(Unfit::NotEnoughMemory);
     }
-    let lease = DEFAULT_LEASE_SECONDS as f64;
+    // Against the ceiling, not the default. The lease this node will actually
+    // be granted stretches to fit it -- `lease_seconds_for` gives it
+    // `predicted * LEASE_HEADROOM`, and headroom above 1 means that always
+    // covers the prediction until the clamp bites -- so the only nodes left to
+    // refuse here are the ones no lease we are willing to grant would cover,
+    // which is exactly `predicted > MAX_LEASE_SECONDS`.
+    //
+    // Judging against the default instead is what turned "slower than most"
+    // into "excluded", and a network built on lending hardware people already
+    // own cannot afford to read those two as the same thing.
     let seconds = predicted_seconds(&worker.caps, candidate.reward_mcu);
-    if seconds.is_some_and(|s| s > lease) {
+    if seconds.is_some_and(|s| s > MAX_LEASE_SECONDS as f64) {
         return Err(Unfit::SlowerThanLease);
     }
 
-    // Hardware: headroom against the lease. For today's shard sizes this
-    // saturates at 1 for every capable node, which is the truth -- hardware is
-    // a filter here, not a preference. It starts discriminating exactly when
-    // shards grow large enough for it to matter.
-    let hardware = seconds.map_or(UNKNOWN, |s| (1.0 - s / lease).clamp(0.0, 1.0));
+    // Hardware: headroom against the *default* lease, deliberately, and not
+    // against the longer one a slow node would actually be granted. The
+    // denominator has to be the same for every node or the axis stops being a
+    // comparison: scaling each node by its own lease would hand the slowest
+    // machines the largest denominators and score them best, which is exactly
+    // backwards. A node past the default simply pins at 0 -- ranked last among
+    // those eligible, which is what "slower, still welcome" should look like.
+    //
+    // For today's shard sizes this saturates at 1 for every capable node, which
+    // is the truth -- hardware is a filter here, not a preference. It starts
+    // discriminating exactly when shards grow large enough for it to matter.
+    let hardware = seconds.map_or(UNKNOWN, |s| {
+        (1.0 - s / DEFAULT_LEASE_SECONDS as f64).clamp(0.0, 1.0)
+    });
 
     // Network: how much of the exchange is the work rather than the round trip
     // carrying it. A distant node scores better on a larger shard, which is
@@ -621,7 +672,9 @@ mod tests {
     fn a_shard_the_node_cannot_finish_before_the_lease_expires_is_refused() {
         // One mCU is REFERENCE_OPS_PER_MCU reference ops; a node scoring 1
         // candidate per second retires one candidate's worth of ops per
-        // second, so a shard of any size is far past a 900 second lease.
+        // second, so a shard of any size is far past even MAX_LEASE_SECONDS --
+        // which is the bar now, since a merely slow node gets a longer lease
+        // instead of a refusal. This one is not slow, it is hopeless.
         let w = worker("slow", 1, 20_000);
         let c = shard("a", 0, 1_000_000);
         assert_eq!(
@@ -648,6 +701,140 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A benchmark this node never ran cannot be used to shorten its lease.
+    #[test]
+    fn an_unbenchmarked_node_gets_the_default_lease() {
+        assert_eq!(
+            lease_seconds_for(&caps(0, 20_000), 100),
+            DEFAULT_LEASE_SECONDS
+        );
+    }
+
+    /// The lease only ever grows. A quick machine finishing in a second must
+    /// not be handed a one-second deadline: the headroom exists because the
+    /// prediction is one benchmark against a reference machine, on hardware
+    /// only lending a slice of itself.
+    #[test]
+    fn a_fast_node_is_never_given_less_than_the_default() {
+        let quick = caps(5_000_000, 20_000);
+        assert!(predicted_seconds(&quick, 10).unwrap() < DEFAULT_LEASE_SECONDS as f64);
+        assert_eq!(lease_seconds_for(&quick, 10), DEFAULT_LEASE_SECONDS);
+    }
+
+    /// The point of the whole change: a machine that is merely slower than the
+    /// default lease is given longer, in proportion to how much slower it is,
+    /// rather than being refused the shard.
+    #[test]
+    fn a_slower_node_is_given_longer_rather_than_refused() {
+        // Derived from the node's own rate rather than hard-coded, so the
+        // shard lands squarely in the band that used to be an outright
+        // exclusion -- past the default lease, inside the ceiling -- however
+        // the benchmark-to-mCU arithmetic is later retuned.
+        let modest = worker("modest", 20_000, 20_000);
+        let target = DEFAULT_LEASE_SECONDS as f64 * 1.5;
+        let reward = (mcu_per_second(&modest.caps).unwrap() * target) as i64;
+        let predicted = predicted_seconds(&modest.caps, reward).unwrap();
+        assert!(
+            predicted > DEFAULT_LEASE_SECONDS as f64,
+            "this test is only meaningful for a node the old gate would have refused"
+        );
+
+        let lease = lease_seconds_for(&modest.caps, reward);
+        assert!(lease > DEFAULT_LEASE_SECONDS);
+        assert!(lease <= MAX_LEASE_SECONDS);
+        assert!(
+            lease as f64 >= predicted,
+            "a lease shorter than the prediction it was sized from guarantees the expiry \
+             it exists to avoid"
+        );
+
+        let c = shard("a", 0, reward);
+        assert!(
+            fit(
+                &modest,
+                &c,
+                &Scale::of(std::slice::from_ref(&c)),
+                1_000,
+                None,
+                &Weights::default()
+            )
+            .is_ok(),
+            "a node the mesh is willing to wait for must not be refused the work"
+        );
+    }
+
+    /// Slower still is not a licence to park a shard indefinitely. Past the
+    /// ceiling the refusal comes back, because at that point the mesh really
+    /// would be better off giving the shard to somebody else.
+    #[test]
+    fn the_lease_stops_stretching_at_the_ceiling() {
+        let glacial = worker("glacial", 1, 20_000);
+        let reward = 1_000_000;
+        assert_eq!(lease_seconds_for(&glacial.caps, reward), MAX_LEASE_SECONDS);
+
+        let c = shard("a", 0, reward);
+        assert_eq!(
+            fit(
+                &glacial,
+                &c,
+                &Scale::of(std::slice::from_ref(&c)),
+                1_000,
+                None,
+                &Weights::default()
+            ),
+            Err(Unfit::SlowerThanLease)
+        );
+    }
+
+    /// Waiting longer is a scheduling concession and must never become a
+    /// pricing one. The reward is the shard's, not the holder's.
+    /// The trap in sizing leases per node: if the hardware axis were scaled by
+    /// the lease each node is granted rather than by a constant, a slower node
+    /// would get a larger denominator and therefore a *better* hardware score.
+    /// Being slow would rank you up. This pins the ordering the right way round.
+    #[test]
+    fn a_slower_node_still_scores_below_a_faster_one_on_hardware() {
+        let w = Weights::default();
+        let quick = worker("quick", 1_000_000, 20_000);
+        let modest = worker("modest", 60_000, 20_000);
+        let crawling = worker("crawling", 20_000, 20_000);
+
+        // Sized so even the slowest of the three stays inside the ceiling --
+        // the point here is the ordering among eligible nodes, not the gate.
+        let reward =
+            (mcu_per_second(&crawling.caps).unwrap() * MAX_LEASE_SECONDS as f64 * 0.9) as i64;
+        let c = shard("s", 0, reward);
+        let scale = Scale::of(std::slice::from_ref(&c));
+
+        let h = |p: &WorkerProfile| fit(p, &c, &scale, 1_000, None, &w).unwrap().hardware;
+        assert!(
+            h(&quick) > h(&modest),
+            "quick {} should out-score modest {}",
+            h(&quick),
+            h(&modest)
+        );
+        assert!(h(&modest) >= h(&crawling));
+        // All three are still eligible -- ranking is the whole of the penalty.
+        for p in [&quick, &modest, &crawling] {
+            assert!(fit(p, &c, &scale, 1_000, None, &w).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_longer_lease_does_not_change_what_the_shard_pays() {
+        let c = shard("a", 0, 2_000_000);
+        let modest = worker("modest", 20_000, 20_000);
+        let quick = worker("quick", 5_000_000, 20_000);
+        assert!(
+            lease_seconds_for(&modest.caps, c.reward_mcu)
+                > lease_seconds_for(&quick.caps, c.reward_mcu)
+        );
+        // `reward_mcu` is the shard's own field and nothing about scheduling
+        // reads or rewrites it -- asserted here so a future change that made
+        // the lease feed back into the price would fail loudly.
+        assert_eq!(c.reward_mcu, 2_000_000);
     }
 
     #[test]

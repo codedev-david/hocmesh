@@ -244,11 +244,87 @@ score = network_latency_ms          proximity to the requester
 So a big, idle, well-connected GPU that already has the model cached beats a
 small busy one — it just does not get paid more per shard for being that.
 
+### Slower machines are ranked down, never locked out
+
+Ranking a machine last is a preference. Refusing it the work is a different
+thing entirely, and until recently the scheduler did the second by accident.
+Every node was measured against one flat lease:
+
+```rust
+// the old crates/hocmesh-coordinator/src/schedule.rs
+let lease = DEFAULT_LEASE_SECONDS as f64;   // 900, the same for every machine
+if predicted_seconds(&worker.caps, candidate.reward_mcu)
+    .is_some_and(|s| s > lease)
+{
+    return Err(Unfit::SlowerThanLease);
+}
+```
+
+A machine three times slower than a current laptop was therefore *forbidden*
+any shard a laptop would spend more than five minutes on — it earned nothing,
+which is the opposite of the premise that hardware you already own is worth
+lending. The lease is now sized to the node taking the shard:
+
+```rust
+pub fn lease_seconds_for(caps: &NodeCapabilities, reward_mcu: i64) -> i64 {
+    let Some(seconds) = predicted_seconds(caps, reward_mcu) else {
+        return DEFAULT_LEASE_SECONDS;   // never benchmarked: no basis to shorten it
+    };
+    ((seconds * LEASE_HEADROOM).ceil() as i64)
+        .clamp(DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS)
+}
+```
+
+It only ever grows, so no machine loses time it had before, and it stops at 3×
+the default — past that `SlowerThanLease` still applies, because the mesh really
+is better off giving the shard to somebody else. Everything above still holds:
+the slow machine earns the *same* mCU for the same shard, because the price is
+in the work and not in the clock. It just takes longer, and gets ranked behind
+faster peers whenever they are free to take it.
+
+**Shard size is not the lever here, and it cannot be.** The obvious fix — cut
+smaller shards for slower machines — is illegal in this design, because
+validators recompute a job's price from `(work, shards)`:
+
+```rust
+// crates/hocmesh-ledger/src/validate.rs
+let cost: i64 = split_work(&e.work, e.shards).iter().map(work_cost_mcu).sum();
+```
+
+The shard count is part of what quorum signs, and `work_cost_mcu` rounds up per
+shard, so re-cutting work at offer time would have the coordinator charge a
+number the validators reject. Shard count is fixed before submit and stays
+fixed; the lease is the part with no consensus meaning, which is precisely why
+it is the part that can flex.
+
+RAM remains a hard gate (`Unfit::NotEnoughMemory`). A machine that cannot hold
+the working set cannot be given longer to hold it.
+
+**What this costs, stated plainly.** Scheduling here is pull-based —
+`schedule::best(worker, candidates, ..)` picks the best shard *for the node that
+just polled*, and there is no mechanism to hold a shard back for a faster peer
+that might poll a second later. So a slow node that polls first now takes work a
+fast node would have finished sooner, and some jobs will finish later than they
+used to. That is the trade being made: tail latency for inclusion, on a network
+whose whole premise is hardware that would otherwise be idle. The starvation
+bonus still guarantees nothing waits forever, and `MAX_LEASE_SECONDS` bounds how
+long any single shard can be parked on a machine that turns out to be hopeless.
+
 Two things are deliberately *not* in this score yet, and they are the honest
 gaps: no premium for scarce resources (a 48 GB card and an 8 GB card are worth
 the same per shard), and no reputation-weighted history beyond a recent-failure
 count. `hocmesh-core/src/reputation.rs` holds the slashing arithmetic for the
 second; nothing wires it into ranking.
+
+A third gap sits one layer up, in inference rather than CPU shards:
+`hocmesh_ai::plan_parallelism` splits a model's layers **uniformly** across
+pipeline stages, with no weighting by how fast each stage's memory actually is.
+Pipeline token time is the sum of stage times, so pairing a fast machine with a
+slow one and giving each half the layers runs the whole pipeline at the slow
+machine's pace. `NodeCapabilities::benchmark_bytes_per_second` exists for the
+weighting and is deliberately left `None` on CPU-only nodes rather than guessed
+at (`hocmesh-core/src/hardware.rs`), so the planner has nothing to weight with
+yet.
 
 ## What an account is, and where the ledger lives
 

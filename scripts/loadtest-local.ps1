@@ -50,6 +50,26 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# Windows PowerShell 5.1 turns any line a native program writes to stderr into
+# an ErrorRecord, and with $ErrorActionPreference = 'Stop' that aborts the
+# script -- even when the program went on to exit 0. These binaries warn on
+# stderr about unsealed keys, and cargo reports its progress there, both of
+# which are correct of them and neither of which is a failure here. So native
+# calls go through this and are judged on their exit code alone.
+#
+# Declared up here rather than beside the other helpers because a script runs
+# top to bottom: the release build below is the first thing that needs it.
+function Invoke-Native([string]$exe, [string[]]$exeArgs) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $exe @exeArgs 2>&1 } finally { $ErrorActionPreference = $previous }
+}
+
+function Run-Ok([string]$exe, [string[]]$exeArgs, [string]$what) {
+    Invoke-Native $exe $exeArgs | Write-Host
+    if ($LASTEXITCODE -ne 0) { throw "$what failed with exit code $LASTEXITCODE" }
+}
+
 $bin = Join-Path $root 'target\release'
 $node = Join-Path $bin 'hocmesh.exe'
 $coordBin = Join-Path $bin 'hocmesh-coordinator.exe'
@@ -57,7 +77,12 @@ $validatorBin = Join-Path $bin 'hocmesh-validator.exe'
 
 if (-not $SkipBuild) {
     Write-Host '==> building release binaries'
-    cargo build --release -p hocmesh -p hocmesh-coordinator -p hocmesh-validator
+    # Through Invoke-Native for the same reason as every other native call
+    # here: cargo writes its progress to stderr, and under
+    # $ErrorActionPreference = 'Stop' PowerShell 5.1 turns any stderr line from
+    # a native exe into a terminating NativeCommandError -- so a perfectly
+    # ordinary "Compiling hocmesh-protocol" aborted the run before it started.
+    Invoke-Native 'cargo' @('build', '--release', '-p', 'hocmesh', '-p', 'hocmesh-coordinator', '-p', 'hocmesh-validator') | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 }
 foreach ($b in @($node, $coordBin, $validatorBin)) {
@@ -121,22 +146,6 @@ function Wait-Health([int]$port, [string]$what) {
     $log = Join-Path $work "$what.log"
     if (Test-Path $log) { Get-Content $log -Tail 20 | Write-Host }
     throw "$what never became healthy on port $port"
-}
-
-# Windows PowerShell 5.1 turns any line a native program writes to stderr into
-# an ErrorRecord, and with $ErrorActionPreference = 'Stop' that aborts the
-# script -- even when the program went on to exit 0. These binaries warn on
-# stderr about unsealed keys, which is correct of them and not a failure here,
-# so native calls go through this and are judged on their exit code alone.
-function Invoke-Native([string]$exe, [string[]]$exeArgs) {
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try { & $exe @exeArgs 2>&1 } finally { $ErrorActionPreference = $previous }
-}
-
-function Run-Ok([string]$exe, [string[]]$exeArgs, [string]$what) {
-    Invoke-Native $exe $exeArgs | Write-Host
-    if ($LASTEXITCODE -ne 0) { throw "$what failed with exit code $LASTEXITCODE" }
 }
 
 try {

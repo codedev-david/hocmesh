@@ -356,34 +356,50 @@ impl LedgerNetwork {
         .into_iter()
         .flatten()
         .collect();
-        let mut counts = std::collections::HashMap::<(i64, i64, i64, u64, String), usize>::new();
-        for p in &proofs {
-            *counts
-                .entry((
-                    p.balance_mcu,
-                    p.earned_mcu,
-                    p.spent_mcu,
-                    p.head.sequence,
-                    p.head.entry_hash.clone(),
-                ))
-                .or_default() += 1;
-        }
-        let Some(((b, e, sp, s, h), n)) = counts.into_iter().max_by_key(|x| x.1) else {
+        if proofs.is_empty() {
             bail!("no validator balance proofs available")
-        };
-        if n < self.set().threshold {
-            bail!("no quorum-agreed balance")
-        };
-        Ok(proofs
-            .into_iter()
-            .find(|p| {
-                p.balance_mcu == b
-                    && p.earned_mcu == e
-                    && p.spent_mcu == sp
-                    && p.head.sequence == s
-                    && p.head.entry_hash == h
-            })
-            .unwrap())
+        }
+        Self::agreed_balance(&proofs, self.set().threshold)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no quorum-agreed balance"))
+    }
+
+    /// The balance a quorum of these proofs stands behind, if there is one.
+    ///
+    /// Grouped on the balance alone, and deliberately not on the head.
+    ///
+    /// A validator's head moves whenever *any* account transacts, so under
+    /// concurrent submits the same balance is routinely attested from
+    /// different heights. Grouping on `(sequence, entry_hash)` as well threw
+    /// those genuine agreements away and reported "no quorum" for an account
+    /// nobody disagreed about -- a spurious refusal that a load test with eight
+    /// concurrent submitters reproduced at roughly one job in twenty-four.
+    ///
+    /// What a quorum has to establish is "do `threshold` validators
+    /// independently say this account holds this?". The head is provenance for
+    /// *when* each one said it, and it stays inside the signed proof; it was
+    /// never part of the claim being agreed on.
+    ///
+    /// Ties go to the freshest group, which is what keeps this from trading a
+    /// liveness bug for a staleness one: a lagging set can also reach threshold
+    /// on a balance that was true a moment ago, and between two balances a
+    /// quorum will vouch for, the later one is the current one.
+    fn agreed_balance(proofs: &[BalanceProof], threshold: usize) -> Option<&BalanceProof> {
+        let mut by_balance =
+            std::collections::HashMap::<(i64, i64, i64), Vec<&BalanceProof>>::new();
+        for p in proofs {
+            by_balance
+                .entry((p.balance_mcu, p.earned_mcu, p.spent_mcu))
+                .or_default()
+                .push(p);
+        }
+        by_balance
+            .into_values()
+            .filter(|ps| ps.len() >= threshold)
+            .max_by_key(|ps| ps.iter().map(|p| p.head.sequence).max().unwrap_or(0))
+            // The freshest proof of the winning group, so a caller that records
+            // a head records one a quorum was standing behind.
+            .and_then(|ps| ps.into_iter().max_by_key(|p| p.head.sequence))
     }
 
     pub async fn claim_quorum(&self, claim: &str) -> Result<ClaimProof> {
@@ -1006,6 +1022,100 @@ mod tests {
             entry_hash: format!("hash-{sequence}"),
             membership_hash: "members".into(),
         }
+    }
+
+    /// A proof from `validator` saying the account holds `balance`, as of
+    /// `sequence`.
+    fn proof(validator: &str, balance: i64, sequence: u64) -> BalanceProof {
+        BalanceProof {
+            account_id: "acct".into(),
+            balance_mcu: balance,
+            earned_mcu: 0,
+            spent_mcu: 0,
+            head: head(sequence),
+            validator_id: validator.into(),
+            signature_b64: format!("sig-{validator}"),
+        }
+    }
+
+    /// The regression this whole extraction exists for.
+    ///
+    /// Four validators, every one of them saying the same balance, and no two
+    /// at the same height -- which is the ordinary state of a ledger taking
+    /// concurrent submits, not a fault. Requiring the heads to match too
+    /// reported "no quorum" here, and a load test with eight concurrent
+    /// submitters hit it about once every twenty-four jobs.
+    #[test]
+    fn validators_at_different_heights_still_agree_about_a_balance() {
+        let proofs = [
+            proof("a", 6_012, 155),
+            proof("b", 6_012, 156),
+            proof("c", 6_012, 157),
+            proof("d", 6_012, 154),
+        ];
+        let agreed = LedgerNetwork::agreed_balance(&proofs, 3).expect("four say the same thing");
+        assert_eq!(agreed.balance_mcu, 6_012);
+        // The head that comes back must be one a quorum was standing behind,
+        // and the freshest of them is the least stale thing a caller can act on.
+        assert_eq!(agreed.head.sequence, 157);
+    }
+
+    /// Loosening the grouping must not loosen the threshold.
+    #[test]
+    fn a_balance_only_some_validators_will_vouch_for_is_still_refused() {
+        let proofs = [
+            proof("a", 100, 40),
+            proof("b", 100, 41),
+            proof("c", 90, 42),
+            proof("d", 80, 43),
+        ];
+        assert!(LedgerNetwork::agreed_balance(&proofs, 3).is_none());
+        // Two is enough for the pair that agree, and nothing above that.
+        assert_eq!(
+            LedgerNetwork::agreed_balance(&proofs, 2)
+                .unwrap()
+                .balance_mcu,
+            100
+        );
+    }
+
+    /// The staleness this trades against. Two groups can each reach threshold
+    /// -- one lagging, one current -- and the current one has to win, or a
+    /// quorum of slow validators could hold the answer back indefinitely.
+    #[test]
+    fn between_two_balances_a_quorum_will_vouch_for_the_later_one_wins() {
+        let proofs = [
+            proof("a", 100, 40),
+            proof("b", 100, 41),
+            proof("c", 90, 50),
+            proof("d", 90, 51),
+        ];
+        let agreed = LedgerNetwork::agreed_balance(&proofs, 2).unwrap();
+        assert_eq!(agreed.balance_mcu, 90);
+        assert_eq!(agreed.head.sequence, 51);
+    }
+
+    /// Earned and spent are grouped alongside the balance on purpose: two
+    /// validators can arrive at the same net figure by different histories,
+    /// and that is disagreement, not agreement.
+    #[test]
+    fn the_same_balance_from_a_different_history_is_not_the_same_answer() {
+        let mut divergent = proof("b", 100, 41);
+        divergent.earned_mcu = 500;
+        divergent.spent_mcu = 400;
+        let proofs = [proof("a", 100, 40), divergent, proof("c", 100, 42)];
+        assert!(LedgerNetwork::agreed_balance(&proofs, 3).is_none());
+        assert_eq!(
+            LedgerNetwork::agreed_balance(&proofs, 2)
+                .unwrap()
+                .earned_mcu,
+            0
+        );
+    }
+
+    #[test]
+    fn nothing_at_all_agrees_about_nothing() {
+        assert!(LedgerNetwork::agreed_balance(&[], 1).is_none());
     }
 
     /// The regression this exists for: a proposer that loses a race must be

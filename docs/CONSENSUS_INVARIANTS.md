@@ -187,6 +187,18 @@ outbid the requester who is reclaiming it.
 measured from the `created_at` of the certified reservation - never from a
 coordinator lease, which no validator has any reason to trust.
 
+That independence cuts both ways, and it is why the window constrains the lease
+even though it does not read it. Leases are no longer a flat 900s: a slower node
+is given up to `MAX_LEASE_SECONDS` (2700s) for the same shard rather than being
+refused it. Nothing in this file changes as a result - the lease is still not an
+input to any validation rule - but a lease longer than the window would let a
+provider still working under a deadline the coordinator granted find the escrow
+already reclaimed underneath it. So `MAX_LEASE_SECONDS < SETTLEMENT_WINDOW_SECS`
+is asserted at compile time in `hocmesh-protocol`, and the slack between them is
+what a shard may spend queued before it is handed out. Widening the lease past
+the window is a protocol change, because the window is consensus-visible and the
+history certified under one value must not validate under another.
+
 A refund is otherwise validated exactly like a reward: same shard-split check
 against the certified root reservation, same funding-type check, same
 deterministic amount, and the same two-posting shape.

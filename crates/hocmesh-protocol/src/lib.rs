@@ -11,6 +11,22 @@ pub const PROTOCOL_VERSION: u32 = 6;
 pub const AUTH_MAX_CLOCK_SKEW_SECS: i64 = 300;
 pub const DEFAULT_LEASE_SECONDS: i64 = 900;
 
+/// The longest a shard may be leased to a node that needs longer than most.
+///
+/// A lease is a timeout, not a price: nothing on the chain reads it, and a
+/// shard is worth the same mCU however long its holder took. So the ceiling
+/// exists only to bound how long a shard can be parked before the mesh gives
+/// up on it -- and pinning every node to `DEFAULT_LEASE_SECONDS` did something
+/// quite different. It excluded slower machines outright, because a node
+/// predicted to overrun the flat lease was refused the shard rather than
+/// given longer to finish it. That is backwards for a network whose whole
+/// premise is that modest hardware still has something to contribute.
+///
+/// Three times the default, which is the spread between a current laptop and
+/// a workstation a decade older -- roughly the widest gap worth scheduling
+/// across before waiting on the slow node costs more than the work is worth.
+pub const MAX_LEASE_SECONDS: i64 = DEFAULT_LEASE_SECONDS * 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GpuCapability {
     pub stable_id: String,
@@ -800,6 +816,17 @@ pub fn submit_body_hash(w: &WorkSpec, s: u32) -> Result<String, serde_json::Erro
 /// and never from a coordinator's lease, which is not. The coordinator is
 /// never the authority for CU.
 pub const SETTLEMENT_WINDOW_SECS: i64 = DEFAULT_LEASE_SECONDS * 4;
+
+/// The window has to outlast the longest lease inside it, or a provider still
+/// working under a lease the coordinator granted would find the CU already
+/// reclaimed when it delivered. The slack left over is what a shard may spend
+/// queued before it is handed out, since the window runs from the reserve and
+/// the lease only starts at assignment.
+///
+/// Checked here rather than left to prose: this constant is consensus-visible,
+/// so widening the lease past it is a protocol change and must be seen to be
+/// one instead of quietly breaking settlement for slow nodes.
+const _: () = assert!(MAX_LEASE_SECONDS < SETTLEMENT_WINDOW_SECS);
 
 /// The body a requester signs to ask for an unsettled shard's CU back.
 ///

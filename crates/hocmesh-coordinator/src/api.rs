@@ -1699,7 +1699,12 @@ async fn poll_work(
         "shard offered"
     );
 
-    let lease_until = now + DEFAULT_LEASE_SECONDS;
+    // Sized to the node that is taking it. `fit` has already refused anyone no
+    // lease would cover, so this only ever decides how much longer than the
+    // default a slower machine gets -- and the shard is worth the same mCU
+    // either way, because the price is in the work and not in the clock.
+    let lease_seconds = schedule::lease_seconds_for(&worker.caps, chosen.reward_mcu);
+    let lease_until = now + lease_seconds;
     // `leased_by` records which coordinator is responsible for this lease, so a
     // peer that goes unreachable can have its in-flight leases cut short
     // without touching anyone else's.
@@ -1722,7 +1727,9 @@ async fn poll_work(
             shard_index: chosen.shard_index,
             work,
             reward_mcu: chosen.reward_mcu,
-            lease_seconds: DEFAULT_LEASE_SECONDS,
+            // The same number the row was written with, so the node's own idea
+            // of its deadline matches the one it will actually be held to.
+            lease_seconds,
             system_funded,
         }),
     }))

@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### Modest hardware is scheduled, not excluded
+
+A node predicted to take longer than the flat 900-second lease was refused the
+shard outright (`Unfit::SlowerThanLease`). The lease is a timeout, not a price —
+nothing on the chain reads it, and a shard is worth the same mCU however long
+its holder took — so a constant that knew nothing about the machine was deciding
+which machines were allowed to contribute at all. On a network whose premise is
+lending hardware you already own, that is the wrong answer.
+
+The lease is now sized to the node taking the shard: `predicted × 1.5`, floored
+at the old default so nobody loses time they had before, and capped at
+`MAX_LEASE_SECONDS` (3× the default). A machine roughly three times slower than
+a current laptop — a decade-old workstation, say — now earns on the same shards
+at the same price, and simply takes longer over them.
+
+Past the ceiling `SlowerThanLease` still applies, because at that point the mesh
+really is better off giving the shard to somebody else.
+
+`SETTLEMENT_WINDOW_SECS` is unchanged and so is `PROTOCOL_VERSION`: the new
+ceiling was chosen to fit inside the existing window, which is consensus-visible.
+A compile-time assertion now enforces that the longest lease stays shorter than
+the window it settles in, so widening it later has to be a deliberate protocol
+change rather than a quiet break in settlement for exactly the slow nodes this
+was meant to help.
+
+Shard *sizing* is deliberately untouched. Validators recompute a job's price
+from `(work, shards)`, so the shard count is part of what quorum signs — cutting
+smaller shards for slower machines would have the coordinator charge a number
+the validators reject.
+
+### `loadtest-local.ps1` can build its own binaries again
+
+The one native call in the script that was not routed through `Invoke-Native`
+was the `cargo build` at the top, so an ordinary `Compiling hocmesh-protocol`
+on stderr became a terminating `NativeCommandError` and the run died before it
+started. It only ever surfaced without `-SkipBuild`. Moving the helper above its
+first use was part of the fix — a PowerShell script runs top to bottom, and the
+function was declared eighty lines below the call.
+
+### A quorum can agree about a balance from different heights
+
+`balance_quorum` grouped validator proofs on the whole tuple including
+`head.sequence` and `head.entry_hash`, so a quorum had to be at the byte-identical
+ledger head at the same instant. A validator's head moves whenever *any* account
+transacts, so under concurrent submits the same balance is routinely attested
+from different heights, and those genuine agreements were thrown away — the
+coordinator returned `409 no quorum-agreed balance` for an account no validator
+disagreed about. The new load test reproduced it at roughly one job in
+twenty-four with eight concurrent submitters.
+
+Proofs are now grouped on `(balance, earned, spent)`, which is the claim being
+agreed on; the head stays inside each signed proof as provenance for when that
+validator said it. Where two groups both reach threshold the freshest wins, so
+a lagging quorum cannot hold the answer back. The threshold itself is unchanged.
+
 ### An account can move to a new machine
 
 Nothing about an account was ever tied to the hardware it was made on — the
