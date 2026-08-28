@@ -10,6 +10,7 @@ use futures::future::join_all;
 use reqwest::Client;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 
 #[derive(Clone)]
@@ -62,6 +63,14 @@ enum Attempt {
 /// Contention is other people settling, so losing repeatedly is progress for
 /// somebody. Still, a caller waiting on a reply deserves an answer eventually.
 const ROUND_ATTEMPTS: u32 = 6;
+
+/// How long a balance read will wait for the set to agree with itself.
+///
+/// Long enough to outlast a commit still landing on the last seats and a
+/// validator noticing it missed one and fetching it, and short enough that a
+/// set which has actually diverged is reported rather than hung on.
+const BALANCE_CONVERGENCE: Duration = Duration::from_secs(4);
+const BALANCE_POLL: Duration = Duration::from_millis(120);
 
 /// A validator that stops answering must not be able to hold a proposer open
 /// forever. Without this a single hung socket blocks the round loop past every
@@ -317,7 +326,38 @@ impl LedgerNetwork {
                 .collect(),
         })
     }
+    /// The balance a quorum of the set stands behind, waiting briefly for one.
+    ///
+    /// A balance no quorum stands behind is more often a quorum mid-step than a
+    /// quorum that disagrees. An entry commits the moment `threshold` seats
+    /// have stored it, so for a short while the remaining seats are still
+    /// attesting the balance from just before it, and an account whose last
+    /// entry landed milliseconds ago reads as contested to a caller that looks
+    /// exactly once. The load test hit that on the first thing it does after
+    /// banking its float -- read the balance the run will be measured against.
+    ///
+    /// Waiting is what tells the two apart. Lag closes on its own; a set that
+    /// has genuinely diverged does not, and after the budget the error names
+    /// which case this was and what the seats were actually holding.
     pub async fn balance_quorum(&self, account: &str) -> Result<BalanceProof> {
+        let deadline = std::time::Instant::now() + BALANCE_CONVERGENCE;
+        loop {
+            let last = match self.balance_once(account).await {
+                Ok(proof) => return Ok(proof),
+                Err(e) => e,
+            };
+            if std::time::Instant::now() >= deadline {
+                return Err(last.context(format!(
+                    "the validator set did not settle on a balance for {account} within {:?}",
+                    BALANCE_CONVERGENCE
+                )));
+            }
+            tokio::time::sleep(BALANCE_POLL).await;
+        }
+    }
+
+    /// One look at what every seat says this account holds.
+    async fn balance_once(&self, account: &str) -> Result<BalanceProof> {
         let mh = membership_hash(&self.set())?;
         let proofs: Vec<BalanceProof> = join_all(self.set().members.iter().map(|m| {
             let (http, mh) = (&self.http, &mh);
@@ -359,9 +399,38 @@ impl LedgerNetwork {
         if proofs.is_empty() {
             bail!("no validator balance proofs available")
         }
-        Self::agreed_balance(&proofs, self.set().threshold)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no quorum-agreed balance"))
+        Self::agreed_balance(&proofs, self.set().threshold).cloned().ok_or_else(|| {
+            // What the seats were holding, biggest camp first. A bare "no
+            // quorum-agreed balance" says nothing about whether one seat is a
+            // few entries behind or the set has split down the middle, and
+            // those want opposite responses from whoever reads the error.
+            let mut camps = std::collections::HashMap::<(i64, i64, i64), Vec<&BalanceProof>>::new();
+            for p in &proofs {
+                camps
+                    .entry((p.balance_mcu, p.earned_mcu, p.spent_mcu))
+                    .or_default()
+                    .push(p);
+            }
+            let mut camps: Vec<_> = camps.into_iter().collect();
+            camps.sort_by_key(|(_, ps)| std::cmp::Reverse(ps.len()));
+            let split = camps
+                .iter()
+                .map(|((balance, _, _), ps)| {
+                    format!(
+                        "{} seat(s) at {balance} mCU (height {})",
+                        ps.len(),
+                        ps.iter().map(|p| p.head.sequence).max().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::anyhow!(
+                "no quorum-agreed balance for {account}: {} of {} seats answered,                  threshold is {} -- {split}",
+                proofs.len(),
+                self.set().members.len(),
+                self.set().threshold
+            )
+        })
     }
 
     /// The balance a quorum of these proofs stands behind, if there is one.
@@ -945,6 +1014,22 @@ impl LedgerNetwork {
         limit: u64,
         at: &ValidatorSet,
     ) -> Result<Vec<QuorumCertificate>> {
+        // Every seat is asked in turn until one of them can actually serve the
+        // range, and "answered" is not the same as "served it". A seat that is
+        // itself behind returns an empty page for a height it has not reached,
+        // and stopping at the first such answer told the caller the chain had
+        // nothing there -- so a validator trying to catch up on the one entry
+        // it missed could be sent away by another validator missing the same
+        // entry.
+        //
+        // An empty page from every seat is a different thing and stays a
+        // successful empty result: that is how the end of the chain reads, and
+        // callers walking forward rely on it to know when to stop.
+        //
+        // Each refusal is kept and reported together, because "no validator
+        // could provide ledger entries" is not something anybody can act on.
+        let mut why: Vec<String> = Vec::new();
+        let mut end_of_chain = false;
         for m in &self.set().members {
             let url = format!(
                 "{}/v1/ledger/entries?from={}&limit={}",
@@ -952,23 +1037,61 @@ impl LedgerNetwork {
                 from,
                 limit
             );
-            if let Ok(r) = self.http.get(url).send().await
-                && r.status().is_success()
-            {
-                let e = r.json::<EntriesResponse>().await?;
-                let mut active = at.clone();
-                for c in &e.certificates {
-                    verify_certificate(c, &active)?;
-                    for t in &c.entry.transactions {
-                        if let TransactionEvidence::MembershipChange(mc) = &t.evidence {
-                            active = verify_membership_change(&active, mc)?;
-                        }
+            let seat = short_id(&m.validator_id);
+            let r = match self.http.get(url).send().await {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    why.push(format!("{seat}: HTTP {}", r.status()));
+                    continue;
+                }
+                Err(e) => {
+                    why.push(format!("{seat}: {e}"));
+                    continue;
+                }
+            };
+            let e = match r.json::<EntriesResponse>().await {
+                Ok(e) => e,
+                Err(e) => {
+                    why.push(format!("{seat}: unreadable page ({e})"));
+                    continue;
+                }
+            };
+            if e.certificates.is_empty() {
+                why.push(format!("{seat}: nothing at height {from}"));
+                end_of_chain = true;
+                continue;
+            }
+            // Verification failing is a seat serving history this set did not
+            // sign. That is worth moving past rather than dying on: the range
+            // may still be readable from somebody honest, and nothing
+            // unverified is ever returned.
+            let mut active = at.clone();
+            let checked = e.certificates.iter().try_for_each(|c| {
+                verify_certificate(c, &active)?;
+                for t in &c.entry.transactions {
+                    if let TransactionEvidence::MembershipChange(mc) = &t.evidence {
+                        active = verify_membership_change(&active, mc)?;
                     }
                 }
-                return Ok(e.certificates);
+                anyhow::Ok(())
+            });
+            if let Err(e) = checked {
+                why.push(format!("{seat}: served history that does not verify ({e})"));
+                continue;
             }
+            return Ok(e.certificates);
         }
-        bail!("no validator could provide ledger entries")
+        if end_of_chain {
+            return Ok(Vec::new());
+        }
+        bail!(
+            "no validator could provide ledger entries from height {from} ({})",
+            if why.is_empty() {
+                "the set is empty".to_string()
+            } else {
+                why.join("; ")
+            }
+        )
     }
     /// A page of one account's postings, newest first.
     ///

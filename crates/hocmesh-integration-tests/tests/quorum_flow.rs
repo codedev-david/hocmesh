@@ -28,7 +28,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -265,15 +265,17 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
         "3 remaining validators should still certify with 3-of-4 threshold"
     );
 
-    run_ok(
-        Command::new(&validator_bin)
-            .arg("sync")
-            .arg("--db")
-            .arg(&validator_dbs[2])
-            .arg("--validators")
-            .arg(&validators_path),
-        "sync restarted validator",
-    )?;
+    // Brought back with nothing done to it. No `validator sync`, no operator:
+    // a seat that missed entries while it was down has to notice and fetch
+    // them itself.
+    //
+    // It used to be the other way round. A certificate only applies on top of
+    // the head it names, so this seat would have refused the entry it missed
+    // and every entry after it, for as long as it ran -- while still answering
+    // balance queries with a stale number signed as though it were current.
+    // Two seats in that state deny a quorum on an account nobody disagrees
+    // about, which is how it surfaced: a load test failing to read the balance
+    // it was about to be measured against.
     validators[2] = ProcessGuard::spawn(
         Command::new(&validator_bin)
             .arg("serve")
@@ -288,14 +290,35 @@ async fn four_validator_quorum_earn_spend_recover_and_audit() -> Result<()> {
     )?;
     wait_health(&http, validator_ports[2]).await?;
 
-    let heads = validator_heads(&http, &set).await?;
+    let behind = validator_heads(&http, &set).await?;
+    let leader = behind.iter().map(|h| h.sequence).max().unwrap_or(0);
+    assert!(
+        behind[2].sequence < leader,
+        "the restarted seat should be behind at {} of {leader}, or this proves nothing",
+        behind[2].sequence
+    );
+
+    let heads = wait_for_agreed_heads(&http, &set).await?;
     assert!(
         heads
             .windows(2)
             .all(|pair| pair[0].sequence == pair[1].sequence
                 && pair[0].entry_hash == pair[1].entry_hash),
-        "all validator heads should match after rejoin"
+        "a restarted validator should catch itself up without being told to: {heads:?}"
     );
+
+    // The manual path is still there for a seat that is not running -- a
+    // restore from a snapshot, a database moved between machines -- and has to
+    // agree with what the seat worked out on its own.
+    run_ok(
+        Command::new(&validator_bin)
+            .arg("sync")
+            .arg("--db")
+            .arg(&validator_dbs[2])
+            .arg("--validators")
+            .arg(&validators_path),
+        "sync a validator that is already level",
+    )?;
     // ---- Inference, under quorum ----
     //
     // This is the leg the whole network exists for: one node lends its GPU,
@@ -1119,8 +1142,18 @@ struct TestDir {
 
 impl TestDir {
     fn new() -> Result<Self> {
+        // A counter, not just a clock reading. Windows advances the system
+        // clock in ~15 ms steps, so two tests starting in the same tick get
+        // the same nanosecond -- and then one of them deletes the other's
+        // ledger, keys and databases out from under it on drop. That failure
+        // looks like a protocol bug and is not one.
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = env::temp_dir().join(format!("hocmesh-integration-{suffix}"));
+        let path = env::temp_dir().join(format!(
+            "hocmesh-integration-{}-{suffix}-{ordinal}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path)?;
         Ok(Self { path })
     }
@@ -1372,6 +1405,33 @@ async fn balance(http: &Client, coordinator: &str, node: &TestNode) -> Result<Ba
 
 async fn job_status(http: &Client, coordinator: &str, job_id: &str) -> Result<JobStatusResponse> {
     get_json(http, coordinator, &format!("/v1/jobs/{job_id}")).await
+}
+
+/// Wait for every seat to report the same head, or say what they were holding.
+///
+/// The catch-up is a background heartbeat rather than something a request
+/// drives, so convergence is quick but not instant, and polling for it beats
+/// sleeping for a number somebody guessed.
+async fn wait_for_agreed_heads(http: &Client, set: &ValidatorSet) -> Result<Vec<LedgerHead>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last = Vec::new();
+    loop {
+        last = validator_heads(http, set).await.unwrap_or(last);
+        if last.len() == set.members.len()
+            && last
+                .windows(2)
+                .all(|p| p[0].sequence == p[1].sequence && p[0].entry_hash == p[1].entry_hash)
+        {
+            return Ok(last);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "validator heads never converged: {:?}",
+                last.iter().map(|h| h.sequence).collect::<Vec<_>>()
+            )
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 async fn validator_heads(http: &Client, set: &ValidatorSet) -> Result<Vec<LedgerHead>> {
@@ -2517,12 +2577,20 @@ async fn settlement_survives_wan_latency_and_a_minority_partition() -> Result<()
         "losing a minority of the quorum must not stop settlement"
     );
 
-    // The link comes back. The three validators that stayed reachable have
-    // been settling all along, so they agree; the isolated one is strictly
-    // behind, because a replica that missed commits does not invent them.
+    // The link comes back, and nothing else is done: no operator, no `validator
+    // sync`, no restart. Every seat must end up on the same head by itself.
+    //
+    // What `cut` models is worth being exact about. The fault link sits in
+    // front of a validator's port, so cutting it stops anything reaching that
+    // seat while leaving the sockets it opens itself alone. A seat that can
+    // still read the chain it is part of should not fall behind at all, and
+    // once it can be reached again it certainly must not stay behind. The seat
+    // that genuinely cannot reach anyone is the killed one in
+    // `four_validator_quorum_earn_spend_recover_and_audit`, which is where the
+    // "a replica does not invent entries it never received" half is proved.
     links[0].heal();
-    let mut connected = None;
-    for _ in 0..100 {
+    let mut agreed = None;
+    for _ in 0..300 {
         // A request across a link that was just cut and healed can hang on a
         // socket the partition left behind, and one such request must not eat
         // the whole retry budget. Bound it and ask again.
@@ -2531,46 +2599,22 @@ async fn settlement_survives_wan_latency_and_a_minority_partition() -> Result<()
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        if heads[1].sequence > 0 && heads[1..].iter().all(|h| h.sequence == heads[1].sequence) {
-            connected = Some(heads[1].sequence);
+        if heads[0].sequence > 0
+            && heads
+                .windows(2)
+                .all(|p| p[0].sequence == p[1].sequence && p[0].entry_hash == p[1].entry_hash)
+        {
+            agreed = Some(heads[0].sequence);
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let connected = connected.context("the reachable validators never agreed on a head")?;
-    let behind = validator_heads(&http, &set).await?[0].sequence;
-    assert!(
-        behind < connected,
-        "a validator cut off from the quorum must fall behind, not keep pace"
-    );
-
-    // Catching it up is the documented repair: stop it, replay from its
-    // peers, start it again. A healed link does not do that on its own.
-    drop(validators.remove(0));
-    run_ok(
-        Command::new(&validator_bin)
-            .arg("sync")
-            .arg("--db")
-            .arg(&validator_dbs[0])
-            .arg("--validators")
-            .arg(&validators_path),
-        "replay the isolated validator from its peers",
+    let agreed = agreed.context(
+        "the set never came back to one head after the partition healed, with no operator          action to blame it on",
     )?;
-    validators.push(
-        start_validator(
-            &validator_bin,
-            &validators_path,
-            &validator_homes[0],
-            &validator_dbs[0],
-            validator_ports[0],
-            &http,
-        )
-        .await?,
-    );
-    let healed = validator_heads(&http, &set).await?;
     assert!(
-        healed.iter().all(|h| h.sequence == connected),
-        "every validator should hold the same head once the laggard has replayed"
+        agreed > 0,
+        "a set agreeing on the genesis head has not settled anything"
     );
 
     drop(validators);

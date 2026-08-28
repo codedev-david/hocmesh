@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -101,6 +101,15 @@ struct App {
     store: Arc<Mutex<LedgerStore>>,
     id: NodeIdentity,
     set: Arc<RwLock<ValidatorSet>>,
+    /// The rest of the quorum, so this seat can read the chain it is part of.
+    ///
+    /// A validator that only ever hears about entries by being handed them is
+    /// one dropped connection away from being permanently behind. This is how
+    /// it goes and looks.
+    net: Arc<LedgerNetwork>,
+    /// Held while catching up, so several requests that all notice the same
+    /// gap close it once between them instead of each fetching it.
+    healing: Arc<tokio::sync::Mutex<()>>,
 }
 impl App {
     /// The set as the chain last left it.
@@ -239,8 +248,11 @@ async fn serve(listen: &str, db: &str, home: &FsPath, validators: &str) -> Resul
     let app = App {
         store: Arc::new(Mutex::new(store)),
         id,
-        set: Arc::new(RwLock::new(set)),
+        set: Arc::new(RwLock::new(set.clone())),
+        net: Arc::new(LedgerNetwork::new(set)?),
+        healing: Arc::new(tokio::sync::Mutex::new(())),
     };
+    tokio::spawn(heal_forever(app.clone()));
     let r = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/ledger/head", get(head))
@@ -478,8 +490,159 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
         }
     }))
 }
+/// How many certificates one catch-up round asks for.
+const HEAL_BATCH: u64 = 256;
+
+/// How often an otherwise idle validator checks whether it has fallen behind.
+///
+/// Short, because the window this closes is short and consequential: between
+/// falling behind and catching up, this seat still answers balance queries --
+/// not with an error, but with a stale number signed as though it were
+/// current. Two seats in that state are enough to deny a quorum on an account
+/// nobody disagrees about.
+const HEAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Apply everything the quorum has certified up to and including `target`.
+///
+/// A certificate only applies on top of the head it names, so a validator that
+/// misses a single commit -- a dropped connection, a process killed mid-round,
+/// a moment of being busy -- refuses every entry after it as well, forever.
+/// Before this existed the only cure was an operator noticing and running
+/// `validator sync` by hand.
+///
+/// Nothing here is trusted from the peer that served it: every certificate is
+/// verified against the set that governed its height, exactly as `sync` and an
+/// audit do. The store lock is taken and released around each step rather than
+/// held across the fetch, because this runs inside request handlers.
+async fn catch_up_to(a: &App, target: u64) -> Result<u64> {
+    // One catch-up at a time. Several requests noticing the same gap should
+    // close it once between them, not fetch it once each and then race to
+    // apply what the others already applied.
+    let _one_at_a_time = a.healing.lock().await;
+    let mut applied = 0u64;
+    loop {
+        let (mut set, head) = {
+            let store = a.store.lock().map_err(|_| anyhow!("ledger store lock"))?;
+            let set = store.current_set()?.unwrap_or_else(|| a.set());
+            let head = store.head(&set)?;
+            (set, head)
+        };
+        if head.sequence >= target {
+            break;
+        }
+        let want = (target - head.sequence).min(HEAL_BATCH);
+        let certs = a
+            .net
+            .fetch_certificates(head.sequence + 1, want, &set)
+            .await?;
+        if certs.is_empty() {
+            bail!(
+                "the quorum has certified height {target} but no validator will serve \
+                 height {}",
+                head.sequence + 1
+            )
+        };
+        let reached = {
+            let mut store = a.store.lock().map_err(|_| anyhow!("ledger store lock"))?;
+            for c in certs {
+                if c.entry.sequence > target {
+                    break;
+                }
+                // Another handler may have applied part of this range while
+                // the page was in flight; what is already held is not an
+                // error, it is the work already done.
+                if c.entry.sequence <= store.head(&set)?.sequence {
+                    continue;
+                }
+                store.apply(&c, &set)?;
+                applied += 1;
+                // A certified membership change governs everything after it,
+                // so it takes effect here and not at the end of the batch.
+                if let Some(next) = store.current_set()? {
+                    set = next;
+                }
+            }
+            store.head(&set)?.sequence
+        };
+        *a.set.write().expect("validator set lock") = set;
+        // Without this a page that advanced nothing would be fetched forever.
+        if reached <= head.sequence {
+            bail!(
+                "catching up stalled at height {reached}: the entries served do not \
+                 extend this chain"
+            )
+        };
+    }
+    Ok(applied)
+}
+
+/// One pass of the background healer.
+async fn heal_once(a: &App) -> Result<u64> {
+    let remote = match a.net.head_quorum().await {
+        Ok(h) => h,
+        // A head this client cannot read is usually a set it has not caught up
+        // with either -- membership moved, and heads are matched on the
+        // membership hash. Follow the change and ask once more before giving
+        // up on the tick.
+        Err(first) => {
+            a.net
+                .refresh_set()
+                .await
+                .with_context(|| format!("reading the quorum head: {first}"))?;
+            a.net.head_quorum().await?
+        }
+    };
+    let local = {
+        let store = a.store.lock().map_err(|_| anyhow!("ledger store lock"))?;
+        let set = store.current_set()?.unwrap_or_else(|| a.set());
+        store.head(&set)?
+    };
+    if local.sequence >= remote.sequence {
+        return Ok(0);
+    }
+    catch_up_to(a, remote.sequence).await
+}
+
+/// Keep this seat level with the chain for as long as it is serving.
+///
+/// Deliberately quiet when there is nothing to do and quiet about failing: a
+/// tick that cannot reach the quorum is a network that is down, which the
+/// operator already knows about, and logging it every second would bury the
+/// one line that matters.
+async fn heal_forever(a: App) {
+    loop {
+        tokio::time::sleep(HEAL_INTERVAL).await;
+        match heal_once(&a).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(entries = n, "caught up with the quorum"),
+            Err(e) => tracing::debug!(error = %e, "could not check for missed entries"),
+        }
+    }
+}
+
 async fn commit(State(a): State<App>, Json(c): Json<QuorumCertificate>) -> Answer<CommitResponse> {
     verify_certificate(&c, &a.set()).map_err(|e| e.to_string())?;
+    // A certificate landing above this seat's head is not something to refuse.
+    // It is proof of a height, signed by the quorum; this seat is simply
+    // missing what came before it. Close that gap from the rest of the set and
+    // then apply it, rather than turning one missed commit into a seat that
+    // never catches up.
+    let behind = {
+        let store = a
+            .store
+            .lock()
+            .map_err(|_| "ledger store lock".to_string())?;
+        let set = store
+            .current_set()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| a.set());
+        store.head(&set).map_err(|e| e.to_string())?.sequence + 1 < c.entry.sequence
+    };
+    if behind {
+        catch_up_to(&a, c.entry.sequence - 1)
+            .await
+            .map_err(|e| format!("catching up to height {}: {e}", c.entry.sequence - 1))?;
+    }
     let mut s = a.store.lock().map_err(|_| "lock".to_string())?;
     let local = s.head(&a.set()).map_err(|e| e.to_string())?;
     if c.entry.sequence <= local.sequence {
