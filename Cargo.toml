@@ -11,6 +11,7 @@ members = [
     "crates/hocmesh-gpu",
     "crates/hocmesh-ai",
     "crates/hocmesh-transport",
+    "crates/hocmesh-desktop",
 ]
 resolver = "2"
 

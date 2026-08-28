@@ -123,8 +123,14 @@ hocMESH/
 │   │   ├── db.rs
 │   │   └── error.rs
 │   │
-│   └── hocmesh-validator/
-│       └── main.rs
+│   ├── hocmesh-validator/
+│   │   └── main.rs
+│   │
+│   └── hocmesh-desktop/
+│       ├── supervisor.rs   starts, finds and stops the node
+│       ├── dashboard.rs    what the window is allowed to say
+│       ├── tray.rs         the menu and the health icon
+│       └── ui/             the window itself
 │
 ├── docs/
 │   ├── FULL_SYSTEM_SPEC.md
@@ -282,6 +288,33 @@ sudo installer -pkg ./hocmesh-0.3.0.pkg -target /
 ```powershell
 Start-Process msiexec.exe -Wait -ArgumentList '/i', '.\hocmesh-0.3.0-x86_64.msi'
 ```
+
+---
+
+# Desktop app
+
+`hocmesh-desktop` is the window and the system tray: a dashboard showing whether this machine is contributing, exactly how much of it is being lent, and the ledger of compute units it has earned and spent, together with the controls to change any of that.
+
+It is not the node. The node is `hocmesh daemon`, a separate process that keeps running when the window is closed, and the app starts, watches and stops it — the same split Docker Desktop draws between its window and its engine. Two rules follow, and both are enforced in code rather than in the interface: a daemon the app did not start is never stopped when the app quits, and a daemon that is already running is attached to, never duplicated.
+
+Run it from a checkout. The node has to be findable — beside the app binary, or on `PATH`:
+
+```bash
+cargo build --release -p hocmesh
+cargo run -p hocmesh-desktop
+```
+
+Build the installers, which lay the app and the node down together so the app finds the matching daemon beside itself rather than an older build somewhere on `PATH`:
+
+```bash
+./scripts/package-desktop.sh target/release/hocmesh "$(cat VERSION)" dist
+```
+
+```powershell
+./scripts/package-desktop.ps1 -Binary target/release/hocmesh.exe -Version (Get-Content VERSION -Raw).Trim() -OutputDirectory dist
+```
+
+That produces an MSI and an NSIS setup executable on Windows, a `.dmg` on macOS, and a `.deb` and an `.AppImage` on Linux; tagged releases carry all of them. `crates/hocmesh-desktop/BUNDLING.md` covers how the node is embedded and what each platform needs installed first.
 
 ---
 

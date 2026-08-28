@@ -11,12 +11,12 @@ use hocmesh_ai::{
 use hocmesh_core::identity::NodeIdentity;
 use hocmesh_model::ModelManifest;
 use hocmesh_protocol::{
-    BalanceResponse, ErrorResponse, HeartbeatRequest, JobStatusResponse, NetworkStatsResponse,
-    NodeCapabilities, NodeStatusResponse, PeerSampleResponse, PollRequest, PollResponse,
-    ReconciliationResponse, RefundRequest, RefundResponse, RegisterRequest, RegisterResponse,
-    ResultRequest, ResultResponse, SubmitJobRequest, SubmitJobResponse, WorkAssignment, WorkResult,
-    WorkSpec, empty_body_hash, heartbeat_body_hash, refund_body_hash, register_body_hash,
-    result_body_hash, submit_body_hash,
+    BalanceResponse, ErrorResponse, HeartbeatRequest, JobStatusResponse, LedgerHistoryResponse,
+    NetworkStatsResponse, NodeCapabilities, NodeStatusResponse, PeerSampleResponse, PollRequest,
+    PollResponse, ReconciliationResponse, RefundRequest, RefundResponse, RegisterRequest,
+    RegisterResponse, ResultRequest, ResultResponse, SubmitJobRequest, SubmitJobResponse,
+    WorkAssignment, WorkResult, WorkSpec, empty_body_hash, heartbeat_body_hash, refund_body_hash,
+    register_body_hash, result_body_hash, submit_body_hash,
 };
 use reqwest::{Client, Response};
 use serde::de::DeserializeOwned;
@@ -39,6 +39,14 @@ impl HocMeshClient {
 
     pub fn node_id(&self) -> String {
         self.identity.node_id()
+    }
+
+    /// The coordinator this client is pointed at.
+    ///
+    /// A dashboard has to be able to say which mesh it is showing; two homes on
+    /// one machine may be pointed at different ones.
+    pub fn coordinator(&self) -> &str {
+        &self.coordinator
     }
 
     pub async fn register(&self, capabilities: &NodeCapabilities) -> Result<RegisterResponse> {
@@ -137,6 +145,18 @@ impl HocMeshClient {
     pub async fn balance(&self) -> Result<BalanceResponse> {
         self.get(&format!("/v1/nodes/{}/balance", self.node_id()))
             .await
+    }
+
+    /// A page of this node's ledger history, newest first.
+    ///
+    /// `before` is the cursor a previous page returned; `None` starts at the
+    /// newest entry.
+    pub async fn history(&self, before: Option<u64>, limit: u32) -> Result<LedgerHistoryResponse> {
+        let mut path = format!("/v1/nodes/{}/history?limit={limit}", self.node_id());
+        if let Some(before) = before {
+            path.push_str(&format!("&before={before}"));
+        }
+        self.get(&path).await
     }
 
     pub async fn node_status(&self) -> Result<NodeStatusResponse> {

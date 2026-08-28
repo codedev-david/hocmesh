@@ -258,6 +258,67 @@ pub fn discover_devices() -> Vec<DeviceCapability> {
     devices
 }
 
+/// Identifier for the CPU when it is treated as an inference device.
+///
+/// A machine always has one, so it is never *discovered* -- listing it
+/// alongside the accelerators would tell every node it had gained a GPU. It is
+/// named instead, by an operator who has said they will serve inference on it,
+/// and resolved by [`resolve_device`] when an assignment arrives for it.
+pub const SHARED_CPU_DEVICE_ID: &str = "cpu-0";
+
+/// The CPU, described the way an accelerator is described.
+///
+/// llama.cpp runs on it with `--gpu-layers 0`, which is what the CPU build from
+/// `runtime-install` is for, so this is a device the node can genuinely execute
+/// on rather than a placeholder. The quantised formats are all readable on CPU
+/// -- slowly, but readable -- and claiming otherwise would decline work this
+/// machine can actually do.
+pub fn cpu_device() -> DeviceCapability {
+    DeviceCapability {
+        stable_id: SHARED_CPU_DEVICE_ID.into(),
+        backend: BackendKind::Cpu,
+        vendor: std::env::consts::ARCH.to_string(),
+        name: "CPU".into(),
+        // Left unstated here. How much memory the node is willing to give a
+        // model is an operator limit, not a property of the CPU, and it is
+        // filled in where that limit is known.
+        memory_bytes: None,
+        driver_version: None,
+        compute_version: None,
+        supports_fp16: true,
+        supports_bf16: true,
+        supports_int8: true,
+    }
+}
+
+/// Find the device an assignment names.
+///
+/// The scheduler places work on whatever the node advertised, and a node that
+/// lent its CPU advertised [`SHARED_CPU_DEVICE_ID`] -- which no discovery probe
+/// returns, because no probe enumerates the CPU. Resolving through this
+/// function rather than searching `discover_devices` directly is what stops a
+/// CPU-only node from accepting inference and then failing every batch with
+/// "assigned accelerator is no longer available".
+pub fn resolve_device(stable_id: &str) -> Option<DeviceCapability> {
+    discover_devices()
+        .into_iter()
+        .find(|device| device.stable_id == stable_id)
+        .or_else(|| (stable_id == SHARED_CPU_DEVICE_ID).then(cpu_device))
+}
+
+/// Layers to offload for a device, given what the operator asked for.
+///
+/// Offloading to a CPU is not a thing llama.cpp can do, and passing a non-zero
+/// count would either be ignored or refused depending on the build. An operator
+/// who set `--gpu-layers` for their GPU box should not have that number quietly
+/// applied to a CPU assignment.
+pub fn gpu_layers_for(device: &DeviceCapability, requested: u32) -> u32 {
+    match device.backend {
+        BackendKind::Cpu => 0,
+        _ => requested,
+    }
+}
+
 pub fn discover_cuda() -> Vec<DeviceCapability> {
     let Ok(output) = Command::new("nvidia-smi")
         .args([

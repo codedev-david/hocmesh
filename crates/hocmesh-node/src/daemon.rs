@@ -1,4 +1,5 @@
 use crate::client::HocMeshClient;
+use crate::control::{ControlSeed, ControlServer, DaemonMetrics, note_exchange};
 use anyhow::{Context, Result, ensure};
 use hocmesh_ai::{InferenceAssignment, PromptOutput};
 use hocmesh_core::compute::execute_work;
@@ -16,7 +17,23 @@ use std::{
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
-use tokio::task::JoinSet;
+use tokio::{sync::Notify, task::JoinSet};
+
+/// What the daemon needs in order to offer a control surface.
+///
+/// Optional as a whole, because a daemon started from a script on a headless
+/// box has nobody to control it and no reason to open a port. The desktop app
+/// always asks for one.
+pub struct ControlConfig {
+    pub home: PathBuf,
+    /// `0` asks the OS for a free port, which is the default. The real one is
+    /// published in the endpoint file, so nothing has to agree in advance.
+    pub port: u16,
+    /// The machine as detected, before limits. Held so that a limit raised
+    /// through the UI can give back what lowering it took away.
+    pub detected: Arc<NodeCapabilities>,
+    pub runtime_available: bool,
+}
 
 pub struct AiWorkerConfig {
     pub home: PathBuf,
@@ -38,26 +55,26 @@ pub struct ProximityConfig {
     pub probe_listen: Option<String>,
 }
 
+/// Everything a run is configured with, decided before it starts.
+///
+/// One struct rather than a long parameter list because these are read
+/// together and only ever set together -- the CLI builds exactly one of these,
+/// and a test that wants a daemon with no AI and no control surface says so by
+/// leaving two fields `None` rather than by counting positions.
+pub struct DaemonConfig {
+    pub capabilities: NodeCapabilities,
+    pub workers: usize,
+    pub poll_ms: u64,
+    pub ai: Option<AiWorkerConfig>,
+    pub proximity: ProximityConfig,
+    pub control: Option<ControlConfig>,
+}
+
 /// Run the node until the operator interrupts it.
-pub async fn run(
-    client: HocMeshClient,
-    capabilities: NodeCapabilities,
-    workers: usize,
-    poll_ms: u64,
-    ai: Option<AiWorkerConfig>,
-    proximity: ProximityConfig,
-) -> Result<()> {
-    run_until(
-        client,
-        capabilities,
-        workers,
-        poll_ms,
-        ai,
-        proximity,
-        async {
-            let _ = tokio::signal::ctrl_c().await;
-        },
-    )
+pub async fn run(client: HocMeshClient, config: DaemonConfig) -> Result<()> {
+    run_until(client, config, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
     .await
 }
 
@@ -68,13 +85,17 @@ pub async fn run(
 /// check that the servers this spawned are really gone.
 async fn run_until<S: std::future::Future<Output = ()>>(
     client: HocMeshClient,
-    capabilities: NodeCapabilities,
-    workers: usize,
-    poll_ms: u64,
-    ai: Option<AiWorkerConfig>,
-    proximity: ProximityConfig,
+    config: DaemonConfig,
     shutdown: S,
 ) -> Result<()> {
+    let DaemonConfig {
+        capabilities,
+        workers,
+        poll_ms,
+        ai,
+        proximity,
+        control,
+    } = config;
     let registered = client.register(&capabilities).await?;
     println!("hocMESH node {} registered", registered.node_id);
     println!(
@@ -84,17 +105,29 @@ async fn run_until<S: std::future::Future<Output = ()>>(
     println!("Contribution workers: {}", workers);
 
     let capabilities = Arc::new(RwLock::new(capabilities));
+    let metrics = DaemonMetrics::new();
+    // Registration succeeded, so the coordinator was reachable a moment ago.
+    // Starting from "unknown" instead would show a disconnected light on a
+    // daemon that had just proved otherwise.
+    metrics.record_contact();
+
     let heartbeat_client = client.clone();
     let heartbeat_caps = capabilities.clone();
+    let heartbeat_metrics = metrics.clone();
     let heartbeat = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
+            // Re-read every tick rather than capturing once: this is what makes
+            // a limits change through the control surface reach the coordinator
+            // without a restart.
             let Some(snapshot) = heartbeat_caps.read().ok().map(|caps| caps.clone()) else {
                 tracing::error!("capability lock poisoned; stopping heartbeat");
                 return;
             };
-            if let Err(error) = heartbeat_client.heartbeat(&snapshot).await {
+            let outcome = heartbeat_client.heartbeat(&snapshot).await;
+            note_exchange(&heartbeat_metrics, &outcome);
+            if let Err(error) = outcome {
                 tracing::warn!(%error, "heartbeat failed");
             }
         }
@@ -123,11 +156,42 @@ async fn run_until<S: std::future::Future<Output = ()>>(
         PROXIMITY_INTERVAL,
     ));
 
+    // Bound before any worker starts, so a desktop app that launched this
+    // process can attach the moment the endpoint file appears rather than
+    // polling for one that may never come.
+    let control_shutdown = Arc::new(Notify::new());
+    let mut control_home = None;
+    let mut control_server = None;
+    if let Some(config) = control {
+        let seed = ControlSeed {
+            home: config.home.clone(),
+            node_id: client.node_id(),
+            coordinator: client.coordinator().to_string(),
+            workers: workers.max(1),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: capabilities.clone(),
+            detected: config.detected,
+            runtime_available: config.runtime_available,
+            metrics: metrics.clone(),
+            shutdown: control_shutdown.clone(),
+        };
+        let (server, _state) = ControlServer::bind(seed, config.port).await?;
+        println!(
+            "Control surface on 127.0.0.1:{} (token in {})",
+            server.endpoint.port,
+            crate::control::ControlEndpoint::path(&config.home).display()
+        );
+        control_home = Some(config.home);
+        control_server = Some(tokio::spawn(async move { server.serve().await }));
+    }
+
     let mut workers_set = JoinSet::new();
     for worker_id in 0..workers.max(1) {
         let worker_client = client.clone();
-        workers_set
-            .spawn(async move { worker_loop(worker_client, worker_id, poll_ms.max(100)).await });
+        let worker_metrics = metrics.clone();
+        workers_set.spawn(async move {
+            worker_loop(worker_client, worker_id, poll_ms.max(100), worker_metrics).await
+        });
     }
 
     let mut seed_server = None;
@@ -144,12 +208,18 @@ async fn run_until<S: std::future::Future<Output = ()>>(
     }
     if let Some(config) = ai {
         let ai_client = client.clone();
-        workers_set.spawn(async move { ai_worker_loop(ai_client, config, poll_ms.max(100)).await });
+        let ai_metrics = metrics.clone();
+        workers_set.spawn(async move {
+            ai_worker_loop(ai_client, config, poll_ms.max(100), ai_metrics).await
+        });
     }
 
     tokio::select! {
         _ = shutdown => {
             println!("Shutdown requested; stopping hocMESH node.");
+        }
+        _ = control_shutdown.notified() => {
+            println!("Shutdown requested through the control surface; stopping hocMESH node.");
         }
         result = workers_set.join_next() => {
             match result {
@@ -169,14 +239,30 @@ async fn run_until<S: std::future::Future<Output = ()>>(
     if let Some(server) = seed_server {
         server.abort();
     }
+    if let Some(server) = control_server {
+        server.abort();
+    }
+    // Withdraw the advertisement last and unconditionally. A file left behind
+    // tells the next dashboard that a daemon which has just stopped is running,
+    // and leaves a spent token on disk.
+    if let Some(home) = control_home {
+        ControlServer::retire(&home);
+    }
     workers_set.abort_all();
     Ok(())
 }
 
-async fn ai_worker_loop(client: HocMeshClient, config: AiWorkerConfig, poll_ms: u64) -> Result<()> {
+async fn ai_worker_loop(
+    client: HocMeshClient,
+    config: AiWorkerConfig,
+    poll_ms: u64,
+    metrics: Arc<DaemonMetrics>,
+) -> Result<()> {
     let idle_delay = Duration::from_millis(poll_ms);
     loop {
-        let poll = match client.poll_inference().await {
+        let outcome = client.poll_inference().await;
+        note_exchange(&metrics, &outcome);
+        let poll = match outcome {
             Ok(poll) => poll,
             Err(error) => {
                 tracing::warn!(%error, "AI poll failed");
@@ -210,11 +296,16 @@ async fn ai_worker_loop(client: HocMeshClient, config: AiWorkerConfig, poll_ms: 
                 .await
             {
                 Ok(response) => {
+                    metrics.record_inference();
                     tracing::info!(%assignment_id, job_completed=response.job_completed, "AI assignment completed")
                 }
-                Err(error) => tracing::warn!(%assignment_id, %error, "AI result submission failed"),
+                Err(error) => {
+                    metrics.record_failure(&error);
+                    tracing::warn!(%assignment_id, %error, "AI result submission failed")
+                }
             },
             Err(error) => {
+                metrics.record_failure(&error);
                 tracing::warn!(%assignment_id, %error, "AI assignment failed; requesting reroute");
                 if let Err(report_error) = client
                     .fail_inference(assignment_id, error.to_string())
@@ -267,9 +358,10 @@ async fn execute_inference_assignment(
     if !model.exists() {
         store.materialize(&assignment.manifest, &model)?;
     }
-    let device = hocmesh_gpu::discover_devices()
-        .into_iter()
-        .find(|device| device.stable_id == assignment.device_id)
+    // Resolve rather than search. A node that lent its CPU advertised a device
+    // no discovery probe returns, and searching `discover_devices` directly is
+    // what made a CPU-only node accept inference and then fail every batch.
+    let device = hocmesh_gpu::resolve_device(&assignment.device_id)
         .context("assigned accelerator is no longer available")?;
     let mut outputs = Vec::with_capacity(assignment.prompts.len());
     for (prompt_index, prompt) in assignment.prompts {
@@ -279,7 +371,9 @@ async fn execute_inference_assignment(
         let max_tokens = assignment.max_tokens;
         let temperature_milli = assignment.temperature_milli;
         let seed = assignment.seed.wrapping_add(prompt_index as u64);
-        let gpu_layers = config.gpu_layers;
+        // An operator who set --gpu-layers for their GPU must not have that
+        // number applied to a CPU assignment, which cannot offload anything.
+        let gpu_layers = hocmesh_gpu::gpu_layers_for(&device, config.gpu_layers);
         let output = tokio::task::spawn_blocking(move || {
             LlamaCppBackend::new(runtime, device, gpu_layers)?.infer(
                 &model,
@@ -302,10 +396,20 @@ async fn execute_inference_assignment(
     Ok(outputs)
 }
 
-async fn worker_loop(client: HocMeshClient, worker_id: usize, poll_ms: u64) -> Result<()> {
+async fn worker_loop(
+    client: HocMeshClient,
+    worker_id: usize,
+    poll_ms: u64,
+    metrics: Arc<DaemonMetrics>,
+) -> Result<()> {
     let idle_delay = Duration::from_millis(poll_ms);
     loop {
-        let poll = match client.poll().await {
+        let outcome = client.poll().await;
+        // Every worker reports the same coordinator, so any one of them
+        // succeeding is enough to call the daemon connected -- which is what a
+        // dashboard is asking about.
+        note_exchange(&metrics, &outcome);
+        let poll = match outcome {
             Ok(poll) => poll,
             Err(error) => {
                 tracing::warn!(worker_id = worker_id, error = %error, "poll failed");
@@ -333,6 +437,10 @@ async fn worker_loop(client: HocMeshClient, worker_id: usize, poll_ms: u64) -> R
 
         match client.report_result(&assignment, &result).await {
             Ok(settlement) => {
+                // Counted on settlement rather than on execution. Work the
+                // coordinator did not accept earned nothing, and a dashboard
+                // that counted it would drift from the ledger.
+                metrics.record_completion(settlement.reward_mcu);
                 tracing::info!(
                     worker_id = worker_id,
                     assignment_id = %assignment.assignment_id,
@@ -342,6 +450,7 @@ async fn worker_loop(client: HocMeshClient, worker_id: usize, poll_ms: u64) -> R
                 );
             }
             Err(error) => {
+                metrics.record_failure(&error);
                 tracing::warn!(worker_id = worker_id, assignment_id = %assignment.assignment_id, error = %error, "result submission failed");
                 // The coordinator lease will expire and requeue the work if the result was not accepted.
             }
@@ -953,13 +1062,16 @@ mod proximity_tests {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let node = tokio::spawn(run_until(
             client,
-            hocmesh_core::hardware::detect_capabilities(false),
-            1,
-            1_000,
-            None,
-            ProximityConfig {
-                home: home.clone(),
-                probe_listen: Some(probe_address.to_string()),
+            DaemonConfig {
+                capabilities: hocmesh_core::hardware::detect_capabilities(false),
+                workers: 1,
+                poll_ms: 1_000,
+                ai: None,
+                proximity: ProximityConfig {
+                    home: home.clone(),
+                    probe_listen: Some(probe_address.to_string()),
+                },
+                control: None,
             },
             async move {
                 let _ = stopped.await;

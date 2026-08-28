@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the dashboard window is allowed to ask the app for. Deliberately narrow: the page renders a snapshot and sends back button presses, and has no business reading the filesystem, opening shells or talking to the network itself.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

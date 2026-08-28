@@ -52,6 +52,18 @@
 | Failure-aware rerouting | Implemented | Persistent failed-node exclusions and device-correct reassignment |
 | Inference settlement | Implemented | Two-stage receipt/verdict: escrow moves to a per-batch holding account on delivery, then to the provider on a signed acceptance or to the commons on a signed dispute |
 
+## Desktop application
+
+| Component | Status | Evidence / boundary |
+|---|---|---|
+| Tray and window | Implemented | Tauri v2 shell; the tray menu and its health icon are built from a `TrayModel` computed in plain Rust, so what the menu offers is decided and tested away from the event loop |
+| Node supervision | Implemented | Start, stop, restart and attach. A daemon the app did not start is never stopped when the app quits, and a daemon already running is attached to rather than duplicated; both rules live in `supervisor.rs` and are covered by unit tests and an end-to-end test that spawns a daemon behind the app's back |
+| Live dashboard | Implemented | Poll-and-emit snapshot every 3s: run state, coordinator, worker count, jobs completed/failed, what share of this machine is lent, and whether inference actually reached the mesh. Readiness is read from the same `advertised_capabilities` the daemon registers with, so the window cannot claim a readiness the coordinator was never told about |
+| Ledger view | Implemented | Balance and newest-first paged history read through the daemon's control endpoint, each page marked with whether a validator quorum stood behind it; a balance whose history page is missing shows as a total over an empty table rather than as no ledger |
+| Settings and limits | Implemented | Coordinator, worker ceiling, AI consent and the CPU/memory/GPU shares, persisted and applied to a running node without a restart. The settings file is a consent record: the app writes what the operator set and never widens a share on its own |
+| End-to-end proof | Implemented | An integration test drives the app's own layers against a real coordinator and daemon: cold snapshot, start, work completed, a paid ledger entry, a limit changed and read back off disk, then stop |
+| Installers | Implemented | Tauri bundler MSI and NSIS setup on Windows, DMG on macOS, DEB and AppImage on Linux, each carrying the node as a sidecar beside the app; `scripts/package-desktop.*` open what they produced and fail unless both executables are inside |
+
 ## Distribution
 
 | Component | Status | Evidence / boundary |
@@ -59,6 +71,7 @@
 | Windows installer | Implemented | WiX-built MSI, ICE validation, administrative extraction, client execution smoke test |
 | macOS installer | Implemented | Native PKG, payload inspection, extracted client execution smoke test |
 | Linux installer | Implemented | Native DEB, metadata/content validation, extracted client execution smoke test |
+| Desktop installers | Implemented | Built and content-checked on all three platforms in CI, published alongside the client installers on a tagged release |
 | Release integrity | Implemented | Per-artifact SHA-256 checksums and CycloneDX SBOM |
 | Platform signing | Deployment configuration required | Installers are unsigned until release signing identities are supplied |
 

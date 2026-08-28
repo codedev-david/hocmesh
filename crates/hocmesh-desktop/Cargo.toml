@@ -1,0 +1,50 @@
+[package]
+name = "hocmesh-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "hocMESH Desktop -- tray application and dashboard for a participating node"
+
+[lib]
+name = "hocmesh_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hocmesh-desktop"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+# The webview, the tray and the bundler. Splitting it out is not about
+# optional functionality -- shipping without a window would be pointless --
+# but about keeping the decisions in this crate testable somewhere that has
+# no display server, and keeping a webview out of anything that only needs
+# to drive a node.
+gui = ["dep:tauri", "dep:tauri-build"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [], optional = true }
+
+[dependencies]
+anyhow.workspace = true
+hocmesh = { path = "../hocmesh-node" }
+hocmesh-core = { path = "../hocmesh-core" }
+hocmesh-gpu = { path = "../hocmesh-gpu" }
+hocmesh-protocol = { path = "../hocmesh-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.11.5", features = [
+    "tray-icon",
+    "image-png",
+    "image-ico",
+], optional = true }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+uuid.workspace = true

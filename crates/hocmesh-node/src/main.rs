@@ -1,10 +1,7 @@
-mod client;
-mod daemon;
-mod install;
-
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use client::HocMeshClient;
+use hocmesh::client::HocMeshClient;
+use hocmesh::{control, daemon, install};
 use hocmesh_ai::{InferenceRequirements, PlanRequest, SubmitInferenceRequest};
 use hocmesh_core::compute::{split_work, work_cost_mcu};
 use hocmesh_core::{hardware, identity::NodeIdentity, limits::ResourceLimits, proximity::Vivaldi};
@@ -68,7 +65,18 @@ enum Command {
         /// this one. Requires a reachable address; measuring others does not.
         #[arg(long)]
         probe_listen: Option<String>,
+        /// Port for the local control surface the desktop app and `hocmesh
+        /// stop` talk to. Always loopback-only. `0` takes a free port, which
+        /// is what lets two homes run on one machine.
+        #[arg(long, default_value_t = 0)]
+        control_port: u16,
+        /// Run without a control surface. Nothing local can then change this
+        /// node's limits or stop it politely -- only a signal will.
+        #[arg(long)]
+        no_control: bool,
     },
+    /// Ask a running daemon on this machine to stop.
+    Stop,
     /// Show where this node sits in the network's latency space.
     Proximity,
     /// Show or set the share of this machine lent to the hocmesh.
@@ -444,19 +452,20 @@ async fn main() -> Result<()> {
             model_seed_listen,
             model_seed_url,
             probe_listen,
+            control_port,
+            no_control,
         } => {
             let cached_model_manifests = model_registry(&cli.home)?
                 .list()?
                 .iter()
                 .map(hocmesh_model::ModelManifest::digest)
                 .collect::<Result<Vec<_>>>()?;
-            let mut caps = hardware::detect_capabilities_with_models(
+            let mut detected = hardware::detect_capabilities_with_models(
                 true,
                 model_seed_url,
                 cached_model_manifests,
             );
             let limits = ResourceLimits::load_or_default(&cli.home)?;
-            hardware::apply_limits(&mut caps, &limits);
             // An installed runtime is used without having to be named, so
             // `runtime-install` followed by `daemon` is enough. --ai-runtime
             // still overrides it; --no-ai declines the work entirely.
@@ -465,7 +474,14 @@ async fn main() -> Result<()> {
             } else {
                 ai_runtime.or_else(|| hocmesh_gpu::runtime::installed_runtime(&cli.home))
             };
-            hardware::apply_ai_readiness(&mut caps, &limits, ai_runtime.is_some());
+            let runtime_available = ai_runtime.is_some();
+            detected.probe_endpoint = probe_listen.as_ref().map(|listen| probe_url(listen));
+            // Kept whole and unshrunk. Limits describe how much of this machine
+            // is lent, so raising one through the control surface has to be
+            // able to give back what lowering it took away -- which needs the
+            // machine as detected, not the last share of it.
+            let detected = Arc::new(detected);
+            let caps = control::advertised_capabilities(&detected, &limits, runtime_available);
             if ai_runtime.is_some() && !caps.ai_runtime_ready {
                 println!(
                     "An inference runtime is available but this node is not offering AI work. \
@@ -484,7 +500,6 @@ async fn main() -> Result<()> {
                     cpu.memory_mb.unwrap_or(0)
                 );
             }
-            caps.probe_endpoint = probe_listen.as_ref().map(|listen| probe_url(listen));
             // --workers may lower the ceiling the operator set, never raise it.
             let workers = limits.clamp_requested_workers(workers, caps.logical_cpus);
             println!(
@@ -505,7 +520,31 @@ async fn main() -> Result<()> {
                 home: cli.home.clone(),
                 probe_listen,
             };
-            daemon::run(client, caps, workers, poll_ms, ai, proximity).await?;
+            let control = (!no_control).then(|| daemon::ControlConfig {
+                home: cli.home.clone(),
+                port: control_port,
+                detected,
+                runtime_available,
+            });
+            daemon::run(
+                client,
+                daemon::DaemonConfig {
+                    capabilities: caps,
+                    workers,
+                    poll_ms,
+                    ai,
+                    proximity,
+                    control,
+                },
+            )
+            .await?;
+        }
+        Command::Stop => {
+            if control::request_shutdown(&cli.home).await? {
+                println!("Asked the hocMESH daemon to stop.");
+            } else {
+                println!("No hocMESH daemon is running for {}.", cli.home.display());
+            }
         }
         Command::Proximity => {
             let tracker = Vivaldi::load_or_seeded(&cli.home, client.node_id().as_bytes());

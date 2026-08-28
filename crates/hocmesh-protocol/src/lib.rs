@@ -313,6 +313,54 @@ pub struct BalanceResponse {
     pub ledger_height: Option<u64>,
     pub ledger_head: Option<String>,
 }
+/// One movement of CU into or out of a node's account.
+///
+/// A balance says where a node stands; this says how it got there, which is
+/// what an operator looking at a dashboard actually wants to see. It is
+/// deliberately not the ledger's own `AccountHistoryEntry`: a coordinator
+/// running without validators has no sequence or transaction to report, and a
+/// federated one has no local category. Both can fill this, and a reader can
+/// tell which by which fields are present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    /// Positive for CU earned, negative for CU spent.
+    pub delta_mcu: i64,
+    /// Why it moved, in the coordinator's own words -- `reward`, `reserve`,
+    /// `refund` and so on. Absent when the entry came from the chain, which
+    /// records transactions rather than categories.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<String>,
+    /// The ledger height this posting landed at, when there is a chain behind
+    /// the coordinator. This is what makes a row checkable against a
+    /// certificate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    pub created_at: i64,
+}
+
+/// A page of one node's history, newest first.
+///
+/// `next_before` is the cursor for the page after this one and is absent at
+/// the start of history. Paging on the position of the last row rather than on
+/// an offset keeps a page correct while new entries land above it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerHistoryResponse {
+    pub node_id: String,
+    /// Whether these rows came from the validator quorum or from the
+    /// coordinator's own table. A dashboard should say which it is showing:
+    /// only the first is authoritative.
+    pub authoritative: bool,
+    pub entries: Vec<LedgerEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_before: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatusResponse {
     pub job_id: String,

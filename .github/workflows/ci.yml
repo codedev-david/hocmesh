@@ -17,6 +17,13 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
+      # hocmesh-desktop links a webview and a tray, so a whole-workspace build
+      # needs GTK and WebKit present. Windows and macOS carry theirs already.
+      - name: Install desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libappindicator3-dev librsvg2-dev patchelf
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check
@@ -66,7 +73,7 @@ jobs:
             mv "$bom" "target/sbom/$crate.cdx.json"
             count=$((count + 1))
           done
-          test "$count" -eq 11
+          test "$count" -eq 12
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v7
         with:
@@ -84,6 +91,10 @@ jobs:
           toolchain: 1.97.1
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libappindicator3-dev librsvg2-dev patchelf
       - name: Measure workspace coverage
         run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/hocmesh-coverage.lcov --fail-under-lines 45 -- --test-threads=1
       - name: Upload coverage artifact
@@ -190,5 +201,59 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: hocmesh-client-${{ matrix.kind }}
+          path: dist/*
+          if-no-files-found: error
+
+  desktop-installers:
+    strategy:
+      matrix:
+        include:
+          # 22.04 rather than latest: linuxdeploy is itself an AppImage, so
+          # bundling one needs FUSE, which 24.04 runners no longer ship.
+          - os: ubuntu-22.04
+            kind: linux
+          - os: windows-latest
+            kind: windows
+          - os: macos-latest
+            kind: macos
+    timeout-minutes: 60
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Install desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libappindicator3-dev librsvg2-dev patchelf
+      # The daemon the app supervises, shipped inside the same installer. Built
+      # here so that the window and the node it starts come from one build.
+      - name: Build node binary
+        run: cargo build --release -p hocmesh --locked
+      - name: Build desktop installers (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./scripts/package-desktop.sh target/release/hocmesh "$(cat VERSION)" dist
+      - name: Build desktop installers (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-desktop.ps1 -Binary target/release/hocmesh.exe -Version (Get-Content VERSION -Raw).Trim() -OutputDirectory dist
+      # Each script opens what it produced and checks the node is inside; this
+      # is the cheap outer guard that something was produced at all.
+      - name: Smoke-test desktop installers
+        shell: pwsh
+        run: |
+          $artifacts = Get-ChildItem dist -File
+          if (-not $artifacts) { throw "no desktop installer was produced" }
+          foreach ($artifact in $artifacts) {
+            if ($artifact.Length -le 0) { throw "$($artifact.Name) is empty" }
+            Get-FileHash -Algorithm SHA256 $artifact.FullName
+          }
+      - name: Upload desktop installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: hocmesh-desktop-${{ matrix.kind }}
           path: dist/*
           if-no-files-found: error

@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>hocMESH Desktop</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true">
+            <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+              <path d="M32 32 32 13M32 32 48.5 22.5M32 32 48.5 41.5M32 32 32 51M32 32 15.5 41.5M32 32 15.5 22.5" />
+              <path
+                d="M32 13 48.5 22.5 48.5 41.5 32 51 15.5 41.5 15.5 22.5Z"
+                stroke-width="1.4"
+                opacity="0.55"
+              />
+            </g>
+            <g fill="currentColor">
+              <circle cx="32" cy="13" r="3.4" />
+              <circle cx="48.5" cy="22.5" r="3.4" />
+              <circle cx="48.5" cy="41.5" r="3.4" />
+              <circle cx="32" cy="51" r="3.4" />
+              <circle cx="15.5" cy="41.5" r="3.4" />
+              <circle cx="15.5" cy="22.5" r="3.4" />
+            </g>
+            <circle class="brand-hub" cx="32" cy="32" r="6.6" />
+          </svg>
+          <div class="brand-text">
+            <span class="brand-name">hocMESH</span>
+            <span class="brand-sub">Desktop</span>
+          </div>
+        </div>
+
+        <nav class="nav" id="nav">
+          <button class="nav-item is-active" type="button" data-view="overview">
+            <span class="nav-glyph" aria-hidden="true">◉</span> Overview
+          </button>
+          <button class="nav-item" type="button" data-view="resources">
+            <span class="nav-glyph" aria-hidden="true">▤</span> Resources
+          </button>
+          <button class="nav-item" type="button" data-view="ledger">
+            <span class="nav-glyph" aria-hidden="true">≡</span> Ledger
+          </button>
+          <button class="nav-item" type="button" data-view="settings">
+            <span class="nav-glyph" aria-hidden="true">⚙</span> Settings
+          </button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="kv-tight">
+            <span>App</span><span id="foot-app-version">—</span>
+          </div>
+          <div class="kv-tight">
+            <span>Node</span><span id="foot-node-version">—</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="state">
+            <span class="dot" id="state-dot"></span>
+            <div class="state-text">
+              <div class="state-label" id="state-label">Connecting…</div>
+              <div class="state-sub" id="state-sub">Reading this machine</div>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" type="button" id="btn-start">Start node</button>
+            <button class="btn" type="button" id="btn-stop">Stop</button>
+            <button class="btn" type="button" id="btn-restart">Restart</button>
+          </div>
+        </header>
+
+        <div class="scroll">
+          <div class="banner banner-warn" id="banner-error" hidden></div>
+
+          <!-- Overview -->
+          <section class="view is-active" id="view-overview">
+            <div class="cards" id="overview-stats"></div>
+            <section class="panel">
+              <h2>This node</h2>
+              <dl class="kv" id="overview-identity"></dl>
+            </section>
+          </section>
+
+          <!-- Resources -->
+          <section class="view" id="view-resources">
+            <div class="banner banner-info" id="banner-restart" hidden>
+              The node is running with the previous limits. Restart it to work to the new ones.
+            </div>
+
+            <section class="panel">
+              <h2>What this machine lends</h2>
+              <p class="hint">
+                These are a record of consent. Nothing on the mesh may use more of this machine
+                than the numbers below, and no one but you can raise them.
+              </p>
+
+              <div class="slider-row">
+                <label for="lim-cpu">Processor</label>
+                <input type="range" id="lim-cpu" min="0" max="100" step="1" />
+                <output class="slider-value" id="lim-cpu-value">—</output>
+                <span class="slider-note" id="lim-cpu-note"></span>
+              </div>
+
+              <div class="slider-row">
+                <label for="lim-mem">Memory</label>
+                <input type="range" id="lim-mem" min="0" max="100" step="1" />
+                <output class="slider-value" id="lim-mem-value">—</output>
+                <span class="slider-note" id="lim-mem-note"></span>
+              </div>
+
+              <div class="slider-row">
+                <label for="lim-gpu">Graphics</label>
+                <input type="range" id="lim-gpu" min="0" max="100" step="1" />
+                <output class="slider-value" id="lim-gpu-value">—</output>
+                <span class="slider-note" id="lim-gpu-note"></span>
+              </div>
+
+              <label class="check">
+                <input type="checkbox" id="lim-ai" />
+                <span>
+                  Run other people's AI inference on this machine
+                  <em class="hint" id="lim-ai-note"></em>
+                </span>
+              </label>
+
+              <div class="row-actions">
+                <button class="btn btn-primary" type="button" id="btn-apply-limits">
+                  Apply limits
+                </button>
+                <button class="btn" type="button" id="btn-reset-limits">Discard changes</button>
+                <span class="saved" id="limits-saved" hidden>Saved</span>
+              </div>
+            </section>
+
+            <section class="panel">
+              <h2>This machine</h2>
+              <dl class="kv" id="machine-facts"></dl>
+            </section>
+
+            <section class="panel">
+              <h2>Accelerators</h2>
+              <div id="accelerators"></div>
+            </section>
+          </section>
+
+          <!-- Ledger -->
+          <section class="view" id="view-ledger">
+            <div class="cards" id="ledger-totals"></div>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>History</h2>
+                <span class="tag" id="ledger-source"></span>
+              </div>
+              <p class="hint">
+                Compute units record work done for other people. They are never bought or sold, and
+                are redeemable only for work done for you.
+              </p>
+              <div class="table-wrap">
+                <table class="table" id="ledger-table">
+                  <thead>
+                    <tr>
+                      <th>When</th>
+                      <th>Reason</th>
+                      <th>Reference</th>
+                      <th class="num">Change</th>
+                    </tr>
+                  </thead>
+                  <tbody id="ledger-body"></tbody>
+                </table>
+              </div>
+              <div class="row-actions">
+                <button class="btn" type="button" id="btn-ledger-more">Load older</button>
+                <span class="hint" id="ledger-note"></span>
+              </div>
+            </section>
+          </section>
+
+          <!-- Settings -->
+          <section class="view" id="view-settings">
+            <section class="panel">
+              <h2>Application settings</h2>
+              <p class="hint">
+                These are this app's preferences. They cannot widen what the machine lends — that
+                lives with the node, under Resources.
+              </p>
+
+              <div class="field">
+                <label for="set-home">Node home</label>
+                <input type="text" id="set-home" spellcheck="false" />
+                <span class="hint">Where identity, limits and models are kept.</span>
+              </div>
+
+              <div class="field">
+                <label for="set-coordinator">Coordinator</label>
+                <input type="text" id="set-coordinator" spellcheck="false" />
+                <span class="hint">The scheduler this node asks for work.</span>
+              </div>
+
+              <div class="field-row">
+                <div class="field">
+                  <label for="set-workers">Workers</label>
+                  <input type="number" id="set-workers" min="0" step="1" placeholder="automatic" />
+                  <span class="hint">Blank follows the processor share.</span>
+                </div>
+                <div class="field">
+                  <label for="set-port">Control port</label>
+                  <input type="number" id="set-port" min="0" max="65535" step="1" />
+                  <span class="hint">0 picks a free one. Loopback only.</span>
+                </div>
+              </div>
+
+              <label class="check">
+                <input type="checkbox" id="set-autostart" />
+                <span>Start the node when this app opens</span>
+              </label>
+
+              <label class="check">
+                <input type="checkbox" id="set-noai" />
+                <span>
+                  Never load an AI runtime
+                  <em class="hint">
+                    Stronger than the graphics share: the node will not start one at all.
+                  </em>
+                </span>
+              </label>
+
+              <div class="row-actions">
+                <button class="btn btn-primary" type="button" id="btn-save-settings">
+                  Save settings
+                </button>
+                <span class="saved" id="settings-saved" hidden>Saved</span>
+              </div>
+            </section>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+    <script src="app.js"></script>
+  </body>
+</html>

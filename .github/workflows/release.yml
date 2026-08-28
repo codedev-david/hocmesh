@@ -37,6 +37,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
+      # hocmesh-desktop links a webview and a tray, so a whole-workspace build
+      # needs GTK and WebKit present. Windows and macOS carry theirs already.
+      - name: Install desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libappindicator3-dev librsvg2-dev patchelf
       - name: Build release binaries
         run: cargo build --release --workspace --features ${{ matrix.features }} --locked
       - name: Assemble release folder
@@ -86,10 +93,23 @@ jobs:
           ./scripts/package-windows.ps1 -Binary target/release/hocmesh.exe -Version $version -OutputDirectory dist
           $installer = (Resolve-Path "dist/hocmesh-$($version.TrimStart('v'))-x86_64.msi").Path
           "INSTALLER=$installer" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build desktop installers (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ./scripts/package-desktop.sh target/release/hocmesh "${{ github.event.inputs.version || github.ref_name }}" dist
+      - name: Build desktop installers (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/package-desktop.ps1 -Binary target/release/hocmesh.exe `
+            -Version "${{ github.event.inputs.version || github.ref_name }}" -OutputDirectory dist
       - name: Generate checksums
         shell: pwsh
         run: |
-          foreach ($artifact in @($env:ARCHIVE, $env:INSTALLER)) {
+          $desktop = Get-ChildItem dist -Filter 'hocmesh-desktop*' -File | ForEach-Object { $_.FullName }
+          if (-not $desktop) { throw "no desktop installer was produced" }
+          foreach ($artifact in @($env:ARCHIVE, $env:INSTALLER) + $desktop) {
             $hash = Get-FileHash -Algorithm SHA256 $artifact
             "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $artifact)" | Out-File -Encoding ascii "$artifact.sha256"
           }
@@ -102,6 +122,7 @@ jobs:
             ${{ env.ARCHIVE }}.sha256
             ${{ env.INSTALLER }}
             ${{ env.INSTALLER }}.sha256
+            dist/hocmesh-desktop*
           if-no-files-found: error
 
   publish:
@@ -119,4 +140,4 @@ jobs:
           draft: true
           prerelease: true
           files: |
-            artifacts/**/*.{zip,tar.gz,msi,pkg,deb,sha256}
+            artifacts/**/*.{zip,tar.gz,msi,exe,pkg,deb,dmg,AppImage,sha256}

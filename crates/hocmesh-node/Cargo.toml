@@ -12,6 +12,7 @@ uuid.workspace = true
 axum.workspace = true
 clap.workspace = true
 flate2.workspace = true
+hex.workspace = true
 hocmesh-core = { path = "../hocmesh-core" }
 hocmesh-ai = { path = "../hocmesh-ai" }
 hocmesh-ledger = { path = "../hocmesh-ledger" }
@@ -19,6 +20,7 @@ hocmesh-model = { path = "../hocmesh-model" }
 hocmesh-gpu = { path = "../hocmesh-gpu" }
 hocmesh-protocol = { path = "../hocmesh-protocol" }
 hocmesh-transport = { path = "../hocmesh-transport" }
+rand_core.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

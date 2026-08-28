@@ -9,3 +9,9 @@ validator-*.db
 .validator-*/
 validators.json
 *.profraw
+
+# Staged by scripts/package-desktop.*: the node binary the desktop
+# installer ships beside the window, named for the target triple.
+crates/hocmesh-desktop/binaries/
+# Written by tauri-build from capabilities/, regenerated every build.
+crates/hocmesh-desktop/gen/

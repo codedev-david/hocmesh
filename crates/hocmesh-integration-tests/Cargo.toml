@@ -8,7 +8,12 @@ publish = false
 
 [dev-dependencies]
 anyhow.workspace = true
+hocmesh = { path = "../hocmesh-node" }
 hocmesh-ai = { path = "../hocmesh-ai" }
+# Without `gui`: these tests drive the desktop app's own logic against a real
+# daemon, and linking a webview to do it would make them unrunnable on a
+# headless machine for no gain.
+hocmesh-desktop = { path = "../hocmesh-desktop", default-features = false }
 hocmesh-core = { path = "../hocmesh-core" }
 hocmesh-gpu = { path = "../hocmesh-gpu" }
 hocmesh-model = { path = "../hocmesh-model" }

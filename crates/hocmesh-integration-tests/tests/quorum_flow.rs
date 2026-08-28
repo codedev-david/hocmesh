@@ -1504,13 +1504,23 @@ fn capabilities() -> NodeCapabilities {
     }
 }
 
+/// Build the three binaries these tests actually launch.
+///
+/// Named rather than `--workspace --bins`, which would also build the desktop
+/// app and so make a headless machine unable to run a test that never opens a
+/// window.
 fn build_bins(workspace: &Path) -> Result<()> {
     run_ok(
         Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
             .arg("build")
             .arg("--ignore-rust-version")
-            .arg("--workspace")
             .arg("--bins")
+            .arg("-p")
+            .arg("hocmesh")
+            .arg("-p")
+            .arg("hocmesh-coordinator")
+            .arg("-p")
+            .arg("hocmesh-validator")
             .current_dir(workspace),
         "build workspace binaries",
     )

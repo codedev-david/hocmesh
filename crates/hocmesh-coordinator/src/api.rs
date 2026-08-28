@@ -35,13 +35,13 @@ use hocmesh_ledger::{
 use hocmesh_model::ModelManifest;
 use hocmesh_protocol::{
     BalanceResponse, CollatzPeakTotal, DEFAULT_LEASE_SECONDS, HeartbeatRequest, JobStatusResponse,
-    NetworkCoordinate, NetworkStatsResponse, NodeCapabilities, NodeStatusResponse, PeerSample,
-    PeerSampleResponse, PollRequest, PollResponse, PricedBatch, ReconciliationResponse,
-    RefundRequest, RefundResponse, RefundableShard, RegisterRequest, RegisterResponse,
-    ResultRequest, ResultResponse, SETTLEMENT_WINDOW_SECS, SubmitJobRequest, SubmitJobResponse,
-    WorkAssignment, WorkResult, WorkSpec, empty_body_hash, heartbeat_body_hash, job_id_from_auth,
-    now_unix, refund_body_hash, register_body_hash, result_body_hash, submit_body_hash,
-    verify_auth,
+    LedgerEntry, LedgerHistoryResponse, NetworkCoordinate, NetworkStatsResponse, NodeCapabilities,
+    NodeStatusResponse, PeerSample, PeerSampleResponse, PollRequest, PollResponse, PricedBatch,
+    ReconciliationResponse, RefundRequest, RefundResponse, RefundableShard, RegisterRequest,
+    RegisterResponse, ResultRequest, ResultResponse, SETTLEMENT_WINDOW_SECS, SubmitJobRequest,
+    SubmitJobResponse, WorkAssignment, WorkResult, WorkSpec, empty_body_hash, heartbeat_body_hash,
+    job_id_from_auth, now_unix, refund_body_hash, register_body_hash, result_body_hash,
+    submit_body_hash, verify_auth,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -75,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/jobs/submit", post(submit_job))
         .route("/v1/jobs/{id}", get(job_status))
         .route("/v1/nodes/{id}/balance", get(balance))
+        .route("/v1/nodes/{id}/history", get(ledger_history))
         .route("/v1/nodes/{id}", get(node_status))
         .route("/v1/network/stats", get(network_stats))
         .route("/v1/network/peers", get(network_peers))
@@ -2485,6 +2486,126 @@ async fn balance(
     authoritative_balance(&state, &node_id).await.map(Json)
 }
 
+/// How far back a single page may reach.
+///
+/// A dashboard scrolls; it does not need the whole chain at once, and an
+/// unbounded `limit` would let one request pull a coordinator's entire ledger
+/// into memory.
+const MAX_HISTORY_PAGE: u32 = 500;
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    /// Return entries strictly older than this position. Absent means "start
+    /// at the newest".
+    before: Option<u64>,
+    limit: Option<u32>,
+}
+
+/// One node's ledger history, newest first.
+///
+/// Reads from the validator quorum when there is one and from the
+/// coordinator's own table when there is not, and says which in the response.
+/// A coordinator's table is a convenience mirror -- the chain is the authority
+/// -- so a dashboard must be able to tell the two apart rather than presenting
+/// a local row as a settled fact.
+async fn ledger_history(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<LedgerHistoryResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, MAX_HISTORY_PAGE);
+    {
+        let conn = state.db.get().map_err(ApiError::internal)?;
+        if conn
+            .query_row(
+                "SELECT 1 FROM nodes WHERE node_id=?1",
+                params![node_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(ApiError::internal)?
+            .is_none()
+        {
+            return Err(ApiError::not_found("node not found"));
+        }
+    }
+
+    if let Some(ledger) = &state.ledger {
+        let page = ledger
+            .fetch_history(&node_id, query.before, limit)
+            .await
+            .map_err(|e| ApiError::conflict(format!("validator history unavailable: {e}")))?;
+        return Ok(Json(LedgerHistoryResponse {
+            node_id,
+            authoritative: true,
+            entries: page
+                .entries
+                .into_iter()
+                .map(|entry| LedgerEntry {
+                    delta_mcu: entry.delta_mcu,
+                    // The chain records transactions, not the coordinator's
+                    // categories, so these stay empty rather than guessed.
+                    category: None,
+                    job_id: None,
+                    assignment_id: None,
+                    sequence: Some(entry.sequence),
+                    transaction_id: Some(entry.transaction_id),
+                    created_at: entry.created_at,
+                })
+                .collect(),
+            next_before: page.next_before,
+        }));
+    }
+
+    let conn = state.db.get().map_err(ApiError::internal)?;
+    // One more than asked for: if it comes back, there is another page, and
+    // the extra row is dropped rather than shown.
+    let probe = i64::from(limit) + 1;
+    let mut statement = conn
+        .prepare(
+            "SELECT id,delta_mcu,category,job_id,assignment_id,created_at \
+             FROM ledger WHERE node_id=?1 AND (?2 IS NULL OR id < ?2) \
+             ORDER BY id DESC LIMIT ?3",
+        )
+        .map_err(ApiError::internal)?;
+    let mut rows: Vec<(i64, LedgerEntry)> = statement
+        .query_map(
+            params![node_id, query.before.map(|b| b as i64), probe],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    LedgerEntry {
+                        delta_mcu: row.get(1)?,
+                        category: Some(row.get(2)?),
+                        job_id: row.get(3)?,
+                        assignment_id: row.get(4)?,
+                        // A coordinator without validators has no chain
+                        // position to report, and inventing one would make a
+                        // local row look checkable when it is not.
+                        sequence: None,
+                        transaction_id: None,
+                        created_at: row.get(5)?,
+                    },
+                ))
+            },
+        )
+        .map_err(ApiError::internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(ApiError::internal)?;
+    let next_before = if rows.len() > limit as usize {
+        rows.truncate(limit as usize);
+        rows.last().map(|(id, _)| *id as u64)
+    } else {
+        None
+    };
+    Ok(Json(LedgerHistoryResponse {
+        node_id,
+        authoritative: false,
+        entries: rows.into_iter().map(|(_, entry)| entry).collect(),
+        next_before,
+    }))
+}
+
 async fn job_status(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
@@ -3140,6 +3261,192 @@ mod ai_api_tests {
         let status: InferenceJobStatus =
             get(&base, &format!("/v1/ai/jobs/{}", submitted.job_id)).await;
         assert_eq!(status.outputs, vec![output]);
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A dashboard's ledger view is only as honest as its paging, so this
+    /// walks the whole thing: newest first, a cursor that reaches the older
+    /// page, and no row served twice or skipped between them.
+    #[tokio::test]
+    async fn history_pages_backwards_without_repeating_or_losing_a_row() {
+        let root = std::env::temp_dir().join(format!("hocmesh-history-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("coordinator.db");
+        let state = AppState {
+            db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
+            ledger: None,
+            federation: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let base = format!("http://{address}");
+        let node = NodeIdentity::load_or_create(&root.join("node")).unwrap();
+        register_test_node(&base, &node, test_capabilities(false, 0)).await;
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            for index in 0..7i64 {
+                conn.execute(
+                    "INSERT INTO ledger(node_id,delta_mcu,category,job_id,assignment_id,created_at) \
+                     VALUES(?1,?2,'reward',?3,NULL,?4)",
+                    params![node.node_id(), index + 1, format!("job-{index}"), index],
+                )
+                .unwrap();
+            }
+        }
+
+        let first: LedgerHistoryResponse = get(
+            &base,
+            &format!("/v1/nodes/{}/history?limit=4", node.node_id()),
+        )
+        .await;
+        assert!(
+            !first.authoritative,
+            "a coordinator with no validators must not present its own table as settled"
+        );
+        assert_eq!(first.entries.len(), 4);
+        assert_eq!(
+            first.entries[0].delta_mcu, 7,
+            "newest first is what a dashboard shows at the top"
+        );
+        assert_eq!(first.entries[0].category.as_deref(), Some("reward"));
+        assert_eq!(first.entries[0].job_id.as_deref(), Some("job-6"));
+        assert!(
+            first.entries[0].sequence.is_none(),
+            "a local row has no chain position, and inventing one would make it look checkable"
+        );
+        let cursor = first.next_before.expect("three entries are still older");
+
+        let second: LedgerHistoryResponse = get(
+            &base,
+            &format!(
+                "/v1/nodes/{}/history?limit=4&before={cursor}",
+                node.node_id()
+            ),
+        )
+        .await;
+        assert_eq!(second.entries.len(), 3);
+        assert_eq!(
+            second.next_before, None,
+            "the start of history is reported as such, not as another page"
+        );
+
+        let seen: Vec<i64> = first
+            .entries
+            .iter()
+            .chain(second.entries.iter())
+            .map(|entry| entry.delta_mcu)
+            .collect();
+        assert_eq!(
+            seen,
+            vec![7, 6, 5, 4, 3, 2, 1],
+            "every posting appears exactly once, in order"
+        );
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One node's dashboard must not show another node's earnings, and asking
+    /// after a node that was never registered is a 404 rather than an empty
+    /// page that reads as "you have earned nothing".
+    #[tokio::test]
+    async fn history_is_scoped_to_one_node_and_unknown_nodes_are_not_found() {
+        let root = std::env::temp_dir().join(format!("hocmesh-history-scope-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("coordinator.db");
+        let state = AppState {
+            db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
+            ledger: None,
+            federation: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let base = format!("http://{address}");
+        let mine = NodeIdentity::load_or_create(&root.join("mine")).unwrap();
+        let theirs = NodeIdentity::load_or_create(&root.join("theirs")).unwrap();
+        register_test_node(&base, &mine, test_capabilities(false, 0)).await;
+        register_test_node(&base, &theirs, test_capabilities(false, 0)).await;
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            for (owner, delta) in [(mine.node_id(), 10i64), (theirs.node_id(), 99)] {
+                conn.execute(
+                    "INSERT INTO ledger(node_id,delta_mcu,category,job_id,assignment_id,created_at) \
+                     VALUES(?1,?2,'reward',NULL,NULL,1)",
+                    params![owner, delta],
+                )
+                .unwrap();
+            }
+        }
+
+        let page: LedgerHistoryResponse =
+            get(&base, &format!("/v1/nodes/{}/history", mine.node_id())).await;
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].delta_mcu, 10);
+
+        let response = reqwest::Client::new()
+            .get(format!("{base}/v1/nodes/node-that-never-was/history"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 404);
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An unbounded page would let one request pull a whole ledger into
+    /// memory, so the ceiling has to hold whatever the caller asks for.
+    #[tokio::test]
+    async fn an_oversized_page_request_is_capped_rather_than_honoured() {
+        let root = std::env::temp_dir().join(format!("hocmesh-history-cap-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("coordinator.db");
+        let state = AppState {
+            db: Arc::new(crate::db::Pool::open(db_path.to_str().unwrap()).unwrap()),
+            ledger: None,
+            federation: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let base = format!("http://{address}");
+        let node = NodeIdentity::load_or_create(&root.join("node")).unwrap();
+        register_test_node(&base, &node, test_capabilities(false, 0)).await;
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            for index in 0..(MAX_HISTORY_PAGE as i64 + 20) {
+                conn.execute(
+                    "INSERT INTO ledger(node_id,delta_mcu,category,job_id,assignment_id,created_at) \
+                     VALUES(?1,1,'reward',NULL,NULL,?2)",
+                    params![node.node_id(), index],
+                )
+                .unwrap();
+            }
+        }
+
+        let page: LedgerHistoryResponse = get(
+            &base,
+            &format!("/v1/nodes/{}/history?limit=100000", node.node_id()),
+        )
+        .await;
+        assert_eq!(page.entries.len(), MAX_HISTORY_PAGE as usize);
+        assert!(
+            page.next_before.is_some(),
+            "capping a page must still say that more remains"
+        );
 
         server.abort();
         let _ = server.await;

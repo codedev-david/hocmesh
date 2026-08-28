@@ -101,9 +101,11 @@ pub fn apply_limits(caps: &mut NodeCapabilities, limits: &ResourceLimits) {
 
 /// Identifier for the shared CPU slice when it is advertised as a device.
 ///
-/// Real accelerators are named by the tool that discovered them, so this is
-/// also how a later pass recognises the one device this crate invented.
-pub const SHARED_CPU_DEVICE_ID: &str = "cpu-0";
+/// Re-exported rather than restated. The scheduler places work on this id and
+/// the AI worker resolves an assignment back to a device by it, so the name has
+/// to be one constant: two that merely happened to match would be a rename away
+/// from a node advertising work it then refused to run.
+pub use hocmesh_gpu::SHARED_CPU_DEVICE_ID;
 
 /// Settle whether this node offers inference to the hocmesh, and on what.
 ///
@@ -142,27 +144,30 @@ pub fn apply_ai_readiness(
 }
 
 /// The lent CPU slice, described the way the scheduler describes a device.
+///
+/// The identity and the capability flags come from [`hocmesh_gpu::cpu_device`],
+/// which is the same description the AI worker will resolve the assignment
+/// against. Only the two facts that crate cannot know are added here: what this
+/// particular CPU is called, and how much of this machine the operator lent.
 fn shared_cpu_device(caps: &NodeCapabilities) -> GpuCapability {
+    let device = hocmesh_gpu::cpu_device();
     GpuCapability {
-        stable_id: SHARED_CPU_DEVICE_ID.into(),
-        vendor: std::env::consts::ARCH.to_string(),
+        stable_id: device.stable_id,
+        vendor: device.vendor,
         name: caps.cpu_brand.clone(),
         // The coordinator already maps this backend onto `BackendKind::Cpu`,
         // and a request that genuinely needs CUDA still names it in
         // `required_backends` and so still refuses to land here.
-        backend: "cpu".into(),
+        backend: format!("{:?}", device.backend).to_lowercase(),
         // The lent slice, not the machine. `--memory-percent` therefore
         // governs which models may be placed on this node, which is the whole
         // reason the operator was asked for a percentage.
         memory_mb: Some(caps.shared_memory_bytes / (1024 * 1024)),
-        driver_version: None,
-        compute_version: None,
-        // llama.cpp's CPU backend reads f16, bf16 and the integer quants
-        // rather than refusing them -- slowly, but it reads them. Claiming
-        // otherwise would decline work this node can genuinely do.
-        supports_fp16: true,
-        supports_bf16: true,
-        supports_int8: true,
+        driver_version: device.driver_version,
+        compute_version: device.compute_version,
+        supports_fp16: device.supports_fp16,
+        supports_bf16: device.supports_bf16,
+        supports_int8: device.supports_int8,
         // Left unmeasured rather than guessed: these are memory-bandwidth
         // numbers from `benchmark_memory`, and inventing one would put a
         // fabricated figure in front of the scheduler.
