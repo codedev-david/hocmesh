@@ -104,6 +104,26 @@ jobs:
         run: |
           ./scripts/package-desktop.ps1 -Binary target/release/hocmesh.exe `
             -Version "${{ github.event.inputs.version || github.ref_name }}" -OutputDirectory dist
+      # Signed before the checksums are taken, so the published digest is the
+      # digest of the file people will actually run.
+      - name: Sign artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: ./scripts/sign-artifacts.ps1 -Directory dist
+      - name: Sign artifacts (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: ./scripts/sign-artifacts.sh dist
       - name: Generate checksums
         shell: pwsh
         run: |
@@ -113,6 +133,17 @@ jobs:
             $hash = Get-FileHash -Algorithm SHA256 $artifact
             "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $artifact)" | Out-File -Encoding ascii "$artifact.sha256"
           }
+      # Linux has no per-file signature format everyone checks, so the
+      # checksum list is what gets signed; verifying it verifies every artifact.
+      - name: Sign checksums (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          ./scripts/sign-artifacts.sh dist
+          ./scripts/sign-artifacts.sh "$(dirname "$ARCHIVE")"
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
@@ -120,8 +151,10 @@ jobs:
           path: |
             ${{ env.ARCHIVE }}
             ${{ env.ARCHIVE }}.sha256
+            ${{ env.ARCHIVE }}.sha256.asc
             ${{ env.INSTALLER }}
             ${{ env.INSTALLER }}.sha256
+            ${{ env.INSTALLER }}.sha256.asc
             dist/hocmesh-desktop*
           if-no-files-found: error
 
@@ -140,4 +173,4 @@ jobs:
           draft: true
           prerelease: true
           files: |
-            artifacts/**/*.{zip,tar.gz,msi,exe,pkg,deb,dmg,AppImage,sha256}
+            artifacts/**/*.{zip,tar.gz,msi,exe,pkg,deb,dmg,AppImage,sha256,asc}

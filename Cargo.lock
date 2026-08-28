@@ -1725,7 +1725,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hocmesh"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-ai"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "hocmesh-core",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-coordinator"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-gpu"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-integration-tests"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "hocmesh",
@@ -1858,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-ledger"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-model"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -1901,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-transport"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "hocmesh-validator"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",

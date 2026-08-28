@@ -22,6 +22,7 @@ shape, the shape is stated.
 | Content-addressed model chunks, rarest-first peer seeding | `hocmesh-model`, node peer server | Working |
 | Two-stage inference settlement through the ledger | `hocmesh-ai`, `hocmesh-ledger` | Working |
 | GGUF **metadata** reader (architecture, name, layer count) | `hocmesh-model/src/gguf.rs` | Working |
+| GGUF **tensor directory** reader: name, type, shape, offset; byte extents and chunk indexes per layer range | `hocmesh-model/src/gguf.rs`, `hocmesh model-inspect` | Working (build order step 1) |
 
 ## 2. What is missing
 
@@ -37,10 +38,12 @@ into stages that nothing can run.
 
 Concretely, three sub-pieces are absent:
 
-1. A GGUF **tensor** reader — the current one stops at metadata, so nothing can
-   read the weight for one layer without reading the file as a blob.
+1. ~~A GGUF **tensor** reader~~ — **done.** `gguf::tensor_directory` reads the
+   directory, `tensors_for_layers` selects a stage's tensors, and
+   `extents_for_layers` turns them into merged byte spans and chunk indexes.
+   `hocmesh model-inspect <file> --stages N` prints them.
 2. A forward pass — attention and FFN over a layer range, with a KV cache that
-   belongs to that stage.
+   belongs to that stage. **This is the load-bearing gap.**
 3. The stage protocol — who owns the KV cache across tokens, what happens when a
    stage drops mid-sequence, how a sequence is resumed elsewhere.
 
@@ -183,16 +186,31 @@ difference between running the model and not running it.
 Each step is independently testable, and each is worthless without the one
 before it. Do not reorder.
 
-**Step 1 — GGUF tensor reader.** Extend `hocmesh-model/src/gguf.rs` from
-metadata to the tensor directory: name, dtype, shape, byte offset. Add
-`tensors_for_layers(range)` returning the byte extents a stage needs.
-*Test:* against a real small GGUF, assert every tensor offset lands inside the
-file, that layer ranges partition the tensor set with no gap or overlap, and
-that the union of all ranges is the whole set. This is also what lets the
-existing chunk catalog fetch *only the layers a stage needs* instead of the
-whole file, which is a real win on its own.
+**Step 1 — GGUF tensor reader. Done.** `gguf::tensor_directory` reads name,
+type code, shape and offset for every tensor, plus the declared alignment and
+where the data section starts. `TensorInfo::layer_index` reads the block a
+tensor belongs to from its name, `tensors_for_layers` selects a stage's set,
+`shared_tensors` returns the embeddings and output head that belong to no
+block, `extents_for_layers` merges the selection into byte spans, and
+`chunks_for_extents` turns those into the chunk indexes to fetch.
+`block_layout` gives bytes per block for every GGML type this build knows and
+answers `None` — never a guess — for one it does not.
 
-**Step 2 — CPU reference forward pass, one architecture, one dtype.** Correctness
+*Tested:* every tensor lands inside the file; layer ranges partition the block
+tensors with nothing claimed twice and nothing left over but the shared set;
+two stages ask for disjoint bytes and neither asks for the whole file; a header
+cut short reads as absent rather than corrupt; overlapping or past-the-end
+tensors are refused; an unknown type reports no length rather than a wrong one.
+The end-to-end check is `hocmesh model-inspect` against a GGUF written by a
+separate implementation of the spec, where the four stage extents plus the
+shared set sum to exactly the data section — a partition, verified rather than
+asserted.
+
+This is also what lets the chunk store fetch *only the layers a stage needs*.
+On a 26 MB, 32-block file split four ways, a middle stage pulls 3.5 MB in one
+span — 1 chunk of 7 — instead of the whole file.
+
+**Step 2 (next) — CPU reference forward pass, one architecture, one dtype.** Correctness
 first, speed never. `forward(layer_range, hidden_state, kv_cache) -> hidden_state`.
 *Test:* run the full layer range in one process and assert the output matches
 llama.cpp for the same prompt within tolerance. Without this comparison the rest

@@ -123,4 +123,4 @@ After every case:
 - no provider is rewarded twice;
 - no runnable shard exists without certified funding;
 - no completed shard lacks a certified reward in quorum mode;
-- client ledger audit succeeds.
+- peer ledger audit succeeds.

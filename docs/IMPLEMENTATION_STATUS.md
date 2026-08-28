@@ -42,6 +42,7 @@
 | Runtime acquisition | Implemented | `runtime-install` fetches a llama.cpp release pinned by SHA-256 per OS/arch; refuses anything that does not match |
 | Model acquisition | Implemented | `model-pull` resolves a GGUF on the Hub or a `--url`, verifies its digest, resumes interrupted transfers, derives the architecture from the GGUF header |
 | GGUF manifests | Implemented | Schema and magic-header validation |
+| GGUF tensor directory | Implemented | `gguf::tensor_directory` reads name, type, shape and offset for every tensor plus the declared alignment; `tensors_for_layers`/`extents_for_layers`/`chunks_for_extents` turn a layer range into byte spans and chunk indexes; `hocmesh model-inspect` prints them. Reads the header only, so it works on a partly-fetched file |
 | Safetensors manifests | Implemented | Schema and header-length validation |
 | GPU capability benchmark | Implemented | Capability report, host-transfer baseline, real-model `llama-bench` adapter |
 | Latency-aware scheduler | Implemented | Backend/VRAM/dtype/cache/RTT/bandwidth/load/failure scoring |

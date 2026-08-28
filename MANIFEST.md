@@ -1,6 +1,6 @@
 # Package Manifest
 
-This archive is a source repository for **hocMESH Compute v0.3.0**.
+This archive is a source repository for **hocMESH Compute v0.4.0**.
 
 Primary deliverables:
 
@@ -14,6 +14,7 @@ Primary deliverables:
 - `docs/LEDGER.md` — replicated CU accounting design.
 - `docs/PROTOCOL.md` — signed wire behavior (current protocol v3).
 - `docs/SECURITY.md` — threat model and hardening requirements.
+- `docs/DISTRIBUTION.md` — how releases are signed, and what signing and a private repository do and do not protect.
 - `docs/CONSENSUS_INVARIANTS.md` — rules that future changes must preserve.
 - `docs/CRASH_RECOVERY.md` — durable settlement and failure-reconciliation design.
 - `docs/ROADMAP.md` — implementation path to hocMESH AI.

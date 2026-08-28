@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use hocmesh::client::HocMeshClient;
 use hocmesh::{control, daemon, install};
@@ -21,7 +21,13 @@ use hocmesh_ledger::{
 use hocmesh_model::{ChunkStore, ModelFormat, ModelRegistry, manifest_for_file};
 use hocmesh_protocol::WorkSpec;
 use hocmesh_transport::{HttpPeerSource, SeedServerState, seed_from_peer, seed_router};
-use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -109,6 +115,19 @@ enum Command {
         chunk_size: usize,
     },
     ModelList,
+    /// Read a GGUF file's tensor directory and report what each pipeline stage
+    /// would have to hold.
+    ///
+    /// Nothing is imported and nothing is run: this reads the header and does
+    /// arithmetic, so it works on a file a peer has only partly fetched.
+    ModelInspect {
+        path: PathBuf,
+        /// How many pipeline stages to divide the transformer blocks between.
+        #[arg(long, default_value_t = 1)]
+        stages: u32,
+        #[arg(long, default_value_t = hocmesh_model::DEFAULT_CHUNK_SIZE)]
+        chunk_size: usize,
+    },
     ModelPublish {
         #[arg(long)]
         model_id: String,
@@ -700,6 +719,13 @@ stored at: {}",
                     manifest.digest()?
                 );
             }
+        }
+        Command::ModelInspect {
+            path,
+            stages,
+            chunk_size,
+        } => {
+            inspect_gguf(&path, stages, chunk_size)?;
         }
         Command::ModelPublish { model_id, revision } => {
             client
@@ -1553,6 +1579,97 @@ fn model_store(home: &std::path::Path) -> Result<ChunkStore> {
 fn model_registry(home: &std::path::Path) -> Result<ModelRegistry> {
     fs::create_dir_all(home)?;
     ModelRegistry::open(home.join("model-registry.db"))
+}
+
+/// The most of a GGUF file this will read to find the header. Real headers are
+/// a few megabytes at worst; the bound is what stops a hostile file from being
+/// pulled into memory whole.
+const MAX_GGUF_HEADER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Report a GGUF file's layout, and what a pipeline of `stages` would cost each
+/// stage to hold.
+///
+/// This is the arithmetic behind fetching only the layers a stage will run: the
+/// chunk counts are the chunks that stage would have to pull, out of the chunks
+/// in the whole file.
+fn inspect_gguf(path: &Path, stages: u32, chunk_size: usize) -> Result<()> {
+    use hocmesh_model::gguf::{self, ByteExtent, TensorDirectory};
+
+    ensure!(
+        stages >= 1,
+        "a model has to be split into at least one stage"
+    );
+    ensure!(chunk_size > 0, "chunk size must be greater than zero");
+    let chunk_size = chunk_size as u64;
+
+    let file_len = fs::metadata(path)
+        .with_context(|| format!("cannot read {}", path.display()))?
+        .len();
+    let mut head = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_GGUF_HEADER_BYTES)
+        .read_to_end(&mut head)?;
+
+    let directory = gguf::tensor_directory(&head)?.with_context(|| {
+        format!(
+            "the tensor directory does not end within the first {MAX_GGUF_HEADER_BYTES} bytes of {}",
+            path.display()
+        )
+    })?;
+    directory.validate(file_len)?;
+
+    let architecture = gguf::architecture(&head)?.unwrap_or_else(|| "unknown".to_string());
+    let name = gguf::model_name(&head)?.unwrap_or_else(|| "unnamed".to_string());
+    let blocks = directory.layer_count();
+    let total_chunks = file_len.div_ceil(chunk_size);
+
+    println!("{name} ({architecture})");
+    println!(
+        "  {file_len} bytes, {} tensors, {blocks} transformer blocks",
+        directory.tensors.len()
+    );
+    println!(
+        "  tensor data starts at {}, aligned to {}",
+        directory.data_start, directory.alignment
+    );
+
+    let shared = directory.extents_of(&directory.shared_tensors(), file_len);
+    let shared_bytes: u64 = shared.iter().map(ByteExtent::len).sum();
+    println!(
+        "  shared (embeddings, final norm, output head): {shared_bytes} bytes; the first and last stage need these"
+    );
+
+    ensure!(
+        blocks > 0,
+        "this file names no transformer blocks, so it cannot be split by layer"
+    );
+    ensure!(
+        stages <= blocks,
+        "{stages} stages asked for but the model has only {blocks} blocks"
+    );
+
+    for stage in 0..stages {
+        let first = block_boundary(blocks, stages, stage);
+        let last = block_boundary(blocks, stages, stage + 1);
+        let extents = directory.extents_for_layers(first..last, file_len);
+        let bytes: u64 = extents.iter().map(ByteExtent::len).sum();
+        let chunks = TensorDirectory::chunks_for_extents(&extents, chunk_size)?;
+        println!(
+            "  stage {}/{stages}: blocks {first}..{last}, {bytes} bytes in {} span(s), {} of {total_chunks} chunks",
+            stage + 1,
+            extents.len(),
+            chunks.len()
+        );
+    }
+
+    Ok(())
+}
+
+/// Where stage `stage` begins when `blocks` are divided as evenly as they go
+/// between `stages`. Computed in u64 so a large block count cannot wrap.
+fn block_boundary(blocks: u32, stages: u32, stage: u32) -> u32 {
+    let boundary = u64::from(blocks) * u64::from(stage) / u64::from(stages);
+    u32::try_from(boundary).unwrap_or(blocks)
 }
 
 fn parse_model_format(value: &str) -> Result<ModelFormat> {

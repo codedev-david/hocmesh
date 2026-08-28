@@ -14,7 +14,7 @@ There is **no payment system, token, cryptocurrency, market, or purchasable cred
 
 This repository is a Rust implementation of hocMESH Compute Core and the hocMESH AI control/data-plane architecture.
 
-## What is implemented in v0.3
+## What is implemented in v0.4
 
 This repository contains working source for three native Rust programs:
 
@@ -33,6 +33,7 @@ Implemented architecture:
 - Declarative allow-listed work instead of arbitrary remote binaries.
 - Deterministic prime-range workload as the first safe distributed workload.
 - One-command inference setup: `runtime-install` fetches a llama.cpp build pinned by SHA-256, `model-pull` fetches and verifies GGUF weights. Neither trusts a name.
+- Per-layer model addressing: `model-inspect` reads a GGUF tensor directory and reports the byte spans and chunk indexes each pipeline stage would need, so a peer can fetch the layers it will run rather than the whole file.
 - Multi-worker task parallelism.
 - Work leasing and lease expiration/requeue.
 - Requesters cannot execute their own paid shards; both scheduler and validators enforce this.
@@ -51,7 +52,7 @@ Implemented architecture:
 - Duplicate reservation/reward claim prevention.
 - Full validator ledger replicas in SQLite.
 - Validator catch-up/synchronization.
-- Ordinary client full-ledger mirroring.
+- Ordinary peer full-ledger mirroring: any node can hold the whole chain.
 - Offline audit from genesis.
 - Quorum-signed portable snapshots, so a new replica adopts a verified state and syncs from there rather than replaying the chain from genesis.
 - Direct validator balance/head verification independent of the coordinator.
@@ -69,7 +70,7 @@ Implemented architecture:
 
 ## Runtime boundary
 
-hocMESH v0.3 executes independent distributed inference batches through an external llama.cpp runtime. `hocmesh runtime-install` will fetch a pinned build for the host platform and verify it against a SHA-256 compiled into the binary, so no separate llama.cpp setup is required; `--runtime` still accepts a build you compiled yourself, which is the path to take for CUDA or ROCm acceleration. Pipeline and tensor/model plans and transport are implemented; actual partial-layer kernels require a compatible runtime plugin because stock llama.cpp does not expose them.
+hocMESH v0.4 executes independent distributed inference batches through an external llama.cpp runtime. `hocmesh runtime-install` will fetch a pinned build for the host platform and verify it against a SHA-256 compiled into the binary, so no separate llama.cpp setup is required; `--runtime` still accepts a build you compiled yourself, which is the path to take for CUDA or ROCm acceleration. Pipeline and tensor/model plans and transport are implemented; actual partial-layer kernels require a compatible runtime plugin because stock llama.cpp does not expose them.
 
 The current executable workload is deterministic CPU prime-range computation. The architecture deliberately proves the harder control-plane primitives first:
 
@@ -244,7 +245,7 @@ argument in full.
 | `hocmesh-coordinator` | **bin** | Scheduler, capability registry, leases, settlement intents, federation, recovery |
 | `hocmesh-validator` | **bin** | Ledger replica, threshold signing, set membership, sync and repair |
 | `hocmesh-desktop` | **bin** | Tray-and-window app; supervises the daemon, never replaces it |
-| `hocmesh-model` | lib | Model manifests, GGUF metadata, content-addressed chunk catalog |
+| `hocmesh-model` | lib | Model manifests, GGUF metadata **and tensor directory**, per-layer byte extents, content-addressed chunk catalog |
 | `hocmesh-gpu` | lib | Device discovery and CUDA / ROCm / Metal backend adapters |
 | `hocmesh-ai` | lib | Model registry, candidate ranking, pipeline/tensor/batch planning, two-stage inference settlement |
 | `hocmesh-transport` | lib | Checksum-bound tensor framing, ordered delivery, replay rejection, route failover |
@@ -258,12 +259,20 @@ accounting that makes lending worth doing, the proximity map that finds near
 peers, the seeding that moves weights, the planner that cuts a model into layer
 ranges, and the transport that carries activations between stages.
 
+A model can now also be *addressed* by layer. `hocmesh model-inspect` reads a
+GGUF file's tensor directory and reports, for a pipeline of N stages, the byte
+spans and chunk indexes each stage would have to hold — so a peer fetches the
+layers it will run rather than the whole file. On a 32-block model split four
+ways, a middle stage pulls one chunk in one span instead of seven.
+
 What does not exist yet is the piece in the middle — an execution engine that
 loads a *layer range* and runs a forward pass over an activation it was handed.
 Today a stage is executed by an external llama.cpp process, which loads whole
-models, not slices. `docs/DISTRIBUTED_INFERENCE.md` states that gap precisely,
-does the bandwidth arithmetic that decides which kinds of splitting can work
-over which links, and gives the build order.
+models, not slices. **Nothing in this repository performs distributed inference
+of a single model across machines**, and no release should be read as claiming
+it does. `docs/DISTRIBUTED_INFERENCE.md` states that gap precisely, does the
+bandwidth arithmetic that decides which kinds of splitting can work over which
+links, and gives the build order — step 1 of which is done.
 
 ---
 
@@ -321,6 +330,7 @@ hocMESH/
 │   ├── LEDGER.md
 │   ├── PROTOCOL.md
 │   ├── SECURITY.md
+│   ├── DISTRIBUTION.md
 │   ├── CONSENSUS_INVARIANTS.md
 │   ├── CRASH_RECOVERY.md
 │   ├── ROADMAP.md
@@ -468,12 +478,12 @@ dotnet tool install --global wix --version 6.0.2
 Install a downloaded release package with the native platform tool:
 
 ```bash
-sudo apt install ./hocmesh_0.3.0_amd64.deb
-sudo installer -pkg ./hocmesh-0.3.0.pkg -target /
+sudo apt install ./hocmesh_0.4.0_amd64.deb
+sudo installer -pkg ./hocmesh-0.4.0.pkg -target /
 ```
 
 ```powershell
-Start-Process msiexec.exe -Wait -ArgumentList '/i', '.\hocmesh-0.3.0-x86_64.msi'
+Start-Process msiexec.exe -Wait -ArgumentList '/i', '.\hocmesh-0.4.0-x86_64.msi'
 ```
 
 ---
@@ -525,7 +535,10 @@ So they replace each other rather than sitting side by side. Both lay down `/usr
 
 The script creates `dist/` containing the three native binaries plus the documentation/config files required to deploy them.
 
-For a participant-only machine, only `hocmesh` is required.
+All three binaries go on every machine. A peer that never schedules for anyone
+and never signs a ledger height still carries the coordinator and the validator,
+because the point of the model is that any peer *can* become one without a
+reinstall.
 
 ---
 
@@ -547,6 +560,28 @@ allow-listed work and never a binary somebody sent it, and "fetch the latest
 build" would quietly hand that away. Mismatched bytes are discarded, not
 installed. `hocmesh runtime-status` shows what is pinned and what is installed
 without downloading anything.
+
+`model-inspect` reads a GGUF file's tensor directory — every tensor's name,
+type, shape and offset — and reports what a pipeline of N stages would each have
+to hold:
+
+```console
+$ hocmesh model-inspect model.gguf --stages 4
+Synthetic Llama 32x256 (llama)
+  26142720 bytes, 291 tensors, 32 transformer blocks
+  tensor data starts at 518656, aligned to 32
+  shared (embeddings, final norm, output head): 11329024 bytes; the first and last stage need these
+  stage 1/4: blocks 0..8, 3573760 bytes in 1 span(s), 2 of 7 chunks
+  stage 2/4: blocks 8..16, 3573760 bytes in 1 span(s), 1 of 7 chunks
+  stage 3/4: blocks 16..24, 3573760 bytes in 1 span(s), 2 of 7 chunks
+  stage 4/4: blocks 24..32, 3573760 bytes in 1 span(s), 2 of 7 chunks
+```
+
+The four stage totals plus the shared set sum to exactly the data section, which
+is the partition a pipeline plan depends on. It reads the header only, so it
+works on a file a peer has only partly fetched, and the chunk indexes are what
+lets a stage pull the layers it will run rather than the whole file. What it
+does **not** do is run them — see `docs/DISTRIBUTED_INFERENCE.md`.
 
 `model-pull` resolves the file on Hugging Face, downloads it with resume,
 verifies the SHA-256 the Hub published for it, reads the architecture out of the
@@ -830,7 +865,7 @@ hocmesh --home .hocmesh-a daemon --workers 4 --probe-listen 0.0.0.0:8646
 
 ---
 
-# How clients find work and one another
+# How peers find work and one another
 
 Participant nodes do **not** open random inbound peer ports and do not discover
 workers directly. Work is still handed out by the coordinator.
@@ -1087,7 +1122,7 @@ The private key never needs to be sent to the coordinator or validators.
 
 Back up this identity if you want to retain access to the CU associated with that node identity.
 
-For a production client, the next security step should be OS-native secure key storage:
+For a production peer, the next security step should be OS-native secure key storage:
 
 - Windows DPAPI / CNG,
 - macOS Keychain/Secure Enclave where applicable,
@@ -1142,7 +1177,7 @@ Recommended protections before public exposure:
 - separate validator hosts/operators,
 - monitoring and alerting,
 - database backups,
-- pinned validator membership distributed with clients.
+- pinned validator membership distributed with the peer.
 
 ## What the network tests actually break
 
@@ -1309,3 +1344,15 @@ repository is private, and neither the source nor any installer may be
 redistributed. Third-party open source components keep their own licenses; the
 full set ships with every release as a CycloneDX SBOM, and `deny.toml` is the
 policy that admits them.
+
+Releases are signed — Authenticode on Windows, Developer ID and notarisation on
+macOS, a GPG-signed checksum list on Linux — so a modified installer fails to
+verify. Being straight about the limit: **no installer can be made technically
+un-redistributable.** A file that runs on somebody's machine can be copied off
+it; signing makes tampering detectable and provenance provable, and the licence
+does the rest. The network does not depend on any of that. What protects the
+ledger is that transactions are signed by keys no coordinator holds, that a
+height needs threshold signatures from a validator quorum, that prices are
+recomputable from the work spec, and that any peer can replay the chain and
+audit it. Those hold whether or not an attacker has read the source.
+`docs/DISTRIBUTION.md` sets out what each measure does and does not buy.

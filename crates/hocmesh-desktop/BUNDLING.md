@@ -95,3 +95,13 @@ with no screen.
   AppImage, which is why CI pins that job to `ubuntu-22.04`.
 * Windows and macOS need nothing extra; the bundler fetches its own WiX and
   NSIS toolchains on first use.
+
+## Signing
+
+The packaging scripts do not sign. Signing is a separate step so it can be run
+with keys that never touch a developer machine: `scripts/sign-artifacts.ps1`
+(Authenticode) and `scripts/sign-artifacts.sh` (Developer ID and notarisation on
+macOS, a GPG-signed checksum list on Linux). `.github/workflows/release.yml`
+runs them between bundling and checksumming, so the digest that gets published
+is the digest of the signed file. See `docs/DISTRIBUTION.md` for what that does
+and does not protect.
