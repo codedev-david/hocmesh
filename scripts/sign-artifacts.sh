@@ -12,8 +12,11 @@
 # See docs/DISTRIBUTION.md.
 #
 # With no key configured this says so and succeeds, so a fork or a local build
-# still works. Set HOCMESH_SIGNING_REQUIRED=1 (CI does for tagged releases) to
-# turn a missing key into a failure rather than a silently unsigned release.
+# still works. Set HOCMESH_SIGNING_REQUIRED=1 to turn a missing key into a
+# failure rather than a silently unsigned release. The release workflow
+# deliberately does not set it yet: there are no certificates, and a release
+# that refuses to build is worse than one that says out loud it is unsigned.
+# Set it in .github/workflows/release.yml the day the keys land.
 set -euo pipefail
 
 directory="${1:?usage: sign-artifacts.sh <directory>}"
