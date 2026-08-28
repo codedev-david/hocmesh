@@ -2,6 +2,11 @@ name: ci
 
 on:
   push:
+    # Branches only. Without this a `v*` tag push runs the whole of CI a
+    # second time alongside the release workflow, and the two then compete
+    # for the same runners -- which is how the desktop packaging job kept
+    # getting starved out of the runs that were meant to validate it.
+    branches: ['**']
   pull_request:
 
 jobs:

@@ -159,45 +159,58 @@ case "$(uname -s)" in
     # rejects whichever is installed second with "trying to overwrite
     # '/usr/bin/hocmesh'".
     #
-    # tauri.conf.json asks the bundler for all three. They are written in here
-    # as well rather than assumed, because v0.4.0's first release build proved
-    # the bundler can be given them and emit a package without them, and a
-    # package missing a Provides looks perfectly healthy right up until
-    # somebody switches between the two installs.
+    # tauri.conf.json asks the bundler for all three. They are rewritten here
+    # rather than trusted, because v0.4.0's release builds proved the bundler
+    # can be given them and emit a package that does not carry them in a form
+    # anything else agrees on -- and a package missing a Provides looks
+    # perfectly healthy right up until somebody switches between the two
+    # installs.
     linux_stage=$(mktemp -d)
     trap 'rm -rf -- "$linux_stage"' EXIT
     deb_stage="$linux_stage/deb"
     dpkg-deb --raw-extract "$deb" "$deb_stage"
     deb_control_file="$deb_stage/DEBIAN/control"
-    missing=()
-    for relation in Provides Conflicts Replaces; do
-      grep -qE "^$relation:.*hocmesh" "$deb_control_file" || missing+=("$relation")
-    done
-    if (( ${#missing[@]} )); then
-      echo "the bundler left ${missing[*]} out of the desktop package; writing them in" >&2
-      # Description is a multi-line field and Debian requires it last, so new
-      # fields go in ahead of it rather than on the end.
-      awk -v relations="${missing[*]}" '
-        /^Description:/ && !inserted {
-          count = split(relations, relation, " ")
-          for (i = 1; i <= count; i++) print relation[i] ": hocmesh"
-          inserted = 1
-        }
-        { print }
-      ' "$deb_control_file" > "$deb_control_file.new"
-      mv "$deb_control_file.new" "$deb_control_file"
-      dpkg-deb --root-owner-group --build "$deb_stage" "$deb" >/dev/null
-    fi
 
-    # Read back from the package that ships, whether the bundler wrote these
-    # or the block above did.
-    deb_control=$(dpkg-deb --field "$deb")
+    # Strip whatever the bundler wrote and write the three fields ourselves,
+    # so this runs to the same result whether the bundler emitted none, some
+    # or all of them. Detecting-then-adding was tried first and was wrong:
+    # Debian field names are case-insensitive, so a `provides:` the grep did
+    # not match was still a Provides to dpkg, and the added line made a
+    # duplicate that failed the rebuild.
+    awk '
+      # A continuation line belongs to the field above it: drop it with that
+      # field, keep it otherwise.
+      /^[ \t]/ { if (!skip) print; next }
+      tolower($0) ~ /^(provides|conflicts|replaces):/ { skip = 1; next }
+      { skip = 0 }
+      tolower($0) ~ /^description:/ && !inserted {
+        print "Provides: hocmesh"
+        print "Conflicts: hocmesh"
+        print "Replaces: hocmesh"
+        inserted = 1
+      }
+      { print }
+      END {
+        if (!inserted) {
+          print "Provides: hocmesh"
+          print "Conflicts: hocmesh"
+          print "Replaces: hocmesh"
+        }
+      }
+    ' "$deb_control_file" > "$deb_control_file.new"
+    mv "$deb_control_file.new" "$deb_control_file"
+    dpkg-deb --root-owner-group --build "$deb_stage" "$deb" >/dev/null
+
+    # Read the fields back out of the package that ships, and ask dpkg for
+    # them by name rather than grepping the stanza: dpkg is the thing whose
+    # opinion decides whether the install succeeds, and it is the one that
+    # treats the field name case-insensitively.
     for relation in Provides Conflicts Replaces; do
-      grep -qE "^$relation:.*hocmesh" <<<"$deb_control" || {
+      value=$(dpkg-deb --field "$deb" "$relation")
+      [[ "$value" =~ (^|[^[:alnum:]_-])hocmesh($|[^[:alnum:]_-]) ]] || {
         echo "$deb does not declare $relation: hocmesh; it would not install alongside or in place of the headless package" >&2
         echo "--- control fields in the package ---" >&2
-        printf '%s
-' "$deb_control" >&2
+        dpkg-deb --field "$deb" >&2
         exit 1
       }
     done
