@@ -525,19 +525,73 @@ impl LedgerNetwork {
                 // validators dislike must not sink every unrelated settlement
                 // that happened to share its round.
                 for (tx, reply) in txs.into_iter().zip(replies) {
-                    let r = self.round(vec![tx]).await.map_err(|e| e.to_string());
+                    let r = match self.round(vec![tx.clone()]).await {
+                        Ok(cert) => Ok(cert),
+                        Err(e) => self
+                            .settled_certificate(&tx)
+                            .await
+                            .ok_or_else(|| e.to_string()),
+                    };
                     let _ = reply.send(r);
                 }
             }
             Err(e) => {
-                // A formed certificate may already be applied somewhere. There
-                // is no safe retry from here; the caller has to resolve it.
+                // A round can be refused because the validators have already
+                // settled these claim keys -- which means it was not refused.
+                // A claim key is an idempotency key: this client applied the
+                // transaction at a height it then lost sight of, climbed, and
+                // was turned away on the way back up by its own earlier
+                // success. The effect the caller asked for is in the ledger.
+                //
+                // Telling the caller "rejected" about work the ledger did is
+                // the expensive kind of wrong: a reservation that exists gets
+                // reported missing, and a job that is already paid for gets
+                // run again. So resolve the claim and hand back the
+                // certificate of the entry that carries it. Anything that
+                // does not resolve keeps the original error -- a formed
+                // certificate may be applied somewhere and there is no safe
+                // retry from here.
                 let msg = e.to_string();
-                for r in replies {
-                    let _ = r.send(Err(msg.clone()));
+                for (tx, reply) in txs.into_iter().zip(replies) {
+                    let r = self
+                        .settled_certificate(&tx)
+                        .await
+                        .ok_or_else(|| msg.clone());
+                    let _ = reply.send(r);
                 }
             }
         }
+    }
+
+    /// The certificate of the entry that already carries *this* transaction,
+    /// if a quorum will vouch for one.
+    ///
+    /// This is deliberately narrow, and the narrowness is the safety property.
+    /// It is not enough that the claim key is spent: the committed entry has
+    /// to carry this exact transaction, matched by hash. A claim key is shared
+    /// by every transaction that settles the same claim, so accepting a
+    /// claim-key match alone would hand a caller a certificate for somebody
+    /// else's transaction -- including the case this ledger exists to refuse,
+    /// a second reward for one assignment under different numbers. That
+    /// coordinator must still be told no.
+    ///
+    /// A claim a validator merely says is settled, with no certificate behind
+    /// it, proves nothing and is not accepted either. The point is to
+    /// recognise this client's own committed work, never to turn somebody
+    /// else's refusal into a success.
+    async fn settled_certificate(&self, tx: &LedgerTransaction) -> Option<QuorumCertificate> {
+        let claim = crate::validate::claim_key(tx);
+        if claim.is_empty() {
+            return None;
+        }
+        let ours = crate::validate::transaction_hash(tx).ok()?;
+        let cert = self.claim_quorum(&claim).await.ok()?.certificate?;
+        verify_certificate(&cert, &self.set()).ok()?;
+        cert.entry
+            .transactions
+            .iter()
+            .any(|t| crate::validate::transaction_hash(t).is_ok_and(|h| h == ours))
+            .then_some(cert)
     }
 
     /// The next ballot this client will propose under.

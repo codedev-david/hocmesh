@@ -2203,6 +2203,96 @@ async fn two_independent_proposers_both_settle() -> Result<()> {
     Ok(())
 }
 
+/// A client that loses sight of its own settlement has to be able to learn it
+/// happened.
+///
+/// This is the ordinary end of a round nobody observed: the transaction is
+/// applied, the certificate never gets back, the client climbs, and the
+/// validators turn it away with "claim already settled" -- its own success,
+/// refusing it. Told "rejected" about work the ledger did, a caller runs a job
+/// that is already paid for and reports a reservation that exists as missing.
+/// So the second attempt has to come back with the certificate of the entry
+/// that already carries the transaction, at the height it landed at, and no
+/// second entry may appear.
+///
+/// The refusal still has to mean something, though. A transaction that is not
+/// the settled one, under a claim key that is spent, is a coordinator paying
+/// one assignment twice under different numbers -- and that is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settled_transaction_resolves_to_its_entry_and_an_impostor_does_not() -> Result<()> {
+    let workspace = workspace_root()?;
+    build_bins(&workspace)?;
+    let bin_dir = workspace.join("target").join("debug");
+    let validator_bin = bin_dir.join(exe("hocmesh-validator"));
+    let node_bin = bin_dir.join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let http = test_client();
+    let validator_ports = [free_port()?, free_port()?, free_port()?, free_port()?];
+    let (validators_path, validator_homes, validator_dbs, set) =
+        create_validator_set(&tmp, &validator_bin, &validator_ports)?;
+    let mut validators = Vec::new();
+    for index in 0..4 {
+        validators.push(
+            start_validator(
+                &validator_bin,
+                &validators_path,
+                &validator_homes[index],
+                &validator_dbs[index],
+                validator_ports[index],
+                &http,
+            )
+            .await?,
+        );
+    }
+
+    let client = LedgerNetwork::new(set.clone())?;
+    let tx = community_mint(&node_bin, &validator_homes, &validators_path, "job_idem")?;
+    let landed = client.transact(tx.clone()).await?;
+
+    // The same transaction again. The validators have it and will refuse it.
+    let again = client
+        .transact(tx.clone())
+        .await
+        .context("a client was refused its own settled transaction")?;
+    assert_eq!(
+        (again.entry.sequence, &again.entry.entry_hash),
+        (landed.entry.sequence, &landed.entry.entry_hash),
+        "the resubmission has to resolve to the entry that carried it"
+    );
+
+    // A client that never saw the round reaches the same answer, because the
+    // answer comes from the quorum and not from anything remembered locally.
+    let stranger = LedgerNetwork::new(set.clone())?;
+    let third = stranger
+        .transact(tx.clone())
+        .await
+        .context("a client that never saw the round could not resolve the claim")?;
+    assert_eq!(third.entry.sequence, landed.entry.sequence);
+
+    // Same claim key, different transaction: refused, and still refused after
+    // the resolution path has had its look at it.
+    let mut impostor = tx.clone();
+    impostor.transaction_id = format!("{}_again", tx.transaction_id);
+    let refused = client.transact(impostor).await;
+    assert!(
+        refused.is_err(),
+        "a different transaction settled under a claim that was already spent: {refused:?}"
+    );
+
+    // Nothing was applied twice.
+    assert_eq!(
+        client.head_quorum().await?.sequence,
+        landed.entry.sequence,
+        "resubmitting a settled transaction added an entry"
+    );
+
+    for mut validator in validators {
+        validator.kill();
+    }
+    Ok(())
+}
+
 /// A quorum that has not agreed on a head *yet* is not a quorum that refused.
 ///
 /// Two proposers reaching for one height leave the validators briefly split

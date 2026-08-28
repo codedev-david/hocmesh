@@ -50,7 +50,7 @@ span — one chunk of seven.
 
 A `Rejected` is final — the round loop returns it to the caller without
 retrying — so a batch that was never actually refused must never be reported as
-one. Two windows could do that under load.
+one. Three windows could do that under load.
 
 The first: a proposer that lost a height race saw a threshold of refusals while
 `head_quorum()` still reported the old height. One signed head at or past the
@@ -68,13 +68,31 @@ other than the one put to it, is telling the proposer its head is stale rather
 than refusing the transactions. Below a threshold of judging seats the round
 defers and re-reads the head.
 
+The third is the ordinary end of a round nobody observed. The transaction is
+applied, the certificate never gets back, the proposer climbs, and the
+validators turn it away with `claim already settled` — its own success,
+refusing it. Retrying cannot help here and neither can deferring: the work is
+done. Told "rejected" about work the ledger did, a caller runs a job that is
+already paid for and reports a reservation that exists as missing. A refused
+round is now resolved against the ledger before the error is handed back, and a
+transaction the quorum can show is already committed comes back with the
+certificate of the entry that carries it, at the height it landed at. The match
+is by transaction hash, not by claim key: a claim key is shared by every
+transaction settling the same claim, so a key-only match would hand back a
+certificate for somebody else's transaction — including the one case this
+ledger exists to refuse, a second reward for one assignment under different
+numbers. That coordinator is still told no. Anything that does not resolve
+keeps its original error.
+
 Refusals also carry their reasons out of the round now. The old message was
 `received only 0 valid votes; threshold is 3`, which said nothing about why;
 it now names the validators and quotes what each said, or states plainly that
 every seat accepted a different entry than the one proposed. Ten new tests in
-`hocmesh-ledger/src/network.rs` cover both rules. `head_sequence` is
-`#[serde(default)]`, so a validator that predates it still votes and is read as
-in step.
+`hocmesh-ledger/src/network.rs` cover the first two rules, and
+`a_settled_transaction_resolves_to_its_entry_and_an_impostor_does_not` in
+`hocmesh-integration-tests` covers the third against four live validators.
+`head_sequence` is `#[serde(default)]`, so a validator that predates it still
+votes and is read as in step.
 
 ### Release signing
 
