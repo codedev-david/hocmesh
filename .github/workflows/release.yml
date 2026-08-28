@@ -162,14 +162,33 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v7
         with:
           path: artifacts
+      # The release body is the changelog section for this version, so what a
+      # release says and what the repository says cannot drift apart. A tag
+      # with no section gets a pointer rather than an empty release.
+      - name: Take the release notes from the changelog
+        shell: bash
+        run: |
+          version="${{ github.event.inputs.version || github.ref_name }}"
+          # Compare the version alone rather than a heading prefix: a prefix
+          # match would hand v0.4.1 the notes for v0.4.10.
+          awk -v want="${version#v}" '
+            /^## / { found = $2; sub(/^v/, "", found); inside = (found == want); if (inside) next }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "No CHANGELOG.md section for $version; see the repository history." > notes.md
+          fi
+          cat notes.md
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.version || github.ref_name }}
           name: hocMESH ${{ github.event.inputs.version || github.ref_name }}
+          body_path: notes.md
           draft: true
           prerelease: true
           files: |

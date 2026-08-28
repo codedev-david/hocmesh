@@ -157,6 +157,32 @@ the round was overtaken and is retried on the new head, and only otherwise is it
 reported as rejected. A round that fell short applied nothing anywhere, which is
 what makes re-proposing the same batch safe.
 
+That question can be asked a moment too early. Reading the heads is another
+round trip, and the winner's entry is applied before its new head is readable
+everywhere, so a proposer can find every seat refusing and no head yet past the
+contested height. The votes themselves settle it. Each one reports where that
+validator's own chain ends, and a vote is a verdict on the batch only if the
+seat was building on the same head the proposer was: one that has moved past
+the height has already applied somebody else's entry there, one that is behind
+cannot judge transactions it has not caught up to, and one that signs an entry
+other than the one put to it is saying the proposer's head is stale. None of
+those is an opinion about the transactions. Below a threshold of seats actually
+judging the batch, no quorum was reachable that round at all, so it defers and
+re-reads the head instead of failing the caller.
+
+Under a normally-loaded machine these windows are microseconds wide; under
+coverage instrumentation they open far enough to fail
+`two_independent_proposers_both_settle`, which is where the second one was
+found. Timing bugs in this path are worth fixing rather than retrying around,
+because a rejection is final: the round loop hands it straight back to the
+caller.
+
+A refusal now carries its reason out of the round, too. `received only 0 valid
+votes` is true and useless; the message names the validators and quotes what
+each of them said, and where every seat accepted but none of the signatures
+counted, it says that instead — that is the signature of a stale head, not of a
+bad batch.
+
 The same reasoning applies one step earlier, before a proposal is even built.
 A round starts by reading a head the quorum agrees on, and while two proposers
 are reaching for one height the validators are briefly split across it, so no

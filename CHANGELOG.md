@@ -41,12 +41,33 @@ span — one chunk of seven.
 
 ### A lost ledger race no longer settles as a rejection
 
-Under load, a proposer that lost a height race could see a threshold of
-refusals while `head_quorum()` still reported the old height, and returned a
-final `Rejected` instead of deferring. One signed head at or past the contested
-sequence is now enough to conclude the race was lost, because retrying is always
-safe — a round that fell short applied nothing — while *settling* needs a
-quorum. Four new tests in `hocmesh-ledger/src/network.rs` cover it.
+A `Rejected` is final — the round loop returns it to the caller without
+retrying — so a batch that was never actually refused must never be reported as
+one. Two windows could do that under load.
+
+The first: a proposer that lost a height race saw a threshold of refusals while
+`head_quorum()` still reported the old height. One signed head at or past the
+contested sequence is now enough to conclude the race was lost, because
+retrying is always safe — a round that fell short applied nothing — while
+*settling* needs a quorum.
+
+The second is narrower and was caught by a coverage run, where instrumentation
+slows everything enough to widen it: the winner's entry is applied but its
+signed head has not come back yet, so every seat refuses and no head reads as
+taken. A vote is now only counted as a verdict on the batch if the seat was
+building on the same head the proposer was — `ProposalVote` carries
+`head_sequence`, and a seat at another height, or one that signed an entry
+other than the one put to it, is telling the proposer its head is stale rather
+than refusing the transactions. Below a threshold of judging seats the round
+defers and re-reads the head.
+
+Refusals also carry their reasons out of the round now. The old message was
+`received only 0 valid votes; threshold is 3`, which said nothing about why;
+it now names the validators and quotes what each said, or states plainly that
+every seat accepted a different entry than the one proposed. Ten new tests in
+`hocmesh-ledger/src/network.rs` cover both rules. `head_sequence` is
+`#[serde(default)]`, so a validator that predates it still votes and is read as
+in step.
 
 ### Release signing
 

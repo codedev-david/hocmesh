@@ -209,6 +209,25 @@ impl LedgerNetwork {
         heads.iter().any(|h| h.sequence >= sequence)
     }
 
+    /// Did this seat judge the batch, or disagree about the chain?
+    ///
+    /// A vote answers the question the proposer asked only if the seat was
+    /// building on the same head: its own chain must end one below this
+    /// height, and anything it signed must be the entry it was handed. A seat
+    /// that is past the height has already applied somebody else's entry
+    /// here, one that is behind cannot judge transactions it has not caught up
+    /// to, and one that signs a different entry is telling us our head is
+    /// stale. None of those is an opinion about the transactions, and all
+    /// three are repaired by re-reading the head.
+    ///
+    /// A validator too old to report its head is read as in step, because with
+    /// nothing to go on the safe reading is the one that keeps today's
+    /// behaviour rather than deferring every round against an older seat.
+    fn judged_our_batch(vote: &ProposalVote, sequence: u64, entry_hash: &str) -> bool {
+        vote.head_sequence.is_none_or(|h| h + 1 == sequence)
+            && (!vote.accepted || vote.entry_hash == entry_hash)
+    }
+
     pub async fn head_quorum(&self) -> Result<LedgerHead> {
         let mh = membership_hash(&self.set())?;
         let heads = self.signed_heads(&mh).await;
@@ -710,6 +729,22 @@ impl LedgerNetwork {
             )));
         }
         let answered = votes.len();
+        let judging = votes
+            .iter()
+            .filter(|(_, v)| Self::judged_our_batch(v, sequence, &expected.entry_hash))
+            .count();
+        // The validators say why they refused, and until this was carried out
+        // of the round a proposer could only report a count. "0 valid votes"
+        // is not something anybody can act on.
+        let refusals: Vec<String> = votes
+            .iter()
+            .filter(|(_, v)| !v.accepted)
+            .filter_map(|(m, v)| {
+                v.error
+                    .as_ref()
+                    .map(|e| format!("{}: {e}", short_id(&m.validator_id)))
+            })
+            .collect();
         let sigs: Vec<ValidatorSignature> = votes
             .into_iter()
             .filter_map(|(m, v)| {
@@ -753,10 +788,35 @@ impl LedgerNetwork {
                     self.set().members.len()
                 )));
             }
+            // Only a seat building on the same head as us was answering the
+            // question we asked. `height_is_taken` catches the winner of a
+            // race whose new head is already readable; this catches the same
+            // race a moment earlier, while the winner's entry is applied but
+            // its signed head has not come back yet, and it catches the two
+            // quieter versions: a seat that is behind, and a seat that signed
+            // a different entry because the head we built on was stale. If too
+            // few seats were judging this batch, no quorum was reachable this
+            // round at all, and calling that a refusal strands a batch nobody
+            // refused.
+            if judging < self.set().threshold {
+                return Ok(Attempt::Deferred(format!(
+                    "only {judging} of {} validators were building on height {} \
+                     when the round reached them",
+                    self.set().members.len(),
+                    sequence - 1
+                )));
+            }
             return Err(RoundError::Rejected(format!(
-                "ledger proposal received only {} valid votes; threshold is {}",
+                "ledger proposal received only {} valid votes; threshold is {} ({})",
                 sigs.len(),
-                self.set().threshold
+                self.set().threshold,
+                if refusals.is_empty() {
+                    "every validator accepted, but not the entry that was put to \
+                     them; the head this round built on is not the one they hold"
+                        .to_string()
+                } else {
+                    refusals.join("; ")
+                }
             )));
         }
         let cert = QuorumCertificate {
@@ -873,6 +933,15 @@ impl LedgerNetwork {
     }
 }
 
+/// Enough of a validator id to tell four of them apart in one error line.
+fn short_id(validator_id: &str) -> &str {
+    let cut = validator_id
+        .char_indices()
+        .nth(12)
+        .map_or(validator_id.len(), |(i, _)| i);
+    &validator_id[..cut]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,5 +993,72 @@ mod tests {
     #[test]
     fn a_seat_far_ahead_also_settles_the_question() {
         assert!(LedgerNetwork::a_head_reached(&[head(9)], 3));
+    }
+
+    /// A vote as a validator sends one, with only the parts the rule reads.
+    fn vote(head_sequence: Option<u64>, accepted: bool, entry_hash: &str) -> ProposalVote {
+        ProposalVote {
+            accepted,
+            validator_id: "v".into(),
+            sequence: 2,
+            previous_hash: "hash-1".into(),
+            entry_hash: entry_hash.into(),
+            signature_b64: accepted.then(|| "sig".into()),
+            promised_ballot: None,
+            head_sequence,
+            error: (!accepted).then(|| "no".to_string()),
+        }
+    }
+
+    fn judged(v: &ProposalVote) -> bool {
+        LedgerNetwork::judged_our_batch(v, 2, "entry-2")
+    }
+
+    #[test]
+    fn a_seat_one_below_the_height_that_signed_our_entry_judged_the_batch() {
+        assert!(judged(&vote(Some(1), true, "entry-2")));
+    }
+
+    #[test]
+    fn a_seat_one_below_the_height_that_refused_judged_the_batch() {
+        // This is the real rejection, and it has to survive the rule: a seat
+        // building on our head that says no is saying no to the transactions.
+        assert!(judged(&vote(Some(1), false, "")));
+    }
+
+    #[test]
+    fn a_seat_that_already_filled_this_height_is_not_refusing_the_batch() {
+        // The failure this rule exists for: the winner of a race applied its
+        // entry at height 2, so every seat refuses the loser's proposal, and
+        // not one of those refusals is about the transactions.
+        assert!(!judged(&vote(Some(2), false, "")));
+    }
+
+    #[test]
+    fn a_seat_that_has_not_caught_up_is_not_refusing_the_batch_either() {
+        assert!(!judged(&vote(Some(0), false, "")));
+    }
+
+    #[test]
+    fn a_seat_that_signed_a_different_entry_was_answering_a_different_question() {
+        // In step, and it accepted -- but it built on a head we do not hold,
+        // so its signature can never count towards our certificate. Reading
+        // that as a refusal rejects a batch nobody looked at.
+        assert!(!judged(&vote(Some(1), true, "entry-2-but-elsewhere")));
+    }
+
+    #[test]
+    fn a_validator_too_old_to_report_its_head_is_read_as_in_step() {
+        // Counting it out would turn every round against an older validator
+        // into a deferral, which is a worse failure than the one being fixed.
+        assert!(judged(&vote(None, false, "")));
+        assert!(judged(&vote(None, true, "entry-2")));
+    }
+
+    #[test]
+    fn short_ids_are_cut_without_splitting_a_character() {
+        assert_eq!(short_id("abcdefghijklmnop"), "abcdefghijkl");
+        assert_eq!(short_id("short"), "short");
+        assert_eq!(short_id("ααααααααααααααα"), "αααααααααααα");
     }
 }

@@ -450,10 +450,21 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
             entry_hash: e.entry_hash,
             signature_b64: Some(sig),
             promised_ballot: s.promised_ballot(r.sequence).ok().flatten(),
+            head_sequence: Some(h.sequence),
             error: None,
         })
     })();
     Json(result.unwrap_or_else(|e| {
+        // Refusals are where a proposer learns why it fell short, so say more
+        // here than anywhere else: which ballot holds the height, and where
+        // this chain actually ends. Both under one lock, because a proposer
+        // reading them against each other wants them from one moment.
+        let (promised_ballot, head_sequence) = a.store.lock().map_or((None, None), |s| {
+            (
+                s.promised_ballot(r.sequence).ok().flatten(),
+                s.head(&a.set()).ok().map(|h| h.sequence),
+            )
+        });
         ProposalVote {
             accepted: false,
             validator_id: a.id.node_id(),
@@ -461,13 +472,8 @@ async fn propose(State(a): State<App>, Json(r): Json<ProposalRequest>) -> Json<P
             previous_hash: String::new(),
             entry_hash: String::new(),
             signature_b64: None,
-            // Refusals are where a proposer learns it has been outbid, so this is
-            // the one that matters most.
-            promised_ballot: a
-                .store
-                .lock()
-                .ok()
-                .and_then(|s| s.promised_ballot(r.sequence).ok().flatten()),
+            promised_ballot,
+            head_sequence,
             error: Some(e.to_string()),
         }
     }))

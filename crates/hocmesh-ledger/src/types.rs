@@ -282,6 +282,16 @@ pub struct ProposalVote {
     /// short because somebody outbid us is a different problem from one that
     /// fell short because the set disliked the batch.
     pub promised_ballot: Option<Ballot>,
+    /// Where this validator's own chain ended when it voted.
+    ///
+    /// A seat that is not one below the height being proposed has no opinion
+    /// to give about the batch: it has either already applied somebody else's
+    /// entry here, or has not yet caught up to the head the proposer read.
+    /// Both are repaired by re-reading the head, and neither is a refusal.
+    /// Defaults to `None` so a vote from a validator that predates the field
+    /// still parses, and is then treated as in step.
+    #[serde(default)]
+    pub head_sequence: Option<u64>,
     pub error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
