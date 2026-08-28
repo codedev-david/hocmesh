@@ -190,6 +190,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
             value TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_assignments_leased_by ON assignments(leased_by);
+        -- Every poll asks how many nodes have asked recently, which is how the
+        -- scheduler tells a queue that is short of workers from one that is
+        -- oversubscribed. It is a range scan over a column that every poll also
+        -- writes, so it is worth an index from the first node.
+        CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen);
         "#,
     )?;
     Ok(())

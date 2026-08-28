@@ -415,6 +415,12 @@ pub struct NodeProfile {
     pub load_fraction: f64,
     pub recent_failures: u32,
     pub online: bool,
+    /// Main-memory bandwidth measured on this node, used for any device of its
+    /// that has no measurement of its own -- in practice a CPU-only machine,
+    /// which is the case where this matters most and where nothing else in the
+    /// profile answers the question.
+    #[serde(default)]
+    pub memory_bandwidth_bytes_per_second: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -435,6 +441,15 @@ pub struct CandidateScore {
     pub device_id: String,
     pub score: f64,
     pub estimated_transfer_bytes: u64,
+    /// How fast this particular device streams memory, if anything measured it.
+    ///
+    /// The device's own figure when it has one, the node's otherwise. `None`
+    /// when neither exists, and it stays `None` rather than becoming a default:
+    /// `plan_parallelism` needs to be able to tell "slow" from "unmeasured",
+    /// because a default would let one unbenchmarked machine quietly decide the
+    /// shape of the whole pipeline.
+    #[serde(default)]
+    pub memory_bandwidth_bytes_per_second: Option<u64>,
 }
 
 pub fn rank_candidates(
@@ -479,6 +494,14 @@ pub fn rank_candidates(
                 device_id: device.stable_id.clone(),
                 score,
                 estimated_transfer_bytes: missing_bytes,
+                // The device's own measurement wins over the node's, because a
+                // machine can hold a fast accelerator behind slow main memory
+                // and the stage runs on the accelerator. Falling back to the
+                // node covers the CPU-only case, where there is no device
+                // benchmark and never will be.
+                memory_bandwidth_bytes_per_second: device
+                    .memory_bandwidth_bytes_per_second
+                    .or(node.memory_bandwidth_bytes_per_second),
             });
         }
     }
@@ -548,6 +571,112 @@ pub struct ParallelismPlan {
     pub batches: Vec<BatchShard>,
 }
 
+/// Cut `layer_count` layers into one contiguous span per stage, in order.
+fn uniform_spans(stages: usize, layer_count: u32) -> Vec<(u32, u32)> {
+    let (n, total) = (stages as u64, u64::from(layer_count));
+    (0..n)
+        .map(|i| ((total * i / n) as u32, (total * (i + 1) / n) as u32))
+        .collect()
+}
+
+/// How the model's layers are divided between the stages of a pipeline.
+///
+/// In pipeline parallelism a token passes through every stage in turn, so the
+/// time to produce one is the sum of the stage times and a stage that holds too
+/// much for the memory behind it holds up everything downstream. Generating a
+/// token re-reads every weight in the stage, which makes the stage time
+/// `bytes / bandwidth` -- so the division that finishes soonest is the one where
+/// every stage takes the same time, and that means **layers in proportion to
+/// bandwidth**, not layers in equal counts.
+///
+/// An even split is the right answer only when every stage is equally fast.
+/// Applied to a mixed set it paces the whole pipeline at its slowest machine
+/// while the fast ones idle -- and it is exactly a mixed set that a network of
+/// donated hardware produces.
+///
+/// Two deliberate refusals:
+///
+/// - **If any stage's bandwidth is unmeasured, every stage is split evenly.**
+///   Substituting a default for the one unknown machine would not be a smaller
+///   error than an even split, it would be an unpredictable one: the default
+///   decides that stage's share of the model, and nothing downstream could tell
+///   the guess from a measurement.
+/// - **Every stage keeps at least one layer.** A stage with none is a network
+///   hop that computes nothing. That floor is a repair applied after the fact,
+///   not a reservation taken before: handing every stage a layer up front and
+///   sharing out only what is left would pull every split back towards even,
+///   including the ones that needed no floor at all.
+fn layer_spans(stages: &[CandidateScore], layer_count: u32) -> Vec<(u32, u32)> {
+    let n = stages.len();
+    // Not enough layers to give each stage one: proportion is meaningless here
+    // and the caller has already been told how many devices it needs.
+    if n == 0 || (layer_count as usize) <= n {
+        return uniform_spans(n, layer_count);
+    }
+    let Some(weights) = stages
+        .iter()
+        .map(|s| {
+            s.memory_bandwidth_bytes_per_second
+                .map(|b| b as f64)
+                .filter(|b| b.is_finite() && *b > 0.0)
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return uniform_spans(n, layer_count);
+    };
+    let total: f64 = weights.iter().sum();
+    if !total.is_finite() || total <= 0.0 {
+        return uniform_spans(n, layer_count);
+    }
+
+    // Largest remainder. Each stage's exact share is a fraction of a layer, and
+    // the layers left over by rounding all of them down go to the stages that
+    // were rounded down hardest. Ties break on stage index so two coordinators
+    // planning the same job produce the same plan.
+    let total_layers = layer_count as usize;
+    let ideal: Vec<f64> = weights
+        .iter()
+        .map(|w| total_layers as f64 * w / total)
+        .collect();
+    let mut counts: Vec<usize> = ideal.iter().map(|x| x.floor() as usize).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        (ideal[b] - ideal[b].floor())
+            .total_cmp(&(ideal[a] - ideal[a].floor()))
+            .then(a.cmp(&b))
+    });
+    // Flooring `n` fractions can lose at most `n - 1` layers, so one pass over
+    // the stages in remainder order always places every last one of them.
+    let left = total_layers.saturating_sub(counts.iter().sum::<usize>());
+    for &i in order.iter().take(left) {
+        counts[i] += 1;
+    }
+
+    // Lift any stage that rounded down to nothing, taking the layer from the
+    // largest stage -- the one whose share changes least by losing it. There
+    // are more layers than stages, so a stage holding none means another holds
+    // at least two, and this cannot empty the stage it takes from.
+    for i in 0..n {
+        if counts[i] > 0 {
+            continue;
+        }
+        let Some(donor) = (0..n).max_by_key(|&j| counts[j]).filter(|&j| counts[j] > 1) else {
+            break;
+        };
+        counts[donor] -= 1;
+        counts[i] += 1;
+    }
+
+    let mut spans = Vec::with_capacity(n);
+    let mut cursor = 0u32;
+    for count in counts {
+        let end = cursor + count as u32;
+        spans.push((cursor, end));
+        cursor = end;
+    }
+    spans
+}
+
 pub fn plan_parallelism(
     candidates: &[CandidateScore],
     layer_count: u32,
@@ -566,9 +695,9 @@ pub fn plan_parallelism(
     let mut pipeline = Vec::new();
     if pipeline_count > 1 {
         kinds.insert(ParallelismKind::Pipeline);
-        for (index, candidate) in candidates.iter().take(pipeline_count).enumerate() {
-            let start = layer_count * index as u32 / pipeline_count as u32;
-            let end = layer_count * (index as u32 + 1) / pipeline_count as u32;
+        let stages = &candidates[..pipeline_count];
+        let spans = layer_spans(stages, layer_count);
+        for (index, (candidate, (start, end))) in stages.iter().zip(spans).enumerate() {
             pipeline.push(PipelineStage {
                 stage_index: index as u32,
                 node_id: candidate.node_id.clone(),
@@ -715,6 +844,7 @@ mod tests {
                 supports_fp16: true,
                 supports_bf16: true,
                 supports_int8: true,
+                memory_bandwidth_bytes_per_second: None,
             }],
             cached_chunks: if cached {
                 [sha256(b"x")].into_iter().collect()
@@ -726,6 +856,7 @@ mod tests {
             load_fraction: 0.0,
             recent_failures: 0,
             online: true,
+            memory_bandwidth_bytes_per_second: None,
         }
     }
     fn requirements() -> InferenceRequirements {
@@ -788,18 +919,21 @@ mod tests {
                 device_id: "1".into(),
                 score: 1.0,
                 estimated_transfer_bytes: 0,
+                memory_bandwidth_bytes_per_second: None,
             },
             CandidateScore {
                 node_id: "b".into(),
                 device_id: "2".into(),
                 score: 2.0,
                 estimated_transfer_bytes: 0,
+                memory_bandwidth_bytes_per_second: None,
             },
             CandidateScore {
                 node_id: "c".into(),
                 device_id: "3".into(),
                 score: 3.0,
                 estimated_transfer_bytes: 0,
+                memory_bandwidth_bytes_per_second: None,
             },
         ];
         let next = reroute(
@@ -885,6 +1019,7 @@ mod tests {
             device_id: "gpu-a".into(),
             score: 0.0,
             estimated_transfer_bytes: 0,
+            memory_bandwidth_bytes_per_second: None,
         }];
         assert!(
             reroute(
@@ -898,5 +1033,146 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // -- Splitting a model between unequal machines ------------------------
+
+    fn stage(id: &str, bandwidth: Option<u64>) -> CandidateScore {
+        CandidateScore {
+            node_id: id.into(),
+            device_id: format!("dev-{id}"),
+            score: 0.0,
+            estimated_transfer_bytes: 0,
+            memory_bandwidth_bytes_per_second: bandwidth,
+        }
+    }
+
+    fn widths(spans: &[(u32, u32)]) -> Vec<u32> {
+        spans.iter().map(|(a, b)| b - a).collect()
+    }
+
+    /// The property that matters: a stage twice as fast holds about twice the
+    /// model, so every stage takes about the same time and none of them waits.
+    #[test]
+    fn layers_follow_bandwidth_rather_than_headcount() {
+        let stages = [
+            stage("fast", Some(40_000_000_000)),
+            stage("slow", Some(10_000_000_000)),
+        ];
+        assert_eq!(widths(&layer_spans(&stages, 40)), vec![32, 8]);
+    }
+
+    /// Balanced is what an even split was always trying to be; on equal
+    /// machines the two agree, so nothing changes for a uniform cluster.
+    #[test]
+    fn equal_machines_still_get_equal_shares() {
+        let stages = [
+            stage("a", Some(20_000_000_000)),
+            stage("b", Some(20_000_000_000)),
+            stage("c", Some(20_000_000_000)),
+        ];
+        assert_eq!(widths(&layer_spans(&stages, 33)), vec![11, 11, 11]);
+    }
+
+    /// One unmeasured machine sends the whole split back to even. A default
+    /// would be a number nothing downstream could tell from a measurement.
+    #[test]
+    fn one_unmeasured_stage_makes_the_whole_split_even() {
+        let stages = [stage("fast", Some(40_000_000_000)), stage("unknown", None)];
+        assert_eq!(
+            layer_spans(&stages, 40),
+            uniform_spans(2, 40),
+            "an unmeasured stage must not be scored as if it were measured"
+        );
+    }
+
+    /// A stage holding nothing is a network hop that computes nothing, so even
+    /// the slowest machine in a lopsided set keeps a layer.
+    #[test]
+    fn every_stage_keeps_at_least_one_layer() {
+        let stages = [
+            stage("fast", Some(1_000_000_000_000)),
+            stage("crawling", Some(1)),
+        ];
+        let spans = layer_spans(&stages, 8);
+        assert_eq!(widths(&spans), vec![7, 1]);
+    }
+
+    /// Whatever the weights, the spans have to be a partition of the model:
+    /// contiguous, in order, covering every layer exactly once. This is the
+    /// invariant `validate_plan` enforces downstream.
+    #[test]
+    fn the_split_always_covers_the_model_exactly_once() {
+        let cases: Vec<Vec<Option<u64>>> = vec![
+            vec![Some(7), Some(11), Some(13)],
+            vec![
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+            ],
+            vec![Some(u64::MAX), Some(1)],
+            vec![Some(3), None, Some(5)],
+            vec![Some(0), Some(4)],
+        ];
+        for widths_in in cases {
+            let stages: Vec<_> = widths_in
+                .iter()
+                .enumerate()
+                .map(|(i, b)| stage(&i.to_string(), *b))
+                .collect();
+            for layer_count in [1u32, 2, 7, 8, 32, 33, 80] {
+                let spans = layer_spans(&stages, layer_count);
+                assert_eq!(spans.len(), stages.len());
+                assert_eq!(spans[0].0, 0, "{widths_in:?} over {layer_count}");
+                assert_eq!(
+                    spans.last().unwrap().1,
+                    layer_count,
+                    "{widths_in:?} over {layer_count}"
+                );
+                for pair in spans.windows(2) {
+                    assert_eq!(pair[0].1, pair[1].0, "{widths_in:?} over {layer_count}");
+                }
+            }
+        }
+    }
+
+    /// The plan a coordinator hands out has to be the plan any other
+    /// coordinator would have produced from the same inputs.
+    #[test]
+    fn the_same_machines_always_produce_the_same_split() {
+        let stages = [
+            stage("a", Some(3_000_000_000)),
+            stage("b", Some(3_000_000_000)),
+            stage("c", Some(3_000_000_001)),
+        ];
+        let once = layer_spans(&stages, 41);
+        for _ in 0..8 {
+            assert_eq!(layer_spans(&stages, 41), once);
+        }
+    }
+
+    /// End to end: the planner's output is a valid plan and the fast machine
+    /// really did get the larger share of the model.
+    #[test]
+    fn a_planned_pipeline_is_weighted_and_still_valid() {
+        let candidates = [
+            stage("fast", Some(48_000_000_000)),
+            stage("slow", Some(16_000_000_000)),
+        ];
+        let mut requirements = requirements();
+        requirements.pipeline_stages = 2;
+        requirements.batch_size = 1;
+        let plan = plan_parallelism(&candidates, 32, &requirements).unwrap();
+        validate_plan(&plan, 32, 1).unwrap();
+        let held: Vec<u32> = plan
+            .pipeline
+            .iter()
+            .map(|s| s.layer_end - s.layer_start)
+            .collect();
+        assert_eq!(held, vec![24, 8]);
     }
 }

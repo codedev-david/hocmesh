@@ -1021,6 +1021,7 @@ stored at: {}",
                     supports_fp16: false,
                     supports_bf16: false,
                     supports_int8: true,
+                    memory_bandwidth_bytes_per_second: None,
                 });
             let runtime = match runtime {
                 Some(explicit) => explicit,

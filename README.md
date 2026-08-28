@@ -300,15 +300,49 @@ it is the part that can flex.
 RAM remains a hard gate (`Unfit::NotEnoughMemory`). A machine that cannot hold
 the working set cannot be given longer to hold it.
 
-**What this costs, stated plainly.** Scheduling here is pull-based —
+**What this cost, and what pays for it.** Scheduling here is pull-based —
 `schedule::best(worker, candidates, ..)` picks the best shard *for the node that
-just polled*, and there is no mechanism to hold a shard back for a faster peer
-that might poll a second later. So a slow node that polls first now takes work a
-fast node would have finished sooner, and some jobs will finish later than they
-used to. That is the trade being made: tail latency for inclusion, on a network
-whose whole premise is hardware that would otherwise be idle. The starvation
-bonus still guarantees nothing waits forever, and `MAX_LEASE_SECONDS` bounds how
-long any single shard can be parked on a machine that turns out to be hopeless.
+just polled*, and a coordinator cannot reserve a shard for a peer that has not
+asked for one. So a slow node that polled first took work a fast node would have
+finished sooner: tail latency traded for inclusion. What a pull-based scheduler
+*can* do is answer "not yet", and that is the whole of the correction:
+
+```rust
+// crates/hocmesh-coordinator/src/schedule.rs
+if scale.contended() {
+    let head_start = (HEAD_START_SECONDS as f64 * (1.0 - hardware)).round() as i64;
+    if now.saturating_sub(candidate.created_at) < head_start {
+        return Err(Unfit::StillReservedForFasterNodes);
+    }
+}
+```
+
+Every node waits `HEAD_START_SECONDS * (1 - hardware)` — at most 30 seconds, and
+zero for the fastest machine in the mesh, so the swarm can never deadlock with
+everybody deferring to somebody else. Note what the node is compared against:
+the clock, not its peers. There is no peer lookup and no shared state, so the
+answer costs nothing per poll and any coordinator gives the same one.
+
+Three things keep this from becoming the exclusion it was meant to undo. It is
+capped. It is measured from *shard creation*, so a queue nobody fast wants opens
+to everyone within half a minute. And it applies only when demand exceeds supply:
+
+```rust
+fn contended(&self) -> bool {
+    self.recent_pollers > self.pending_shards
+}
+```
+
+With a shard for everyone, holding one back denies it to a node that was going
+to sit idle anyway and delays the job for no gain at all. `recent_pollers` is a
+single indexed `COUNT(*)` over `nodes.last_seen`, which every poll already
+writes — a count, not a comparison, because the scheduler needs to know whether
+demand exceeds supply, not who is faster than whom. A caller that passes `0`
+(“not measured”) gets exactly the old behaviour.
+
+The starvation bonus still guarantees nothing waits forever, and
+`MAX_LEASE_SECONDS` bounds how long any single shard can be parked on a machine
+that turns out to be hopeless.
 
 Two things are deliberately *not* in this score yet, and they are the honest
 gaps: no premium for scarce resources (a 48 GB card and an 8 GB card are worth
@@ -316,15 +350,49 @@ the same per shard), and no reputation-weighted history beyond a recent-failure
 count. `hocmesh-core/src/reputation.rs` holds the slashing arithmetic for the
 second; nothing wires it into ranking.
 
-A third gap sits one layer up, in inference rather than CPU shards:
-`hocmesh_ai::plan_parallelism` splits a model's layers **uniformly** across
-pipeline stages, with no weighting by how fast each stage's memory actually is.
-Pipeline token time is the sum of stage times, so pairing a fast machine with a
-slow one and giving each half the layers runs the whole pipeline at the slow
-machine's pace. `NodeCapabilities::benchmark_bytes_per_second` exists for the
-weighting and is deliberately left `None` on CPU-only nodes rather than guessed
-at (`hocmesh-core/src/hardware.rs`), so the planner has nothing to weight with
-yet.
+### A model is split by bandwidth, not by headcount
+
+One layer up, in inference rather than CPU shards, the same mistake had a
+different shape: `hocmesh_ai::plan_parallelism` split a model's layers
+**uniformly** across pipeline stages. Pipeline token time is the sum of stage
+times, so pairing a fast machine with a slow one and giving each half the layers
+runs the whole pipeline at the slow machine's pace.
+
+The physics says what the split should be. Generating one token re-reads every
+weight in the stage, so a stage's time is `bytes / bandwidth`, and stage times
+are equal exactly when **layers are proportional to bandwidth**. A uniform split
+is the right answer only when every stage is equally fast — which a network of
+donated hardware is, by definition, not.
+
+That needed a number nothing was measuring. `cpu_benchmark_score` counts primes,
+which is arithmetic throughput: a machine with a strong core behind narrow memory
+scores well on it and would be handed layers it cannot stream. So
+`hocmesh-core/src/hardware.rs` gained a real one — a sequential read over a
+buffer far larger than any last-level cache, four accumulators so the loop waits
+on memory rather than on the add chain, `std::hint::black_box` so the compiler
+cannot delete the work and time an empty function. It reports the best pass,
+because every error source (scheduling, contention, thermal) makes the number
+look *worse* than the hardware is. The GPU figure was already being measured and
+was simply dropped in `protocol_gpu_to_device` before reaching the planner; it
+now carries through, and a device without one falls back to its node's.
+
+Two refusals in `layer_spans` are deliberate:
+
+- **If any stage's bandwidth is unmeasured, every stage splits evenly.**
+  Substituting a default for the one unknown machine is not a smaller error than
+  an even split, it is an unpredictable one — the default decides that stage's
+  share of the model, and nothing downstream could tell the guess from a
+  measurement. Same reason `benchmark_memory_bandwidth` returns `None` rather
+  than a fallback number if it cannot measure: unknown falls back to an even
+  split, wrong silently overloads a stage.
+- **Every stage keeps at least one layer**, since a stage with none is a network
+  hop that computes nothing. That floor is a repair applied after the
+  proportional split, not a reservation taken before it — handing every stage a
+  layer up front and sharing out only the remainder pulls *every* split back
+  towards even, including the ones that needed no floor at all.
+
+Allocation is largest-remainder with ties broken on stage index, so two
+coordinators planning the same job produce the same plan.
 
 ## What an account is, and where the ledger lives
 

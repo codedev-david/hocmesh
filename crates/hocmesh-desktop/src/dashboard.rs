@@ -350,6 +350,7 @@ mod tests {
             logical_cpus: 16,
             total_memory_bytes: 32 * 1024 * 1024 * 1024,
             cpu_benchmark_score: 1,
+            memory_bandwidth_bytes_per_second: None,
             gpus: Vec::new(),
             model_seed_url: None,
             cached_model_manifests: Vec::new(),

@@ -248,6 +248,7 @@ async fn plan_ai(
                 load_fraction: (capabilities.accelerator_load_permille.min(1000) as f64) / 1000.0,
                 recent_failures: 0,
                 online: true,
+                memory_bandwidth_bytes_per_second: capabilities.memory_bandwidth_bytes_per_second,
             });
         }
         (manifest, nodes)
@@ -284,6 +285,11 @@ fn protocol_gpu_to_device(gpu: &hocmesh_protocol::GpuCapability) -> Option<Devic
         supports_fp16: gpu.supports_fp16,
         supports_bf16: gpu.supports_bf16,
         supports_int8: gpu.supports_int8,
+        // The node already measured this when it registered. It used to stop
+        // here, so the planner -- the one thing in the system that needs to
+        // know how fast a device streams weights -- was the only thing that
+        // could not see it.
+        memory_bandwidth_bytes_per_second: gpu.benchmark_bytes_per_second,
     })
 }
 
@@ -1419,6 +1425,7 @@ fn ai_context(
             load_fraction: capabilities.accelerator_load_permille.min(1000) as f64 / 1000.0,
             recent_failures: 0,
             online: true,
+            memory_bandwidth_bytes_per_second: capabilities.memory_bandwidth_bytes_per_second,
         });
     }
     Ok((manifest, nodes, seed_peers))
@@ -1672,12 +1679,27 @@ async fn poll_work(
     let worker = worker_profile(&conn, &req.auth.node_id)?;
     let pending = pending_work(&conn, &req.auth.node_id, state.federation.as_ref())?;
     let region = state.federation.as_ref().and_then(|f| f.region());
+    // How many nodes are competing for this work. Polling is the only way a
+    // node asks, so a node seen inside the head-start window is one that either
+    // wanted a shard or is about to. This is a count and not a comparison --
+    // the scheduler needs to know whether demand exceeds supply, not who is
+    // faster than whom -- which is what keeps it one indexed range scan rather
+    // than a walk over every peer's capabilities on every poll.
+    let recent_pollers: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE last_seen >= ?1",
+            params![now - schedule::HEAD_START_SECONDS],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(ApiError::internal)?
+        .max(0) as usize;
     let Some((chosen, fit)) = schedule::best(
         &worker,
         &pending.candidates,
         now,
         region,
         &schedule::Weights::default(),
+        recent_pollers,
     ) else {
         return Ok(Json(PollResponse { assignment: None }));
     };
@@ -3485,6 +3507,7 @@ mod ai_api_tests {
             logical_cpus: 1,
             total_memory_bytes: 1024,
             cpu_benchmark_score: 1,
+            memory_bandwidth_bytes_per_second: None,
             gpus: if ai_ready {
                 vec![hocmesh_protocol::GpuCapability {
                     stable_id: format!("gpu-{latency}"),

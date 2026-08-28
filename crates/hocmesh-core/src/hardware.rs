@@ -56,6 +56,7 @@ pub fn detect_capabilities_with_models(
         logical_cpus: system.cpus().len().max(1),
         total_memory_bytes: system.total_memory(),
         cpu_benchmark_score: if run_benchmark { benchmark_cpu() } else { 0 },
+        memory_bandwidth_bytes_per_second: run_benchmark.then(benchmark_memory_bandwidth).flatten(),
         gpus,
         model_seed_url,
         cached_model_manifests,
@@ -82,6 +83,59 @@ pub fn benchmark_cpu() -> u64 {
     let _ = count_primes(2, END);
     let elapsed = started.elapsed().as_secs_f64().max(0.000_001);
     ((END - 2) as f64 / elapsed) as u64
+}
+
+/// Bytes of main memory this machine can stream per second.
+///
+/// This is the number that decides how fast a machine can generate tokens, and
+/// it is not the one `benchmark_cpu` reports. Generating a token re-reads every
+/// weight the stage holds, so the step time is `bytes / bandwidth` and the core
+/// spends most of it waiting. Two machines with the same arithmetic score and
+/// different memory can differ several-fold here, which is why the planner
+/// needs this measured rather than inferred.
+///
+/// Measured over a buffer far larger than any last-level cache, so what is
+/// timed is the trip to DRAM rather than a cache that would flatter a machine
+/// with a big L3 and slow memory -- the opposite of what the planner needs.
+/// Four accumulators keep the loop waiting on memory instead of on the
+/// dependency chain between one addition and the next, which would measure the
+/// adder. The best pass wins rather than the mean: every source of error here
+/// is something else stealing the machine, so the fastest observation is the
+/// one least contaminated.
+///
+/// Returns `None` rather than a guess if the machine cannot spare the buffer or
+/// the clock reports nothing usable. A wrong bandwidth is worse than an unknown
+/// one -- unknown falls back to an even split, wrong silently overloads a stage.
+pub fn benchmark_memory_bandwidth() -> Option<u64> {
+    const WORDS: usize = 8 * 1024 * 1024; // 64 MiB of u64
+    const PASSES: usize = 3;
+
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(WORDS).is_err() {
+        return None;
+    }
+    buffer.extend((0..WORDS).map(|i| i as u64));
+
+    let bytes = std::mem::size_of_val(buffer.as_slice()) as f64;
+    let mut best = 0.0f64;
+    for _ in 0..PASSES {
+        let started = Instant::now();
+        let (mut a, mut b, mut c, mut d) = (0u64, 0u64, 0u64, 0u64);
+        for chunk in buffer.chunks_exact(4) {
+            a = a.wrapping_add(chunk[0]);
+            b = b.wrapping_add(chunk[1]);
+            c = c.wrapping_add(chunk[2]);
+            d = d.wrapping_add(chunk[3]);
+        }
+        // Without this the whole loop is dead code and the compiler is entitled
+        // to delete it, which would time an empty function.
+        std::hint::black_box(a ^ b ^ c ^ d);
+        let elapsed = started.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            best = best.max(bytes / elapsed);
+        }
+    }
+    (best.is_finite() && best > 0.0).then_some(best as u64)
 }
 
 /// Overwrite the advertised shared-capacity fields from the operator's limits.

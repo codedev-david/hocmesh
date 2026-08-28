@@ -30,6 +30,15 @@ pub struct DeviceCapability {
     pub supports_fp16: bool,
     pub supports_bf16: bool,
     pub supports_int8: bool,
+    /// Measured device memory bandwidth, in bytes per second.
+    ///
+    /// `None` straight out of discovery, which enumerates devices and does not
+    /// run anything on them. It is filled in from a `BenchmarkReport` once one
+    /// exists, so that a planner deciding how much of a model a device should
+    /// hold reads a measurement or nothing -- never a number inferred from the
+    /// device name.
+    #[serde(default)]
+    pub memory_bandwidth_bytes_per_second: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -288,6 +297,7 @@ pub fn cpu_device() -> DeviceCapability {
         supports_fp16: true,
         supports_bf16: true,
         supports_int8: true,
+        memory_bandwidth_bytes_per_second: None,
     }
 }
 
@@ -430,6 +440,7 @@ fn parse_cuda_csv(text: &str) -> Vec<DeviceCapability> {
                 supports_fp16: major >= 5,
                 supports_bf16: major >= 8,
                 supports_int8: major >= 6,
+                memory_bandwidth_bytes_per_second: None,
             })
         })
         .collect()
@@ -461,6 +472,7 @@ fn parse_rocm_json(text: &str) -> Result<Vec<DeviceCapability>> {
                 supports_fp16: true,
                 supports_bf16: true,
                 supports_int8: true,
+                memory_bandwidth_bytes_per_second: None,
             }
         })
         .collect())
@@ -491,6 +503,7 @@ fn parse_metal_json(text: &str) -> Result<Vec<DeviceCapability>> {
                 supports_fp16: true,
                 supports_bf16: false,
                 supports_int8: true,
+                memory_bandwidth_bytes_per_second: None,
             })
         })
         .collect())
@@ -528,6 +541,7 @@ mod tests {
             supports_fp16: true,
             supports_bf16: true,
             supports_int8: true,
+            memory_bandwidth_bytes_per_second: None,
         }
     }
 
@@ -573,6 +587,7 @@ mod tests {
             supports_fp16: false,
             supports_bf16: false,
             supports_int8: false,
+            memory_bandwidth_bytes_per_second: None,
         };
         let report = benchmark_memory(&device, 4096, 3);
         assert!(report.throughput_units_per_second.is_finite());
@@ -600,6 +615,7 @@ mod tests {
                 supports_fp16: true,
                 supports_bf16: true,
                 supports_int8: true,
+                memory_bandwidth_bytes_per_second: None,
             },
             gpu_layers: 12,
         };

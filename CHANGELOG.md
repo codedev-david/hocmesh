@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### A model is split by memory bandwidth, not by stage count
+
+`plan_parallelism` divided a model's layers evenly across pipeline stages, so a
+fast machine paired with a slow one ran the whole pipeline at the slow one's
+pace. Decode re-reads every weight in a stage per token, so stage time is
+`bytes / bandwidth` and the stages finish together only when layers are
+proportional to bandwidth.
+
+- **Added `benchmark_memory_bandwidth()`** (`hocmesh-core/src/hardware.rs`) — a
+  sequential read over a buffer larger than any last-level cache, four
+  accumulators so the loop waits on memory and not on the add chain,
+  `black_box` so it cannot be optimised away. Best of three passes, since every
+  error source makes the figure look worse than the hardware is. Returns `None`
+  rather than a guess if it cannot measure.
+- **`memory_bandwidth_bytes_per_second`** added to `NodeCapabilities`,
+  `DeviceCapability`, `hocmesh-ai`'s `NodeProfile` and `CandidateScore`, all
+  `#[serde(default)]` so existing `capabilities_json` rows still load.
+- **The GPU figure now reaches the planner.** `protocol_gpu_to_device` measured
+  `benchmark_bytes_per_second` at registration and then dropped it, leaving the
+  one component that needs it unable to see it. A device without its own
+  measurement falls back to its node's.
+- **`layer_spans`** allocates layers by largest remainder, ties broken on stage
+  index so two coordinators plan identically. Any unmeasured stage sends the
+  whole split back to uniform — a default would be an unpredictable error, not
+  a smaller one. Every stage keeps at least one layer, as a repair after the
+  proportional split rather than a reservation before it.
+
+### Fast nodes get a bounded head start on contended work
+
+Pull-based scheduling answers whoever polls, so the previous release's
+inclusion fix let a slow node take work a fast node would have finished sooner.
+A coordinator cannot reserve a shard for a peer that has not asked — but it can
+answer "not yet".
+
+- **`Unfit::StillReservedForFasterNodes`** defers a node for
+  `HEAD_START_SECONDS * (1 - hardware)`, capped at 30s and zero for the fastest
+  machine, so the mesh cannot deadlock with everyone deferring.
+- **Only under contention.** `Scale::contended()` is `recent_pollers >
+  pending_shards`; with a shard for everyone, holding one back delays the job
+  for no gain. Measured from shard creation, so an aging queue opens to all.
+- **`recent_pollers`** is one indexed `COUNT(*)` over `nodes.last_seen`, which
+  every poll already writes; new index `idx_nodes_last_seen`. Passing `0` means
+  "not measured" and reproduces the previous behaviour exactly.
+
 ### Modest hardware is scheduled, not excluded
 
 A node predicted to take longer than the flat 900-second lease was refused the

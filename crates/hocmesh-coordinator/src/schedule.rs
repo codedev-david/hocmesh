@@ -130,6 +130,12 @@ pub struct ShardCandidate {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Scale {
     pub max_reward_mcu: i64,
+    /// How many shards are on offer at once.
+    pub pending_shards: usize,
+    /// How many nodes have asked for work recently, or `0` when the caller did
+    /// not measure it. Zero disables the head start in `fit` entirely, so a
+    /// caller that knows nothing about demand gets exactly the old behaviour.
+    pub recent_pollers: usize,
 }
 
 impl Scale {
@@ -141,7 +147,24 @@ impl Scale {
                 .max()
                 .unwrap_or(1)
                 .max(1),
+            pending_shards: candidates.len(),
+            recent_pollers: 0,
         }
+    }
+
+    /// Record how many nodes are competing for these shards.
+    pub fn with_recent_pollers(mut self, pollers: usize) -> Self {
+        self.recent_pollers = pollers;
+        self
+    }
+
+    /// Whether there are more nodes wanting work than there is work.
+    ///
+    /// Only then does it cost anything to give a shard to a slower machine:
+    /// with a shard for everyone, holding one back denies it to a node that was
+    /// going to sit idle anyway and delays the job for no gain at all.
+    fn contended(&self) -> bool {
+        self.recent_pollers > self.pending_shards
     }
 
     /// This shard's share of the largest on offer, in `[0, 1]`.
@@ -175,7 +198,26 @@ pub enum Unfit {
     /// The node cannot finish this shard before its lease expires. Handing it
     /// over anyway produces a guaranteed expiry and a guaranteed re-lease.
     SlowerThanLease,
+    /// Not a refusal: this shard is new, faster machines are competing for it,
+    /// and this node's head start has not run out yet. Ask again shortly and
+    /// the same shard will be offered.
+    StillReservedForFasterNodes,
 }
+
+/// The longest a shard is ever held back from the node in front of it.
+///
+/// Scheduling here is pull-based: a node asks, and the coordinator answers from
+/// the shards that exist at that moment. It cannot save a shard for a faster
+/// machine that has not asked yet, so once slower machines are eligible -- which
+/// is the point of the variable lease -- whoever asks first takes it, and a job
+/// can finish later than it needed to for no reason but the order of arrival.
+///
+/// The head start is the whole of the correction, so it is bounded on purpose
+/// and it is short: a fixed, known ceiling on how long any shard can be idle
+/// while a faster node is hoped for. Past it every eligible node is equal again,
+/// which is what stops this from becoming an exclusion rule wearing a different
+/// hat.
+pub const HEAD_START_SECONDS: i64 = 30;
 
 /// mCU per second this node's benchmark says it sustains, or `None` when it
 /// never ran one.
@@ -309,6 +351,30 @@ pub fn fit(
         (1.0 - s / DEFAULT_LEASE_SECONDS as f64).clamp(0.0, 1.0)
     });
 
+    // The head start, and the only place the scheduler prefers a fast machine
+    // over a slow one for reasons of time rather than of fit.
+    //
+    // Every node's wait is `HEAD_START_SECONDS * (1 - hardware)`, so the
+    // fastest waits nothing and takes fresh work the instant it appears, and
+    // each slower one is behind it by an amount that is a measurement rather
+    // than a rank. Nobody is compared against anybody: the node is compared
+    // against the clock, which is what keeps this cheap -- no peer lookup, no
+    // shared state, the same answer from any coordinator scoring the same row.
+    //
+    // Three things stop it becoming exclusion. It is capped, so the slowest
+    // eligible node waits half a minute and not a second longer. It applies
+    // only while more nodes want work than there is work, because otherwise
+    // the shard would go to nobody at all. And it is measured from when the
+    // shard appeared, so a shard that has been sitting is open to everyone --
+    // which means the correction switches itself off in precisely the case it
+    // was not built for, a queue nobody fast is draining.
+    if scale.contended() {
+        let head_start = (HEAD_START_SECONDS as f64 * (1.0 - hardware)).round() as i64;
+        if now.saturating_sub(candidate.created_at) < head_start {
+            return Err(Unfit::StillReservedForFasterNodes);
+        }
+    }
+
     // Network: how much of the exchange is the work rather than the round trip
     // carrying it. A distant node scores better on a larger shard, which is
     // the batching argument stated as arithmetic. Unknown latency is neutral,
@@ -394,8 +460,9 @@ pub fn best<'a>(
     now: i64,
     coordinator_region: Option<&str>,
     weights: &Weights,
+    recent_pollers: usize,
 ) -> Option<(&'a ShardCandidate, Fit)> {
-    let scale = Scale::of(candidates);
+    let scale = Scale::of(candidates).with_recent_pollers(recent_pollers);
     candidates
         .iter()
         .filter_map(|c| {
@@ -587,6 +654,7 @@ mod tests {
             logical_cpus: 8,
             total_memory_bytes: 16 << 30,
             cpu_benchmark_score: benchmark,
+            memory_bandwidth_bytes_per_second: None,
             gpus: Vec::new(),
             model_seed_url: None,
             cached_model_manifests: Vec::new(),
@@ -623,6 +691,17 @@ mod tests {
             nearest_done_shard: None,
             required_manifests: Vec::new(),
         }
+    }
+
+    /// A shard this node is predicted to spend `seconds` over.
+    ///
+    /// The head start is a function of predicted time, so a test that wants a
+    /// particular wait has to ask for a particular duration. Writing the reward
+    /// as a literal instead couples the test to `REFERENCE_OPS_PER_MCU` and
+    /// quietly crosses `MAX_LEASE_SECONDS` when either constant moves.
+    fn shard_taking(node: &WorkerProfile, id: &str, seconds: f64) -> ShardCandidate {
+        let reward = (mcu_per_second(&node.caps).expect("benchmarked node") * seconds) as i64;
+        shard(id, 0, reward.max(1))
     }
 
     fn score(w: &WorkerProfile, c: &ShardCandidate, now: i64) -> Fit {
@@ -968,7 +1047,7 @@ mod tests {
         let now = 10_000;
 
         let candidates = vec![ideal.clone(), starved.clone()];
-        let (picked, _) = best(&w, &candidates, now, None, &Weights::default()).unwrap();
+        let (picked, _) = best(&w, &candidates, now, None, &Weights::default(), 0).unwrap();
         assert_eq!(picked.assignment_id, "starved");
 
         // And the reason is structural, not a coincidence of these numbers:
@@ -1000,13 +1079,13 @@ mod tests {
     fn choosing_is_deterministic_when_two_shards_are_indistinguishable() {
         let w = worker("any", 1_000_000, 20_000);
         let candidates = vec![shard("bbb", 3, 100), shard("aaa", 3, 100)];
-        let first = best(&w, &candidates, 1_000, None, &Weights::default())
+        let first = best(&w, &candidates, 1_000, None, &Weights::default(), 0)
             .unwrap()
             .0
             .assignment_id
             .clone();
         let reversed: Vec<_> = candidates.iter().rev().cloned().collect();
-        let second = best(&w, &reversed, 1_000, None, &Weights::default())
+        let second = best(&w, &reversed, 1_000, None, &Weights::default(), 0)
             .unwrap()
             .0
             .assignment_id
@@ -1025,7 +1104,8 @@ mod tests {
                 &[shard("a", 0, 100), shard("b", 1, 100)],
                 1_000,
                 None,
-                &Weights::default()
+                &Weights::default(),
+                0
             )
             .is_none()
         );
@@ -1035,7 +1115,8 @@ mod tests {
                 &[],
                 1_000,
                 None,
-                &Weights::default()
+                &Weights::default(),
+                0
             )
             .is_none()
         );
@@ -1154,5 +1235,137 @@ mod tests {
         ]);
         graph.vertices[1].online = false;
         assert_eq!(graph.cluster(2, |_| true).unwrap().node_ids, vec!["a", "b"]);
+    }
+
+    // -- The head start ----------------------------------------------------
+    //
+    // These lock the property the mechanism exists for: it changes who goes
+    // *first*, and never who is allowed to go at all.
+
+    /// The reserve costs nothing when there is work spare, which is the state a
+    /// healthy mesh spends most of its time in.
+    #[test]
+    fn with_a_shard_for_everyone_nobody_waits() {
+        let slow = worker("slow", 20_000, 20_000);
+        let field = [
+            shard_taking(&slow, "a", 1_000.0),
+            shard_taking(&slow, "b", 1_000.0),
+        ];
+        // Two nodes asking, two shards on offer: not contended.
+        let scale = Scale::of(&field).with_recent_pollers(2);
+        assert!(
+            fit(
+                &slow,
+                &field[0],
+                &scale,
+                field[0].created_at,
+                None,
+                &Weights::default()
+            )
+            .is_ok()
+        );
+    }
+
+    /// With more nodes than shards, a fresh shard goes to the fastest asker and
+    /// the slower one is told to come back.
+    #[test]
+    fn on_fresh_work_the_faster_node_goes_first() {
+        let quick = worker("quick", 100_000_000, 20_000);
+        let slow = worker("slow", 20_000, 20_000);
+        let field = [shard_taking(&slow, "a", 1_000.0)];
+        let scale = Scale::of(&field).with_recent_pollers(4);
+        let now = field[0].created_at;
+        let w = Weights::default();
+
+        assert!(fit(&quick, &field[0], &scale, now, None, &w).is_ok());
+        assert_eq!(
+            fit(&slow, &field[0], &scale, now, None, &w),
+            Err(Unfit::StillReservedForFasterNodes)
+        );
+    }
+
+    /// And the wait is over in `HEAD_START_SECONDS` whatever the machine, which
+    /// is what keeps a head start from turning into the exclusion it replaced.
+    #[test]
+    fn no_node_waits_longer_than_the_head_start() {
+        let slow = worker("slow", 20_000, 20_000);
+        let field = [shard_taking(&slow, "a", 1_000.0)];
+        let scale = Scale::of(&field).with_recent_pollers(4);
+        let w = Weights::default();
+        assert!(
+            fit(
+                &slow,
+                &field[0],
+                &scale,
+                field[0].created_at + HEAD_START_SECONDS,
+                None,
+                &w
+            )
+            .is_ok()
+        );
+    }
+
+    /// A node fast enough to be at the front of the queue is never held back,
+    /// however contended the mesh is.
+    #[test]
+    fn the_fastest_node_never_waits() {
+        let quick = worker("quick", 100_000_000, 20_000);
+        let field = [shard("a", 0, 1_000)];
+        let scale = Scale::of(&field).with_recent_pollers(1_000);
+        assert!(
+            fit(
+                &quick,
+                &field[0],
+                &scale,
+                field[0].created_at,
+                None,
+                &Weights::default()
+            )
+            .is_ok()
+        );
+    }
+
+    /// The wait is graded rather than binary: a middling machine is behind the
+    /// quick one and ahead of the crawling one, by a measured amount.
+    #[test]
+    fn a_slower_machine_waits_longer_than_a_less_slow_one() {
+        let modest = worker("modest", 200_000, 20_000);
+        let crawling = worker("crawling", 20_000, 20_000);
+        // Sized so the modest machine is part-way down the axis and the
+        // crawling one is pinned at the bottom of it.
+        let field = [shard_taking(&modest, "a", 200.0)];
+        let scale = Scale::of(&field).with_recent_pollers(9);
+        let w = Weights::default();
+        let waited = |worker: &WorkerProfile| {
+            (0..=HEAD_START_SECONDS)
+                .find(|d| fit(worker, &field[0], &scale, field[0].created_at + d, None, &w).is_ok())
+                .expect("every node is eligible by the end of the head start")
+        };
+        let modest = waited(&modest);
+        let crawling = waited(&crawling);
+        assert!(
+            modest < crawling,
+            "a faster machine should wait less: {modest}s vs {crawling}s"
+        );
+        assert!(crawling <= HEAD_START_SECONDS);
+    }
+
+    /// A caller that measured no demand gets the behaviour that existed before
+    /// the head start did.
+    #[test]
+    fn without_a_demand_reading_the_head_start_is_off() {
+        let slow = worker("slow", 20_000, 20_000);
+        let field = [shard_taking(&slow, "a", 1_000.0)];
+        assert!(
+            fit(
+                &slow,
+                &field[0],
+                &Scale::of(&field),
+                field[0].created_at,
+                None,
+                &Weights::default()
+            )
+            .is_ok()
+        );
     }
 }

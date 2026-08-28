@@ -71,6 +71,18 @@ pub struct NodeCapabilities {
     pub logical_cpus: usize,
     pub total_memory_bytes: u64,
     pub cpu_benchmark_score: u64,
+    /// Sustained main-memory read bandwidth, in bytes per second, or `None` on
+    /// a node that never measured it.
+    ///
+    /// Deliberately separate from `cpu_benchmark_score`, which counts
+    /// arithmetic. The two answer different questions and a fast machine on one
+    /// can be a slow machine on the other: token generation re-reads the
+    /// weights every step and is bound by how fast memory can be streamed, not
+    /// by how fast the core can multiply. Using the arithmetic score to place
+    /// model layers would systematically over-load exactly the machines with a
+    /// strong CPU behind narrow memory.
+    #[serde(default)]
+    pub memory_bandwidth_bytes_per_second: Option<u64>,
     pub gpus: Vec<GpuCapability>,
     #[serde(default)]
     pub model_seed_url: Option<String>,
