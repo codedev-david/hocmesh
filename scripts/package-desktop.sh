@@ -45,8 +45,16 @@ done
 # The bundler takes its version from tauri.conf.json, so a tree whose config
 # disagrees with its VERSION file would ship an installer named for one
 # release and reporting another.
-configured_version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+# Not anchored to the start of a line: the only thing that makes this config
+# line-oriented is that somebody formatted it that way, and a reformat is not
+# supposed to be able to break a build. `minimumSystemVersion` does not match --
+# the capital V means it is not `"version"`.
+configured_version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   "$desktop_dir/tauri.conf.json" | head -1)
+[[ -n "$configured_version" ]] || {
+  echo "no \"version\" field in $desktop_dir/tauri.conf.json" >&2
+  exit 1
+}
 repository_version=$(tr -d '[:space:]' < "$repository_root/VERSION")
 [[ "$configured_version" == "$repository_version" ]] || {
   echo "tauri.conf.json says $configured_version but VERSION says $repository_version" >&2
