@@ -24,14 +24,35 @@ cargo tauri build --config tauri.bundle.json -- --locked
 (macOS, Linux) do the whole sequence: take an already-built release `hocmesh`
 as their first argument -- passed in rather than built here so the app and the
 daemon it will start always come from one build -- stage it as
-`binaries/hocmesh-<target-triple>`, run the bundler with that patch, then copy
-each installer into `dist/` under a name that carries the version. Each script
-then opens what it produced and fails unless both executables are inside: an
-installer carrying the window without the daemon would look perfectly fine from
-the outside and install an app that cannot start anything. Tauri strips
-the triple when it bundles, so the sidecar is installed as plain `hocmesh`
-(or `hocmesh.exe`) next to the app binary, which is exactly the first place
+`binaries/hocmesh-node-<target-triple>`, run the bundler with that patch, then
+copy each installer into `dist/` under a name that carries the version. Each
+script then opens what it produced and fails unless both executables are inside:
+an installer carrying the window without the daemon would look perfectly fine
+from the outside and install an app that cannot start anything. Tauri strips
+the triple when it bundles, so the sidecar is installed as plain `hocmesh-node`
+(or `hocmesh-node.exe`) next to the app binary, which is exactly the first place
 `candidate_paths` looks.
+
+## Why the sidecar is not called `hocmesh`
+
+Tauri's Debian bundler copies both the app binary and every sidecar into
+`/usr/bin`. The client package `hocmesh-compute-client` already owns
+`/usr/bin/hocmesh`, and dpkg refuses to let two packages own one path, so a
+sidecar named `hocmesh` would make the two installers mutually exclusive:
+
+```
+dpkg: error processing archive hocmesh-desktop_0.3.0_amd64.deb
+ trying to overwrite '/usr/bin/hocmesh', which is also in package
+ hocmesh-compute-client
+```
+
+The name is `hocmesh-node` on every platform so there is one answer rather than
+a per-platform one, and `package-desktop.sh` fails the build if the `.deb` ever
+claims `/usr/bin/hocmesh` again. `supervisor::NODE_BINARIES` looks for
+`hocmesh-node` first and plain `hocmesh` second, so a machine that has only the
+client package installed still gets a working daemon from the operator's
+`PATH`, and a machine that has both is driven by the node this window shipped
+with.
 
 ## What comes out
 

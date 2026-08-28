@@ -34,11 +34,16 @@ if ($configuredVersion -ne $repositoryVersion) {
 
 # Tauri names a sidecar for the triple it was built for and strips that suffix
 # when it bundles, which is what lands the node next to the app as plain
-# hocmesh.exe -- the first place supervisor::candidate_paths looks.
+# hocmesh-node.exe -- the first place supervisor::candidate_paths looks.
+#
+# hocmesh-node rather than hocmesh so that one name is used on every platform.
+# Windows would tolerate either, since this app installs to its own directory,
+# but the Linux .deb shares /usr/bin with the standalone client package and
+# dpkg refuses to let two packages own one path.
 $hostTriple = (& rustc -vV | Select-String -Pattern '^host: (.+)$').Matches[0].Groups[1].Value
 $sidecarDir = Join-Path $desktopDir "binaries"
 New-Item -ItemType Directory -Force -Path $sidecarDir | Out-Null
-$sidecar = Join-Path $sidecarDir "hocmesh-$hostTriple.exe"
+$sidecar = Join-Path $sidecarDir "hocmesh-node-$hostTriple.exe"
 Copy-Item -LiteralPath $binaryPath -Destination $sidecar -Force
 
 if (-not (Get-Command cargo-tauri -ErrorAction SilentlyContinue)) {
@@ -83,7 +88,7 @@ $extract = Join-Path ([System.IO.Path]::GetTempPath()) "hocmesh-desktop-msi-$cle
 if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
 $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @("/a", $msi, "/qn", "TARGETDIR=$extract")
 if ($process.ExitCode -ne 0) { throw "MSI administrative extraction failed: $($process.ExitCode)" }
-foreach ($expected in @("hocmesh.exe", "hocmesh-desktop.exe")) {
+foreach ($expected in @("hocmesh-node.exe", "hocmesh-desktop.exe")) {
     if (-not (Get-ChildItem $extract -Filter $expected -Recurse -File | Select-Object -First 1)) {
         throw "$expected is absent from $msi"
     }

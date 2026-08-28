@@ -316,6 +316,8 @@ Build the installers, which lay the app and the node down together so the app fi
 
 That produces an MSI and an NSIS setup executable on Windows, a `.dmg` on macOS, and a `.deb` and an `.AppImage` on Linux; tagged releases carry all of them. `crates/hocmesh-desktop/BUNDLING.md` covers how the node is embedded and what each platform needs installed first.
 
+These are a different installer from the client packages further up. The desktop installer carries the window and the node it drives, and is all a person contributing a machine needs. The client installer carries the three command line binaries — node, coordinator and validator — and no window, which is what a headless server or anyone running a coordinator or a validator wants. Both can be installed on one machine: the node inside the desktop package is called `hocmesh-node` precisely so the desktop `.deb` and the client `.deb` do not both claim `/usr/bin/hocmesh`, and the app prefers the node it shipped with over whatever is on `PATH`.
+
 ---
 
 # Build a release folder

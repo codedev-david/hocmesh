@@ -63,6 +63,7 @@
 | Settings and limits | Implemented | Coordinator, worker ceiling, AI consent and the CPU/memory/GPU shares, persisted and applied to a running node without a restart. The settings file is a consent record: the app writes what the operator set and never widens a share on its own |
 | End-to-end proof | Implemented | An integration test drives the app's own layers against a real coordinator and daemon: cold snapshot, start, work completed, a paid ledger entry, a limit changed and read back off disk, then stop |
 | Installers | Implemented | Tauri bundler MSI and NSIS setup on Windows, DMG on macOS, DEB and AppImage on Linux, each carrying the node as a sidecar beside the app; `scripts/package-desktop.*` open what they produced and fail unless both executables are inside |
+| Coexistence with the client installer | Implemented | The sidecar is named `hocmesh-node`, not `hocmesh`, because Tauri's Debian bundler unpacks into `/usr/bin` and dpkg refuses to let the desktop package and `hocmesh-compute-client` both own `/usr/bin/hocmesh`; `package-desktop.sh` fails the build if the `.deb` ever claims that path, and `NODE_BINARIES` still falls back to a client-installed `hocmesh` on `PATH` |
 
 ## Distribution
 

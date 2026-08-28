@@ -185,15 +185,17 @@ mod tests {
 
     #[test]
     fn something_that_blocks_a_start_is_said_out_loud_rather_than_failing_on_click() {
-        let model = TrayModel::from_snapshot(
-            &snapshot(Health::Stopped, false),
-            Some("hocmesh.exe was not found beside this app or on PATH"),
-        );
+        // Taken from the supervisor rather than written out here, so that
+        // renaming the node executable cannot leave this test asserting a
+        // sentence the operator will never actually be shown.
+        let blocker = crate::supervisor::start_blocker(None, "http://mesh.example").unwrap();
+        let model = TrayModel::from_snapshot(&snapshot(Health::Stopped, false), Some(&blocker));
         assert!(!model.enabled(ID_START));
         assert_eq!(
             model.item(ID_STATUS).unwrap().label,
-            "Cannot start: hocmesh.exe was not found beside this app or on PATH"
+            format!("Cannot start: {blocker}")
         );
+        assert!(blocker.contains(crate::supervisor::NODE_BINARY));
     }
 
     #[test]

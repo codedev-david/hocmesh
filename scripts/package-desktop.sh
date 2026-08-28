@@ -41,11 +41,16 @@ repository_version=$(tr -d '[:space:]' < "$repository_root/VERSION")
 
 # Tauri names a sidecar for the triple it was built for and strips that suffix
 # when it bundles, which is what lands the node next to the app as plain
-# hocmesh -- the first place supervisor::candidate_paths looks.
+# hocmesh-node -- the first place supervisor::candidate_paths looks.
+#
+# hocmesh-node, not hocmesh: the .deb below unpacks into /usr/bin, the same
+# place the standalone client package puts its own hocmesh, and dpkg refuses
+# to let two packages own one path. Sharing the name would make the desktop
+# installer and the client installer mutually exclusive on one machine.
 host_triple=$(rustc -vV | sed -n 's/^host: //p')
 [[ -n "$host_triple" ]] || { echo "could not read the host target triple from rustc" >&2; exit 1; }
 mkdir -p "$desktop_dir/binaries"
-install -m 0755 "$binary" "$desktop_dir/binaries/hocmesh-$host_triple"
+install -m 0755 "$binary" "$desktop_dir/binaries/hocmesh-node-$host_triple"
 
 # Both of these are sent to stderr so that the only thing this script writes
 # to stdout is the artifact paths a caller wants to capture.
@@ -86,7 +91,7 @@ case "$(uname -s)" in
     dmg_mount=$(mktemp -d)
     trap 'hdiutil detach "$dmg_mount" >/dev/null 2>&1 || true; rm -rf -- "$dmg_mount"' EXIT
     hdiutil attach -nobrowse -readonly -mountpoint "$dmg_mount" "$dmg" >/dev/null
-    for expected in hocmesh hocmesh-desktop; do
+    for expected in hocmesh-node hocmesh-desktop; do
       # Assigned rather than piped into grep: grep -q exits on the first match,
       # which hands the producer a SIGPIPE that pipefail then reports as a
       # failure of the very check that just succeeded.
@@ -113,18 +118,28 @@ case "$(uname -s)" in
     # exits on the first match, which hands dpkg-deb a SIGPIPE that pipefail
     # then reports as a failure of the very check that just succeeded.
     deb_contents=$(dpkg-deb --contents "$deb")
-    for expected in hocmesh hocmesh-desktop; do
+    for expected in hocmesh-node hocmesh-desktop; do
       grep -qE "/$expected\$" <<<"$deb_contents" || {
         echo "$expected is absent from $deb" >&2
         exit 1
       }
     done
 
+    # The other half of the same rule. hocmesh_<version>_<arch>.deb already
+    # owns /usr/bin/hocmesh, and dpkg will not install a second package that
+    # claims it -- so a desktop .deb carrying that exact path would be
+    # uninstallable on any machine with the client, and vice versa. This is the
+    # check that catches a sidecar accidentally renamed back.
+    if grep -qE "/usr/bin/hocmesh\$" <<<"$deb_contents"; then
+      echo "$deb claims /usr/bin/hocmesh, which the client package owns" >&2
+      exit 1
+    fi
+
     chmod +x "$appimage"
     appimage_stage=$(mktemp -d)
     trap 'rm -rf -- "$appimage_stage"' EXIT
     (cd "$appimage_stage" && "$appimage" --appimage-extract >/dev/null)
-    for expected in hocmesh hocmesh-desktop; do
+    for expected in hocmesh-node hocmesh-desktop; do
       found=$(find "$appimage_stage/squashfs-root" -type f -name "$expected" -print -quit)
       [[ -n "$found" ]] || { echo "$expected is absent from $appimage" >&2; exit 1; }
     done
