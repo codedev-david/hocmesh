@@ -101,7 +101,16 @@ jobs:
             mv "$bom" "target/sbom/$crate.cdx.json"
             count=$((count + 1))
           done
-          test "$count" -eq 12
+          # Derived from the workspace rather than written down, because the
+          # number was written down and adding a crate broke this job rather
+          # than telling anybody a crate was missing from the SBOM. What is
+          # actually being asserted is "every workspace member produced a valid
+          # bill of materials", and that survives the workspace growing.
+          expected=$(cargo metadata --format-version 1 --no-deps | jq '.packages | length')
+          test "$count" -eq "$expected" || {
+            echo "$count of $expected workspace crates produced an SBOM" >&2
+            exit 1
+          }
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v7
         with:
