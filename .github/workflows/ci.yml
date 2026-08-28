@@ -24,6 +24,29 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libappindicator3-dev librsvg2-dev patchelf
+      # A script a workflow runs as ./scripts/x.sh has to be executable in the
+      # index, and a Windows checkout cannot tell you it is not: the file is
+      # committed 100644, every local run works because it is invoked through
+      # bash, and the release fails on macOS a quarter of an hour in. Two
+      # seconds here instead.
+      - name: Workflow scripts are executable
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bad=0
+          # Comments are stripped first, so the one above this step does not
+          # report itself.
+          invoked=$(cat .github/workflows/*.yml | grep -v '^[[:space:]]*#' |
+                    grep -oE '\./scripts/[A-Za-z0-9_-]+\.sh' | sort -u)
+          for script in $invoked; do
+            mode=$(git ls-files -s "${script#./}" | cut -d' ' -f1)
+            if [ "$mode" != "100755" ]; then
+              echo "$script is invoked directly by a workflow but is committed $mode; run: git update-index --chmod=+x ${script#./}" >&2
+              bad=1
+            fi
+          done
+          [ "$bad" -eq 0 ] && echo "Every directly-invoked workflow script is executable."
+          exit "$bad"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check
