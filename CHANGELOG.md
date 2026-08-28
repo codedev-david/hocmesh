@@ -1,6 +1,141 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
+
+### A model now runs across machines none of which hold it whole
+
+This is the thing the rest of the system existed to make possible, and until
+this release it was the one piece missing. hocMESH could already say which
+layers a machine should hold, price the work, settle it and move the bytes. A
+stage was then executed by an external llama.cpp process, which loads whole
+models — so a model too large for any single participating machine could be
+planned and paid for but never run.
+
+- **New crate `hocmesh-engine`** — loads blocks `[start, end)` out of a GGUF file
+  and runs a forward pass over an activation handed to it. RMS norm, RoPE,
+  grouped-query attention and SwiGLU, over F32, F16, BF16, Q8\_0, Q4\_0, Q4\_1,
+  Q5\_0 and Q5\_1. Nothing in a stage reaches for a weight outside its own range,
+  which is what lets it run on a machine that holds only its own layers.
+- **The architecture is read, never asserted.** An architecture the engine has
+  not been told about is refused at load. A wrong RoPE layout does not fail — it
+  generates fluent nonsense — so guessing is not on the table.
+- **`hocmesh stage-serve`** puts one layer range behind an HTTP port with the
+  address of the next stage; the tail turns the activation into logits and the
+  answer walks back down the chain. **`hocmesh stage-run`** drives a chain, or
+  runs the same model whole in one process to compare against.
+- **`hocmesh model-shard`** materialises only the bytes a stage's layers need.
+  The file is created at the model's full declared length so every tensor sits
+  where the header says it does, and the rest is a hole. A `.shard.json` sidecar
+  records which bytes are real, because **a hole reads back as zeros, and zeros
+  are a valid weight matrix** — a stage with a zeroed layer does not crash, it
+  generates confident nonsense. `stage-serve` checks the sidecar before reading a
+  single weight and refuses to start with the missing range named.
+- **`hocmesh model-fixture`** writes a small but genuine GGUF file — the real
+  format, through the real header reader, tensor directory and dequantiser — so
+  the split can be exercised without downloading gigabytes.
+
+### The proof, rather than the description
+
+- **`split_matches_whole.rs`** — the same model cut two, three, four and eight
+  ways produces **bit-identical** logits, for every supported weight format and
+  at several grouped-query head ratios. Not approximately: each block's
+  arithmetic depends only on the activation it was handed and its own weights, so
+  there is no rounding difference to tolerate, and tolerating one would hide a
+  real divergence. Activations round-trip through the wire encoding on every hop,
+  so the test exercises the bytes a real pipeline sends.
+- **`distributed_inference.rs`** — three separate OS processes, three shards each
+  holding about 41% of the file (asserted by reading it: bytes present below
+  bytes total, chunks kept below chunks total, share under half), chained
+  together, generating output identical to the same model run whole in one
+  process, down to the SHA-256 of the logits. A second test points a stage at a
+  shard that does not hold its layers and asserts it refuses to start.
+- **A guard on the guard.** `inf == inf`, and two identical NaN bit patterns
+  compare equal — so a model that had saturated would pass every bit-exactness
+  assertion above while computing nothing. This was not hypothetical: the fixture
+  generated weights in `[-0.25, 8191.75]` because a 24-bit value was divided by
+  2^11, the attention softmax saturated, the residual stream ran to infinity, and
+  the first end-to-end run "passed" with every argmax pinned at token 0. The
+  divisor is fixed, the harness asserts finiteness at every step, and a dedicated
+  test asserts the fixture produces a real logit spread and more than one winning
+  token across positions.
+
+### A validator that missed a commit now catches itself up
+
+A quorum certificate only applies on top of the head it names, so a seat that
+missed a single commit — a dropped connection, a process killed mid-round, a
+moment of being busy — refused every entry after it as well, **for as long as it
+ran**. The only cure was an operator noticing and running `validator sync` by
+hand. In the meantime that seat kept answering balance queries: not with an
+error, but with a stale number signed as though it were current. Two seats in
+that state deny a quorum on an account nobody disagrees about, which is how it
+surfaced — a load test failing on the first thing it does, reading the balance
+the run is about to be measured against.
+
+- **`catch_up_to`** in the validator fetches and applies what a seat missed,
+  verifying every certificate against the set that governed its height, exactly
+  as `sync` and an offline audit do. It runs when a certificate lands above the
+  local head, and on a one-second heartbeat so a gap no later commit reveals
+  still closes.
+- **`fetch_certificates` no longer stops at the first seat that answers.** A seat
+  that is itself behind returns an empty page for a height it has not reached,
+  and taking that as the answer meant a validator catching up on the entry it
+  missed could be sent away by another validator missing the same entry. Empty
+  from *every* seat still means end of chain, which is what callers walking the
+  chain forward rely on. Each refusal is now reported, because "no validator
+  could provide ledger entries" is not something anybody can act on.
+- **`balance_quorum` waits briefly for the set to agree with itself.** An entry
+  commits the moment `threshold` seats have stored it, so for a short while the
+  rest are still attesting the balance from just before it. Lag closes; a real
+  split does not, and the error after the budget names which case it was and what
+  each camp of seats was holding.
+- **The quorum tests now prove the seat heals itself.** A killed validator is
+  restarted with nothing done to it — no `sync`, no operator — and must be
+  observed behind and then converge. `sync` is still exercised, as the path for a
+  seat that is not running.
+
+### Scarcity is a ranking term, never a price
+
+A 48 GB card and an 8 GB card earned the same for the same shard, and they have
+to: the reward is `work_cost_mcu` of the spec, every validator recomputes it from
+`split_work` before signing, and a coordinator paying a premium for scarce
+hardware would be proposing a settlement the quorum rejects on sight. Pricing is
+not available as a lever and should not be.
+
+- **A fifth scheduling axis, `scarcity`** (weight 0.10), scores a shard's declared
+  working set against the machine offering to hold it, preferring the smallest
+  machine that fits and ranking a GPU node down for work that cannot use a GPU.
+  The large machine is still offered anything nobody else can take.
+- **Reputation was already in the score** and the README said otherwise.
+  `standing()` folds a Laplace-smoothed acceptance ratio and the node's current
+  audit rate into the reliability axis. The stale paragraph is corrected.
+
+### Packaging and documentation
+
+- **RPM packaging**, the one installer format the release workflow was missing:
+  `packaging/linux/hocmesh.spec.in`, `scripts/package-linux-rpm.sh`, an `rpm`
+  target on the desktop bundle, and both in the release job with checksums and
+  signatures. The machines most likely to lend spare capacity are servers, and a
+  large share of servers are not Debian. Both scripts open the finished package
+  and check its contents and its relationship fields before handing it over.
+- **`docs/ROADMAP.md`** claimed "signed protocol v4 requests" while
+  `PROTOCOL_VERSION` was 6. Priority 6 and the north-star section are rewritten
+  against what now exists, including what it is *not*: three processes on one
+  host is the protocol proved, not a deployment, and the Priority 1 multi-host
+  run still stands open.
+- **`README.md`'s runtime boundary** described a single llama.cpp path. There
+  are two paths now and they do different jobs, so it says which is which and
+  that they do not yet meet — accelerated means whole models, split means CPU.
+- **`docs/IMPLEMENTATION_STATUS.md`** gained rows for the engine, exact split
+  execution, distributed inference and partial materialisation, and one row for
+  what is *not* done: the forward pass is not compared against llama.cpp on a
+  converted model. The split is proved to change nothing; that the unsplit
+  result matches another implementation is not, and no document here should
+  imply otherwise.
+- **A temporary-directory collision** in the quorum integration tests. The
+  directory name was a nanosecond timestamp, and Windows advances the system
+  clock in ~15 ms steps — so two tests starting in the same tick shared a
+  directory and one deleted the other's ledger, keys and databases on drop. It
+  now carries the process id and a counter, matching the engine tests.
 
 ### A model is split by memory bandwidth, not by stage count
 

@@ -14,7 +14,7 @@ There is **no payment system, token, cryptocurrency, market, or purchasable cred
 
 This repository is a Rust implementation of hocMESH Compute Core and the hocMESH AI control/data-plane architecture.
 
-## What is implemented in v0.4
+## What is implemented in v0.5
 
 This repository contains working source for three native Rust programs:
 
@@ -34,6 +34,10 @@ Implemented architecture:
 - Deterministic prime-range workload as the first safe distributed workload.
 - One-command inference setup: `runtime-install` fetches a llama.cpp build pinned by SHA-256, `model-pull` fetches and verifies GGUF weights. Neither trusts a name.
 - Per-layer model addressing: `model-inspect` reads a GGUF tensor directory and reports the byte spans and chunk indexes each pipeline stage would need, so a peer can fetch the layers it will run rather than the whole file.
+- **A layer-range execution engine** (`hocmesh-engine`): loads blocks `[start, end)` out of a GGUF file and runs a forward pass over an activation handed to it, on a machine that holds only those layers.
+- **Distributed inference of one model across several processes**: `stage-serve` puts a layer range behind a port and forwards to the next stage; `stage-run` drives the chain. Proved bit-identical to running the same model whole, over shards that each hold a minority of the file's bytes.
+- `model-shard` materialises the byte range a stage needs as a sparse file, and a stage refuses to start against layers whose bytes are absent — the missing range named in the error, rather than reading holes back as zeros and generating confident nonsense.
+- `model-fixture` writes a small but genuine GGUF file, so the split can be exercised without downloading a multi-gigabyte model.
 - Multi-worker task parallelism.
 - Work leasing and lease expiration/requeue.
 - Requesters cannot execute their own paid shards; both scheduler and validators enforce this.
@@ -51,7 +55,7 @@ Implemented architecture:
 - Persistent one-vote-per-height validator locks.
 - Duplicate reservation/reward claim prevention.
 - Full validator ledger replicas in SQLite.
-- Validator catch-up/synchronization.
+- Validator catch-up/synchronization, and self-healing: a seat that missed a commit fetches what it missed from its peers instead of refusing every entry after it until an operator notices.
 - Ordinary peer full-ledger mirroring: any node can hold the whole chain.
 - Offline audit from genesis.
 - Quorum-signed portable snapshots, so a new replica adopts a verified state and syncs from there rather than replaying the chain from genesis.
@@ -67,12 +71,20 @@ Implemented architecture:
 - Latency/cache/capability-aware AI scheduling and all three parallelism planners.
 - Checksum-bound tensor framing, ordered delivery, replay rejection, and route failover.
 - Distributed batch inference with leases, results, status, and worker rerouting.
+- Scarcity-aware ranking: the smallest machine that fits gets the shard first, without changing what the shard pays.
+- Installers for Windows (MSI/NSIS), macOS (dmg/app), Debian (`.deb`), Red Hat (`.rpm`) and AppImage, headless and desktop, each pair replacing the other rather than colliding.
 
 ## Runtime boundary
 
-hocMESH v0.4 executes independent distributed inference batches through an external llama.cpp runtime. `hocmesh runtime-install` will fetch a pinned build for the host platform and verify it against a SHA-256 compiled into the binary, so no separate llama.cpp setup is required; `--runtime` still accepts a build you compiled yourself, which is the path to take for CUDA or ROCm acceleration. Pipeline and tensor/model plans and transport are implemented; actual partial-layer kernels require a compatible runtime plugin because stock llama.cpp does not expose them.
+There are two inference paths, and they do different jobs.
 
-The current executable workload is deterministic CPU prime-range computation. The architecture deliberately proves the harder control-plane primitives first:
+**Whole-model batches go through llama.cpp.** `hocmesh runtime-install` fetches a build pinned by SHA-256 for the host platform, so no separate setup is required; `--runtime` accepts a build you compiled yourself, which is the path to CUDA, ROCm or Metal acceleration. This path is fast and it loads whole models, so every machine on it needs to hold the whole model.
+
+**Layer ranges go through `hocmesh-engine`, which is this repository's own.** It loads blocks `[start, end)` out of a GGUF file and runs a forward pass over an activation handed to it, so a machine that holds a third of a model can do a third of the work. It is CPU-only, it is written for correctness rather than speed, and a model that fits on one machine will run faster through llama.cpp. What it buys is the case where nothing fits.
+
+The two do not meet yet: **there is no GPU execution of a single stage.** Accelerated inference means whole models, and split inference means CPU. Closing that is the next substantial piece of work, and `docs/DISTRIBUTED_INFERENCE.md` says so in the same words.
+
+The executable CPU workloads are `PrimeCount`, `MatrixMultiply` and `CollatzPeak` — a fixed allow-list, because there is no sandbox and the allow-list is therefore the safety property. The architecture deliberately proves the harder control-plane primitives first:
 
 1. identity,
 2. trust,
@@ -344,11 +356,22 @@ The starvation bonus still guarantees nothing waits forever, and
 `MAX_LEASE_SECONDS` bounds how long any single shard can be parked on a machine
 that turns out to be hopeless.
 
-Two things are deliberately *not* in this score yet, and they are the honest
-gaps: no premium for scarce resources (a 48 GB card and an 8 GB card are worth
-the same per shard), and no reputation-weighted history beyond a recent-failure
-count. `hocmesh-core/src/reputation.rs` holds the slashing arithmetic for the
-second; nothing wires it into ranking.
+Scarcity is a fifth axis, and it is a *ranking* term rather than a price. A 48 GB
+card and an 8 GB card earn exactly the same for the same shard, and they have to:
+the reward is `work_cost_mcu` of the spec, every validator recomputes it from
+`split_work` before signing, and a coordinator that paid a premium for scarce
+hardware would be proposing a settlement the quorum rejects on sight. So the
+premium is spent where the coordinator does have authority — on who gets offered
+the work. `scarcity()` scores a shard's declared working set against the machine
+offering to hold it, preferring the smallest machine that fits, and ranks a GPU
+node down for work that cannot use a GPU. The large machine is still offered
+anything nobody else can take; it is simply not the first choice for work that
+does not need it.
+
+History is folded into the reliability axis by `standing()`, which combines a
+Laplace-smoothed acceptance ratio with the node's current audit rate, so a record
+of accepted work earns a lighter audit *and* a better ranking, and a record of
+rejected work costs both. `hocmesh-core/src/reputation.rs` holds the arithmetic.
 
 ### A model is split by bandwidth, not by headcount
 
@@ -496,29 +519,57 @@ spans and chunk indexes each stage would have to hold — so a peer fetches the
 layers it will run rather than the whole file. On a 32-block model split four
 ways, a middle stage pulls one chunk in one span instead of seven.
 
-What does not exist yet is the piece in the middle — an execution engine that
-loads a *layer range* and runs a forward pass over an activation it was handed.
-Today a stage is executed by an external llama.cpp process, which loads whole
-models, not slices. **Nothing in this repository performs distributed inference
-of a single model across machines**, and no release should be read as claiming
-it does. `docs/DISTRIBUTED_INFERENCE.md` states that gap precisely, does the
-bandwidth arithmetic that decides which kinds of splitting can work over which
-links, and gives the build order — step 1 of which is done.
+The piece in the middle now exists. `hocmesh-engine` loads a *layer range* out
+of a GGUF file and runs a forward pass over an activation it was handed, and
+`hocmesh stage-serve` puts one of those behind an HTTP port with the address of
+the next stage. **A model now runs across machines none of which hold it
+whole.**
+
+The claim is a test rather than a description. `distributed_inference.rs` builds
+a real GGUF model, imports it in 32 KB chunks, and materialises three shards that
+each hold about 41% of the bytes — verified by reading the file: bytes present
+below bytes total, chunks kept below chunks total, and each shard's share under
+half. It starts three separate `stage-serve` processes over those three shards,
+chains them, generates from the head, then generates the same prompt from the
+whole file in one process, and asserts the two runs match down to the SHA-256 of
+the logits. A second test points a stage at a shard that does not contain its
+layers and asserts it refuses to start, naming the missing byte range.
+
+Underneath that, `split_matches_whole.rs` proves the property the arrangement
+rests on: the same model, cut two, three, four and eight ways, produces
+bit-identical logits. Not approximately — the same bits. Each block's arithmetic
+depends only on the activation it was handed and its own weights, so there is no
+rounding difference to tolerate, and tolerating one would hide a real divergence.
+It holds for every weight format the engine reads (F32, F16, BF16, Q8\_0, Q4\_0,
+Q4\_1, Q5\_0, Q5\_1) and for grouped-query attention at several head ratios. One
+more test guards the guard: a model whose logits had saturated would compare
+bit-identical to itself however wrongly it was split, so the fixture is asserted
+to produce finite logits, a real spread, and more than one winning token across
+positions.
+
+What this is not: `hocmesh-engine` is a from-scratch CPU implementation of the
+llama-family block (RMS norm, RoPE, grouped-query attention, SwiGLU), and it
+refuses any architecture it has not been told about rather than guessing — a
+wrong guess does not fail, it generates fluent nonsense. It is built for
+correctness and for splitting, not for throughput; single-machine inference on a
+model that fits is still faster through llama.cpp, and GPU execution still goes
+through the llama.cpp adapters. The engine is what makes the *distributed* case
+possible at all, which is the case that had no answer before.
 
 ```mermaid
 flowchart LR
-    subgraph BUILT["Built and shipping in v0.4"]
+    subgraph BUILT["Built and shipping"]
         direction TB
         A["proximity map<br/><i>Vivaldi coordinates</i>"]
         B["layer-range planner<br/><i>byte spans per stage</i>"]
         C["content-addressed<br/>chunk seeding"]
         D["tensor transport<br/><i>checksum-bound framing</i>"]
         E["ledger, escrow,<br/>settlement, audit"]
+        F["<b>hocmesh-engine</b><br/><i>loads a layer range, runs<br/>a forward pass over an<br/>activation handed to it</i>"]
     end
-    subgraph GAP["Missing — and load-bearing"]
-        F["an engine that loads <b>a layer range</b><br/>and runs a forward pass over<br/>an activation handed to it"]
-    end
-    BUILT ==> GAP ==> G(["distributed inference of one<br/>model across many machines"])
+    BUILT ==> G(["distributed inference of one<br/>model across many machines<br/><i>proved bit-exact against a<br/>single-process run</i>"])
+```
+
 ```
 
 ---
@@ -564,6 +615,13 @@ hocMESH/
 │   │
 │   ├── hocmesh-validator/
 │   │   └── main.rs
+│   │
+│   ├── hocmesh-engine/
+│   │   ├── config.rs     the numbers that decide what a forward pass does
+│   │   ├── weights.rs    reading one tensor without reading the file
+│   │   ├── dequant.rs    the GGUF weight formats, unpacked
+│   │   ├── stage.rs      blocks [start, end) and the pass over them
+│   │   └── fixture.rs    a real GGUF file small enough to run in a test
 │   │
 │   └── hocmesh-desktop/
 │       ├── supervisor.rs   starts, finds and stops the node
@@ -714,6 +772,7 @@ window. To build installers locally from an existing release build:
 
 ```bash
 ./scripts/package-linux.sh target/release/hocmesh "$(cat VERSION)" dist amd64
+./scripts/package-linux-rpm.sh target/release/hocmesh "$(cat VERSION)" dist amd64
 ./scripts/package-macos.sh target/release/hocmesh "$(cat VERSION)" dist
 ```
 
@@ -725,13 +784,22 @@ dotnet tool install --global wix --version 6.0.2
 Install a downloaded release package with the native platform tool:
 
 ```bash
-sudo apt install ./hocmesh_0.4.0_amd64.deb
-sudo installer -pkg ./hocmesh-0.4.0.pkg -target /
+sudo apt install ./hocmesh_0.5.0_amd64.deb
+sudo dnf install ./hocmesh-0.5.0-1.x86_64.rpm
+sudo installer -pkg ./hocmesh-0.5.0.pkg -target /
 ```
 
 ```powershell
-Start-Process msiexec.exe -Wait -ArgumentList '/i', '.\hocmesh-0.4.0-x86_64.msi'
+Start-Process msiexec.exe -Wait -ArgumentList '/i', '.\hocmesh-0.5.0-x86_64.msi'
 ```
+
+The `.rpm` exists for the same reason the `.deb` does and not as an
+afterthought: the machines most likely to have spare capacity to lend are
+servers, and a large share of servers are not Debian. It carries the same three
+binaries from the same build, and `scripts/package-linux-rpm.sh` opens the
+finished package with `rpm -qlp` and `rpm -qp --obsoletes` before it will hand it
+over — a package that installs a node without the coordinator and validator
+beside it looks perfectly healthy from the outside and cannot run a mesh.
 
 ---
 
@@ -758,11 +826,11 @@ Build the installers, which lay the app and the node down together so the app fi
 ./scripts/package-desktop.ps1 -Binary target/release/hocmesh.exe -Version (Get-Content VERSION -Raw).Trim() -OutputDirectory dist
 ```
 
-That produces an MSI and an NSIS setup executable on Windows, a `.dmg` on macOS, and a `.deb` and an `.AppImage` on Linux; tagged releases carry all of them. `crates/hocmesh-desktop/BUNDLING.md` covers how the node is embedded and what each platform needs installed first.
+That produces an MSI and an NSIS setup executable on Windows, a `.dmg` on macOS, and a `.deb`, an `.rpm` and an `.AppImage` on Linux; tagged releases carry all of them. `crates/hocmesh-desktop/BUNDLING.md` covers how the node is embedded and what each platform needs installed first.
 
 There is no client build and no server build. Every hocMESH install is a whole peer — node, coordinator and validator — because the model is a torrent swarm run in the other order: you seed first, lending CPU, memory and GPU to other people's work, and what that earns is what lets you later reach for somebody else's hardware. Both installers above carry all three binaries. The only difference is whether the machine has a screen: the desktop installer adds the window over the same peer, the headless installers further up leave it out.
 
-So they replace each other rather than sitting side by side. Both lay down `/usr/bin/hocmesh` as the command an operator types, and each declares that in package metadata — the desktop `.deb` carries `Provides`, `Conflicts` and `Replaces: hocmesh`, the headless one `Conflicts` and `Replaces: hoc-mesh-desktop` — so installing either on a machine that has the other swaps it cleanly instead of failing on a file collision. That is enforced on Debian packages only; on Windows and macOS the two installers do not yet declare each other, so installing both leaves two copies on disk rather than one replacing the other. The app still prefers the node it shipped with, beside its own binary, over whatever is on `PATH`.
+So they replace each other rather than sitting side by side. Both lay down `/usr/bin/hocmesh` as the command an operator types, and each declares that in package metadata — the desktop `.deb` carries `Provides`, `Conflicts` and `Replaces: hocmesh`, the headless one `Conflicts` and `Replaces: hoc-mesh-desktop` — so installing either on a machine that has the other swaps it cleanly instead of failing on a file collision. The RPMs say the same thing in RPM's spelling, where `Obsoletes` is what Debian calls `Replaces`. That is enforced on Linux packages only; on Windows and macOS the two installers do not yet declare each other, so installing both leaves two copies on disk rather than one replacing the other. The app still prefers the node it shipped with, beside its own binary, over whatever is on `PATH`.
 
 ---
 
@@ -827,8 +895,57 @@ Synthetic Llama 32x256 (llama)
 The four stage totals plus the shared set sum to exactly the data section, which
 is the partition a pipeline plan depends on. It reads the header only, so it
 works on a file a peer has only partly fetched, and the chunk indexes are what
-lets a stage pull the layers it will run rather than the whole file. What it
-does **not** do is run them — see `docs/DISTRIBUTED_INFERENCE.md`.
+lets a stage pull the layers it will run rather than the whole file.
+
+### Running those layers, on machines that hold only those layers
+
+Five commands turn that plan into a running model. They are shown here against a
+generated fixture so the whole thing fits in a terminal; nothing about them is
+specific to a small model.
+
+```bash
+# A real GGUF file, deterministic and small enough to move around.
+hocmesh model-fixture --output tiny.gguf --blocks 6
+
+# Into the content-addressed store, in chunks small enough to divide. The default
+# chunk is 4 MB, which would put this whole model in one chunk and make every
+# shard a full copy.
+hocmesh model-import tiny.gguf --model-id tiny --format gguf --architecture llama \n  --chunk-size 32768
+
+# Three shards, each holding only the bytes its own layers need. The file is
+# created at the model's full length so every tensor sits where the header says
+# it does; the rest is a hole, and a sidecar records which bytes are real.
+hocmesh model-shard --model-id tiny --blocks 0..2 --output stage-0-2.gguf
+hocmesh model-shard --model-id tiny --blocks 2..4 --output stage-2-4.gguf
+hocmesh model-shard --model-id tiny --blocks 4..6 --output stage-4-6.gguf
+
+# Three processes, chained tail-first. Each holds a minority of the file.
+hocmesh stage-serve --model stage-4-6.gguf --blocks 4..6 --listen 127.0.0.1:8103
+hocmesh stage-serve --model stage-2-4.gguf --blocks 2..4 --listen 127.0.0.1:8102         --next http://127.0.0.1:8103
+hocmesh stage-serve --model stage-0-2.gguf --blocks 0..2 --listen 127.0.0.1:8101         --next http://127.0.0.1:8102
+
+# The same prompt, twice: split across the chain, and whole in one process.
+hocmesh stage-run --head http://127.0.0.1:8101 --tokens 3,17,5 --max-new-tokens 8
+hocmesh stage-run --model tiny.gguf          --tokens 3,17,5 --max-new-tokens 8
+```
+
+Both runs print the tokens they generated and a SHA-256 over the logits, and the
+two digests are the same. That equality is the whole claim: the split model is
+not an approximation of the whole one, it is the same computation carried out in
+three places. `crates/hocmesh-integration-tests/tests/distributed_inference.rs`
+runs exactly this and asserts it, including that each shard really does hold less
+than half the file.
+
+A stage refuses to start against a file that is missing a byte its blocks need,
+naming the range. This matters more than it looks: a hole in a sparsely
+materialised file reads back as zeros, zeros are a perfectly valid weight matrix,
+and a model with a zeroed layer does not crash — it generates confident nonsense.
+The sidecar `model-shard` writes is what makes that refusable instead of
+invisible.
+
+There is no tokenizer in `stage-run`, on purpose. Tokenising is a separate
+problem with its own correctness argument, and a command that did both would
+prove neither.
 
 `model-pull` resolves the file on Hugging Face, downloads it with resume,
 verifies the SHA-256 the Hub published for it, reads the architecture out of the

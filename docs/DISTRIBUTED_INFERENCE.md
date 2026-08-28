@@ -22,30 +22,72 @@ shape, the shape is stated.
 | Content-addressed model chunks, rarest-first peer seeding | `hocmesh-model`, node peer server | Working |
 | Two-stage inference settlement through the ledger | `hocmesh-ai`, `hocmesh-ledger` | Working |
 | GGUF **metadata** reader (architecture, name, layer count) | `hocmesh-model/src/gguf.rs` | Working |
-| GGUF **tensor directory** reader: name, type, shape, offset; byte extents and chunk indexes per layer range | `hocmesh-model/src/gguf.rs`, `hocmesh model-inspect` | Working (build order step 1) |
+| GGUF **tensor directory** reader: name, type, shape, offset; byte extents and chunk indexes per layer range | `hocmesh-model/src/gguf.rs`, `hocmesh model-inspect` | Working |
+| **Layer-range execution**: load blocks [start, end), run a forward pass over an activation handed in | `hocmesh-engine`, `hocmesh stage-serve` | Working, CPU |
+| **Distributed inference of one model across processes**, bit-identical to running it whole | `hocmesh stage-serve` + `stage-run`, proved in `distributed_inference.rs` | Working |
 
-## 2. What is missing
+## 2. What was missing, and is not any more
 
-One thing, and it is the middle of the sandwich:
+For every release up to 0.4 this section named one gap, and it was the middle of
+the sandwich:
 
 > **An execution engine that loads a layer range and runs a forward pass over an
 > activation it was handed.**
 
-Today a stage is executed by an external llama.cpp process. llama.cpp loads
-*whole models*; it has no interface for "load layers 24–47, take this hidden
-state, give me the hidden state after layer 47." So the planner can cut a model
-into stages that nothing can run.
+A stage was executed by an external llama.cpp process. llama.cpp loads *whole
+models*; it has no interface for "load layers 24–47, take this hidden state, give
+me the hidden state after layer 47." So the planner could cut a model into stages
+that nothing could run.
 
-Concretely, three sub-pieces are absent:
+That engine is `hocmesh-engine`, added in 0.5.0. The three sub-pieces:
 
 1. ~~A GGUF **tensor** reader~~ — **done.** `gguf::tensor_directory` reads the
    directory, `tensors_for_layers` selects a stage's tensors, and
    `extents_for_layers` turns them into merged byte spans and chunk indexes.
    `hocmesh model-inspect <file> --stages N` prints them.
-2. A forward pass — attention and FFN over a layer range, with a KV cache that
-   belongs to that stage. **This is the load-bearing gap.**
-3. The stage protocol — who owns the KV cache across tokens, what happens when a
-   stage drops mid-sequence, how a sequence is resumed elsewhere.
+2. ~~A forward pass~~ — **done.** `hocmesh-engine`'s `Stage` holds blocks
+   `[start, end)`, owns the KV cache for exactly those blocks, and runs RMS norm,
+   RoPE, grouped-query attention and SwiGLU over an activation handed to it.
+   Weights are read through `WeightFile` one tensor at a time, so a stage never
+   touches a byte outside its own range. F32, F16, BF16, Q8\_0, Q4\_0, Q4\_1,
+   Q5\_0 and Q5\_1 are decoded; anything else, and any architecture not on the
+   known list, is refused at load rather than guessed at.
+3. ~~The stage protocol~~ — **done for the single-sequence case.** `stage-serve`
+   exposes `GET /stage/info`, `POST /stage/token`, `POST /stage/forward` and
+   `POST /stage/reset`; each stage forwards to its `--next` and the tail's logits
+   return down the chain. Position travels with the activation rather than being
+   counted by the stage, so a stage cannot silently disagree with its neighbours
+   about where in the sequence it is, and a gap in positions is an error rather
+   than a hole.
+
+### What is still open
+
+- **Parity with another implementation.** The split is proved to change nothing,
+  which is the property distribution rests on. That the *unsplit* result matches
+  llama.cpp on a converted model is not proved — the tensor directory is
+  cross-checked against a foreign writer, the arithmetic is not. Until it is,
+  the engine is verified as self-consistent rather than as correct.
+- **Resuming a sequence elsewhere.** A stage that drops mid-sequence takes its KV
+  cache with it. Re-running the prompt against a replacement is correct and
+  costs the prompt again; migrating the cache is not implemented.
+- **Batching across sequences.** One sequence at a time per chain.
+- **GPU execution of a stage.** The engine is CPU. GPU inference still goes
+  through the llama.cpp adapters, which means it still loads whole models — so
+  the *distributed* path and the *accelerated* path do not currently meet.
+- **Throughput.** The engine is written for correctness and for splitting. A
+  model that fits on one machine runs faster through llama.cpp.
+
+### The property that makes it worth having
+
+Split execution is **bit-identical** to whole execution, not approximately equal.
+Each block's arithmetic depends only on the activation it was handed and its own
+weights, so a correct split has no rounding difference to tolerate — and
+tolerating one would hide a real divergence. That is asserted, over the wire
+encoding, in `crates/hocmesh-engine/tests/split_matches_whole.rs` for two, three,
+four and eight-way cuts, every supported weight format, and several
+grouped-query head ratios; and end to end across three OS processes holding
+disjoint shards in
+`crates/hocmesh-integration-tests/tests/distributed_inference.rs`.
 
 ---
 
@@ -184,7 +226,8 @@ difference between running the model and not running it.
 ## 4. Build order
 
 Each step is independently testable, and each is worthless without the one
-before it. Do not reorder.
+before it. Do not reorder. Steps 1 to 4 shipped in 0.5.0; the rest are still in
+this order and still for the same reasons.
 
 **Step 1 — GGUF tensor reader. Done.** `gguf::tensor_directory` reads name,
 type code, shape and offset for every tensor, plus the declared alignment and
@@ -210,27 +253,61 @@ This is also what lets the chunk store fetch *only the layers a stage needs*.
 On a 26 MB, 32-block file split four ways, a middle stage pulls 3.5 MB in one
 span — 1 chunk of 7 — instead of the whole file.
 
-**Step 2 (next) — CPU reference forward pass, one architecture, one dtype.** Correctness
-first, speed never. `forward(layer_range, hidden_state, kv_cache) -> hidden_state`.
-*Test:* run the full layer range in one process and assert the output matches
-llama.cpp for the same prompt within tolerance. Without this comparison the rest
-is unfalsifiable.
+**Step 2 — CPU forward pass over a layer range. Done.** `hocmesh-engine`'s
+`Stage::load(&mut file, start..end)` reads only the tensors for blocks
+`[start, end)` plus whatever shared tensors that range genuinely owns, and
+`Stage::forward(&activation)` runs RMS norm, RoPE, grouped-query attention and
+SwiGLU over a hidden state it was handed. F32, F16, BF16, Q8\_0, Q4\_0, Q4\_1,
+Q5\_0 and Q5\_1 are decoded; anything else is refused. The architecture is read
+from the header and checked against a list, never inferred from a family name,
+because a wrong RoPE layout does not crash — it generates fluent nonsense.
 
-**Step 3 — Stage runner and KV-cache ownership.** A stage owns the KV cache for
-the sequences routed to it. Define what happens when a stage dies mid-sequence:
-either the sequence is replayed from the prompt on a replacement peer, or caches
-are checkpointed. Pick one and write it down.
-*Test:* kill a stage mid-sequence, assert the sequence completes and the answer
-is identical to the uninterrupted run.
+*Tested:* `crates/hocmesh-engine/tests/split_matches_whole.rs`. The same model
+run whole and run in two, three, four and eight pieces produces **bit-identical**
+logits — every supported weight format, several grouped-query head ratios,
+activations round-tripped through the wire encoding on every hop. An empty
+range, a range past the end, and a tied output head split across stages are all
+refused at load. And because `inf == inf` and identical NaN patterns compare
+equal, a separate test asserts the fixture produces finite logits with a real
+spread and more than one winning token — otherwise every comparison above would
+pass while computing nothing.
 
-**Step 4 — Activation transport.** Carry the hidden state over the framing that
-already exists in `hocmesh-transport` (checksums, ordering, replay rejection,
-failover are all done). This step is mostly plumbing, which is the point of
-having built the transport first.
-*Test:* two stages on two processes produce the same tokens as one process.
+*Not tested, and worth saying plainly:* the arithmetic is not compared against
+llama.cpp on a real converted model. What is proved is that splitting changes
+nothing, which is the property distribution depends on; what is not proved is
+that the unsplit result matches another implementation's for a downloaded
+model. The tensor directory *is* cross-checked against a foreign writer; the
+forward pass is not. That comparison is the next thing worth adding.
 
-**Step 5 — Speculative decoding.** Draft locally, verify remotely, accept the
-longest matching prefix.
+**Step 3 — Stage runner and KV-cache ownership. Done, with the recovery
+question answered one way.** A stage owns the KV cache for the blocks it holds
+and for the sequence routed to it. Position travels with the activation instead
+of being counted locally, so two stages cannot silently disagree about where in
+the sequence they are, and a gap in positions is an error rather than a hole.
+
+The choice on a stage dying mid-sequence is **replay from the prompt on a
+replacement**, not cache checkpointing. `POST /stage/reset` clears the chain and
+the sequence is re-run; correctness costs the prompt again. Migrating a cache is
+not implemented and is not pretended to be.
+
+**Step 4 — Activation transport. Done.** `hocmesh stage-serve` puts one layer
+range behind an HTTP port with `--next` naming the stage after it; the tail
+turns the activation into logits and the answer walks back down the chain.
+`hocmesh stage-run` drives a chain, or runs the same model whole in one process
+to compare against. `hocmesh model-shard` materialises only the bytes a stage's
+layers need, at the model's full declared length so every tensor sits where the
+header says, with a `.shard.json` sidecar recording which bytes are real —
+because a hole reads back as zeros and zeros are a valid weight matrix.
+
+*Tested:* `crates/hocmesh-integration-tests/tests/distributed_inference.rs`.
+Three separate OS processes, three shards each holding about 41% of the file
+(asserted by reading it, not by assuming it), chained together, produce output
+identical to the whole model in one process down to the SHA-256 of the logits.
+A stage pointed at a shard that does not hold its layers refuses to start and
+names the missing range.
+
+**Step 5 (next) — Speculative decoding.** Draft locally, verify remotely, accept
+the longest matching prefix.
 *Test:* output is **token-identical** to non-speculative decoding — that is the
 whole correctness claim — and measure the acceptance rate, since it is what
 determines the speedup.
@@ -240,10 +317,11 @@ range; fetch concurrently; cache hot experts locally.
 *Test:* identical outputs to a single-process run, and assert the concurrent
 fetch really is one round trip and not N.
 
-**Step 7 — Pricing.** Only now can a token be priced. Keep the existing rule:
-the price is a closed-form function of the *spec* (`work_cost_mcu`), never a
-measurement of the machine, so any peer can recheck it and no validator has to
-trust a self-report.
+**Step 7 — Pricing a token.** The rule to keep: the price is a closed-form
+function of the *spec* (`work_cost_mcu`), never a measurement of the machine, so
+any peer can recheck it and no validator has to trust a self-report. Inference
+already settles this way — escrow, receipt, then a signed acceptance or dispute
+— so what is left is a spec for the work a stage does, not a new mechanism.
 
 ---
 

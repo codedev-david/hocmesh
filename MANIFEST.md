@@ -1,6 +1,6 @@
 # Package Manifest
 
-This archive is a source repository for **hocMESH Compute v0.4.0**.
+This archive is a source repository for **hocMESH Compute v0.5.0**.
 
 Primary deliverables:
 

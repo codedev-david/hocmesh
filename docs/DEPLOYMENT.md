@@ -47,15 +47,16 @@ looks complete.
 
 ```bash
 # Linux
-sudo dpkg -i hocmesh_0.4.0_amd64.deb
+sudo dpkg -i hocmesh_0.5.0_amd64.deb        # Debian, Ubuntu
+sudo rpm -i  hocmesh-0.5.0-1.x86_64.rpm     # RHEL, Fedora, SUSE
 
 # macOS
-sudo installer -pkg hocmesh-0.4.0.pkg -target /
+sudo installer -pkg hocmesh-0.5.0.pkg -target /
 ```
 
 ```powershell
 # Windows (elevated)
-msiexec /i hocmesh-0.4.0-x86_64.msi /qb
+msiexec /i hocmesh-0.5.0-x86_64.msi /qb
 ```
 
 ### From source

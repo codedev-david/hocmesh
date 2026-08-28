@@ -5,7 +5,7 @@
 - Rust workspace split by responsibility.
 - Native participant/coordinator/validator binaries.
 - Ed25519 identities.
-- Signed protocol v4 requests with nonces and AI capability advertisements.
+- Signed protocol v6 requests with nonces and AI capability advertisements.
 - Hardware discovery and CPU benchmarking.
 - Declarative CPU work: `PrimeCount`, `MatrixMultiply`, `CollatzPeak`.
 - Multi-worker task parallelism.
@@ -34,6 +34,10 @@
 - Incremental ledger sync for coordinators, resuming from a persisted watermark that carries the validator set the entries were signed under, so a coordinator that has been down catches up without replaying the chain from genesis.
 - A resource graph over the registered machines, with distance taken from measured coordinates where they exist and never invented where they do not, and a clustering pass for work that has to land on several machines at once. Readable at `/v1/topology`.
 - Scheduling on hardware, network, reliability, and cache locality rather than arrival order, with a starvation guarantee that outranks any fit. Every axis is derived from something already measured or already priced, and a shard nobody can finish inside its lease is refused rather than scored.
+- An execution engine that runs a *layer range* rather than a whole model. `hocmesh-engine` loads blocks `[start, end)` out of a GGUF file and runs a forward pass over an activation it was handed, so a machine holding a third of a model can do a third of the work. Split execution is bit-identical to whole execution, asserted rather than assumed.
+- Distributed inference end to end: `stage-serve` chains layer ranges across processes, `model-shard` materialises only the bytes a stage needs and records which bytes are real, and three processes each holding about 41% of a file generate output identical to the whole model in one process.
+- Scarcity as a scheduling term. A shard's declared working set is scored against the machine offering to hold it, preferring the smallest machine that fits and ranking a GPU node down for work no GPU helps with. It never touches the price, which every validator recomputes from the spec.
+- Validators that repair themselves. A seat that missed a commit fetches what it missed from the rest of the set, on a certificate landing above its head and on a heartbeat, instead of refusing every later entry until an operator runs `sync`.
 
 ## Priority 0 — handoff validation — done
 
@@ -93,13 +97,15 @@ by the quorum against evidence the worker signed.
 
 ## Priority 6 — distributed model execution
 
-- Model layer partitioner.
-- Pipeline stages.
-- Activation transport.
-- Topology-aware routing.
-- Replicated critical layers.
-- Node departure recovery.
-- Micro-batching.
+- Model layer partitioner. **Done.** `plan_parallelism` cuts a model into stages and `model-inspect` gives the byte span each stage needs; `model-shard` writes a file holding only those bytes.
+- Pipeline stages. **Done.** `hocmesh-engine` executes one layer range; `stage-serve` puts it behind a port; a stage owns the KV cache for its own blocks and takes its position from the activation rather than counting locally.
+- Activation transport. **Done.** Stages chain over HTTP with the hidden state encoded on every hop; the logits return down the chain. Proved by three processes holding disjoint shards producing output identical, to the SHA-256, to the whole model in one process.
+- Topology-aware routing. **Partly.** Stage order is given on the command line. The resource graph and the round-trip scoring exist and choose *which* machines hold which shards; nothing yet reorders a chain to shorten it.
+- Replicated critical layers. **Not done.**
+- Node departure recovery. **Decided, not automated.** A stage that drops takes its KV cache with it; the answer is replay from the prompt on a replacement, and `stage/reset` is the mechanism. Nothing orchestrates the replacement yet.
+- Micro-batching. **Not done.** One sequence at a time per chain.
+- Parity against another implementation. **Not done, and it is the honest gap.** The split is proved to change nothing; that the unsplit result matches llama.cpp on a converted model is not.
+- GPU execution of a stage. **Not done.** The engine is CPU. GPU inference still goes through the llama.cpp adapters, which load whole models, so the distributed path and the accelerated path do not yet meet.
 
 ## Priority 7 — heterogeneous accelerators
 
@@ -118,8 +124,12 @@ by the quorum against evidence the worker signed.
 - Temperature/power limits.
 - Bandwidth caps.
 - Signed auto-update.
-- RPM packaging (MSI, PKG, and DEB are shipped by the release workflow).
+- RPM packaging. **Done.** `scripts/package-linux-rpm.sh` and an `rpm` target on the desktop bundle, both in the release job with checksums and signatures, alongside MSI, PKG, DEB and AppImage.
 
 ## North-star demonstration
 
 Run an AI model that **none of the participating machines can run individually**, using only compute contributed by community nodes and credits previously earned through contribution.
+
+**The mechanism is done and proved by test.** `crates/hocmesh-integration-tests/tests/distributed_inference.rs` runs three separate OS processes, each holding a shard with about 41% of the model's bytes — asserted by reading the shard, not by assuming it — chained together, generating output identical to the same model run whole, down to the SHA-256 of the logits. No process in that run holds enough of the file to answer on its own, and a stage pointed at a shard missing its layers refuses to start rather than reading zeros as weights.
+
+**What that is not.** Three processes on one host is the protocol proved, not a deployment. The remaining Priority 1 item — a run across two or more real machines on a real network — still stands, and this does not close it: loopback says nothing about NIC drivers, MTU, NAT, asymmetric routes, or clocks that drift independently. The claim earned here is that the software can do it; the claim about the world needs the world.
