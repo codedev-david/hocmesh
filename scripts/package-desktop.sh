@@ -59,9 +59,12 @@ repository_version=$(tr -d '[:space:]' < "$repository_root/VERSION")
 # looks, and the command an operator types in a terminal.
 #
 # On Linux these unpack into /usr/bin, the same paths the headless package
-# claims. That is deliberate and declared: tauri.bundle.json marks this package
+# claims. That is deliberate and declared: tauri.conf.json marks this package
 # as providing, conflicting with and replacing `hocmesh`, so apt installs one
-# or the other rather than refusing both.
+# or the other rather than refusing both. Those three live beside `depends` in
+# the main config rather than in tauri.bundle.json: both files would be writing
+# to bundle.linux.deb, and leaving which one wins to the `--config` merge is
+# how the built package came out with no Provides field at all.
 host_triple=$(rustc -vV | sed -n 's/^host: //p')
 [[ -n "$host_triple" ]] || { echo "could not read the host target triple from rustc" >&2; exit 1; }
 mkdir -p "$desktop_dir/binaries"
@@ -146,19 +149,70 @@ case "$(uname -s)" in
     # will not install a second package claiming a path the first one has
     # unless the relationship is declared. Without these three fields apt
     # rejects whichever is installed second with "trying to overwrite
-    # '/usr/bin/hocmesh'", so they are checked in the built artifact rather
-    # than trusted to survive a config edit.
+    # '/usr/bin/hocmesh'".
+    #
+    # tauri.conf.json asks the bundler for all three. They are written in here
+    # as well rather than assumed, because v0.4.0's first release build proved
+    # the bundler can be given them and emit a package without them, and a
+    # package missing a Provides looks perfectly healthy right up until
+    # somebody switches between the two installs.
+    linux_stage=$(mktemp -d)
+    trap 'rm -rf -- "$linux_stage"' EXIT
+    deb_stage="$linux_stage/deb"
+    dpkg-deb --raw-extract "$deb" "$deb_stage"
+    deb_control_file="$deb_stage/DEBIAN/control"
+    missing=()
+    for relation in Provides Conflicts Replaces; do
+      grep -qE "^$relation:.*hocmesh" "$deb_control_file" || missing+=("$relation")
+    done
+    if (( ${#missing[@]} )); then
+      echo "the bundler left ${missing[*]} out of the desktop package; writing them in" >&2
+      # Description is a multi-line field and Debian requires it last, so new
+      # fields go in ahead of it rather than on the end.
+      awk -v relations="${missing[*]}" '
+        /^Description:/ && !inserted {
+          count = split(relations, relation, " ")
+          for (i = 1; i <= count; i++) print relation[i] ": hocmesh"
+          inserted = 1
+        }
+        { print }
+      ' "$deb_control_file" > "$deb_control_file.new"
+      mv "$deb_control_file.new" "$deb_control_file"
+      dpkg-deb --root-owner-group --build "$deb_stage" "$deb" >/dev/null
+    fi
+
+    # Read back from the package that ships, whether the bundler wrote these
+    # or the block above did.
     deb_control=$(dpkg-deb --field "$deb")
     for relation in Provides Conflicts Replaces; do
       grep -qE "^$relation:.*hocmesh" <<<"$deb_control" || {
         echo "$deb does not declare $relation: hocmesh; it would not install alongside or in place of the headless package" >&2
+        echo "--- control fields in the package ---" >&2
+        printf '%s
+' "$deb_control" >&2
+        exit 1
+      }
+    done
+
+    # The headless package names this one in Conflicts and Replaces, and has
+    # to name it exactly. The bundler derives the package name from
+    # productName with heck's kebab-case, so "hocMESH Desktop" becomes
+    # `hoc-mesh-desktop` -- a rename that reads as cosmetic would leave two
+    # packages that both own /usr/bin/hocmesh and neither of which has heard
+    # of the other. Read the name off the built package rather than assuming
+    # the casing rule.
+    desktop_package=$(sed -n 's/^Package:[[:space:]]*//p' <<<"$deb_control" | head -1)
+    [[ -n "$desktop_package" ]] || { echo "$deb has no Package field" >&2; exit 1; }
+    for relation in Conflicts Replaces; do
+      grep -qE "^$relation:.*$desktop_package" "$repository_root/packaging/linux/control.in" || {
+        echo "packaging/linux/control.in does not name $desktop_package in $relation; the headless package would not replace this one" >&2
         exit 1
       }
     done
 
     chmod +x "$appimage"
-    appimage_stage=$(mktemp -d)
-    trap 'rm -rf -- "$appimage_stage"' EXIT
+    appimage_stage="$linux_stage/appimage"
+    mkdir -p "$appimage_stage"
     (cd "$appimage_stage" && "$appimage" --appimage-extract >/dev/null)
     for expected in hocmesh hocmesh-coordinator hocmesh-validator hocmesh-desktop; do
       found=$(find "$appimage_stage/squashfs-root" -type f -name "$expected" -print -quit)

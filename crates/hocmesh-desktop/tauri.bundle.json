@@ -5,13 +5,6 @@
       "binaries/hocmesh",
       "binaries/hocmesh-coordinator",
       "binaries/hocmesh-validator"
-    ],
-    "linux": {
-      "deb": {
-        "provides": ["hocmesh"],
-        "conflicts": ["hocmesh"],
-        "replaces": ["hocmesh"]
-      }
-    }
+    ]
   }
 }

@@ -15,8 +15,12 @@ has a screen, so **they replace each other rather than sitting side by side**.
   `Provides`/`Conflicts`/`Replaces: hocmesh`, the headless one `Conflicts` and
   `Replaces: hoc-mesh-desktop`. Installing either over the other swaps it
   cleanly instead of failing on a dpkg file collision. `package-desktop.sh`
-  reads those fields back out of the built artifact, so dropping them fails the
-  build rather than silently regressing.
+  writes those fields in and then reads them back out of the built artifact:
+  the bundler was asked for them in `tauri.conf.json` and shipped a package
+  without them anyway, so the packaging script no longer trusts it. It also
+  reads the desktop package's own name off the artifact and fails unless the
+  headless `control` names that exact string, so a rename cannot quietly leave
+  two packages that both own `/usr/bin/hocmesh`.
 - Client/server language is gone from packages, scripts, CI and docs.
 - `scripts/install-user.sh` / `.ps1` install all three binaries for one user.
 
