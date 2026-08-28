@@ -14,6 +14,7 @@ clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
 hocmesh-core = { path = "../hocmesh-core" }
+hocmesh-engine = { path = "../hocmesh-engine" }
 hocmesh-ai = { path = "../hocmesh-ai" }
 hocmesh-ledger = { path = "../hocmesh-ledger" }
 hocmesh-model = { path = "../hocmesh-model" }

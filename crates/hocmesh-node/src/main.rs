@@ -192,6 +192,85 @@ enum Command {
         #[arg(long)]
         keep_download: bool,
     },
+    /// Write a small, deterministic model file for exercising a mesh.
+    ///
+    /// A real GGUF file in every respect except size, so a mesh can be tested
+    /// end to end -- sharded, served across machines, run -- without anybody
+    /// downloading gigabytes first. The weights come from a fixed seed, so two
+    /// machines that generate one from the same arguments get identical bytes.
+    ModelFixture {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 6)]
+        blocks: u32,
+        #[arg(long, default_value_t = 64)]
+        embedding_length: u32,
+        #[arg(long, default_value_t = 8)]
+        heads: u32,
+        #[arg(long, default_value_t = 2)]
+        kv_heads: u32,
+        #[arg(long, default_value_t = 128)]
+        feed_forward_length: u32,
+        #[arg(long, default_value_t = 96)]
+        vocab: u32,
+    },
+    /// Write a model file holding only the layers one stage runs.
+    ///
+    /// The output is created at the model's full length so every tensor sits
+    /// where the header says it does, but only the chunks those layers need are
+    /// written. The rest is a hole. A sidecar records which bytes are real,
+    /// because a hole reads back as zeros and zeros are a valid weight matrix.
+    ModelShard {
+        #[arg(long)]
+        model_id: String,
+        #[arg(long, default_value = "main")]
+        revision: String,
+        /// The transformer blocks this shard runs, as `start..end`.
+        #[arg(long)]
+        blocks: String,
+        /// Where to write the shard.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Serve one contiguous range of a model's layers.
+    ///
+    /// The stage runs its own blocks and hands the activation to `--next`, or,
+    /// if it holds the last block, turns it into logits and answers. It refuses
+    /// to start if the file it was given is missing a byte its blocks need.
+    StageServe {
+        /// A model file, whole or sharded by `model-shard`.
+        #[arg(long)]
+        model: PathBuf,
+        /// The transformer blocks this stage runs, as `start..end`.
+        #[arg(long)]
+        blocks: String,
+        #[arg(long, default_value = "127.0.0.1:8100")]
+        listen: String,
+        /// The stage holding the next range, as `http://host:port`. Omitted on
+        /// the stage that holds the last block, and required on every other.
+        #[arg(long)]
+        next: Option<String>,
+    },
+    /// Run a prompt, either through a chain of stages or whole in this process.
+    ///
+    /// The two paths exist to be compared: `--head` runs the model split across
+    /// however many machines the chain has, `--model` runs the same model here.
+    /// They print the same digest, or something is wrong.
+    StageRun {
+        /// The head of a chain of stages, as `http://host:port`.
+        #[arg(long, conflicts_with = "model")]
+        head: Option<String>,
+        /// A whole model file, to produce the local reference.
+        #[arg(long, conflicts_with = "head")]
+        model: Option<PathBuf>,
+        /// The prompt as token ids, e.g. `3,17,5`. There is no tokenizer here
+        /// on purpose: tokenising is a separate problem with its own
+        /// correctness argument, and mixing the two would prove neither.
+        #[arg(long)]
+        tokens: String,
+        #[arg(long, default_value_t = 8)]
+        max_new_tokens: usize,
+    },
     /// List the models `model-pull` knows by name.
     ModelCatalog,
     /// Download the pinned llama.cpp build for this machine.
@@ -827,6 +906,106 @@ stored at: {}",
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             println!("Serving verified model chunks on http://{listen}");
             axum::serve(listener, seed_router(state)).await?;
+        }
+        Command::ModelFixture {
+            output,
+            blocks,
+            embedding_length,
+            heads,
+            kv_heads,
+            feed_forward_length,
+            vocab,
+        } => {
+            let recipe = hocmesh_engine::fixture::Recipe {
+                block_count: blocks,
+                embedding_length,
+                head_count: heads,
+                head_count_kv: kv_heads,
+                feed_forward_length,
+                vocab_size: vocab,
+                ..hocmesh_engine::fixture::Recipe::default()
+            };
+            recipe.write(&output)?;
+            println!(
+                "Wrote a {blocks}-block {}-wide fixture to {} ({} bytes)",
+                embedding_length,
+                output.display(),
+                std::fs::metadata(&output)?.len()
+            );
+        }
+        Command::ModelShard {
+            model_id,
+            revision,
+            blocks,
+            output,
+        } => {
+            let blocks = hocmesh::pipeline::parse_blocks(&blocks)?;
+            let store = model_store(&cli.home)?;
+            let manifest = model_registry(&cli.home)?
+                .get(&model_id, &revision)?
+                .with_context(|| format!("no manifest for {model_id}@{revision}"))?;
+            // The tensor directory lives in the head of the file, so the first
+            // chunk is read before anything can be decided about the rest.
+            let header = store.read(&manifest.chunks[0].sha256)?;
+            let keep = hocmesh::pipeline::chunks_for_blocks(&manifest, &header, blocks.clone())?;
+            let present = store.materialize_partial(&manifest, &output, &keep)?;
+            let bytes_present: u64 = present
+                .iter()
+                .map(hocmesh_model::gguf::ByteExtent::len)
+                .sum();
+            let shard = hocmesh::pipeline::ShardManifest {
+                model_id: model_id.clone(),
+                revision: revision.clone(),
+                blocks: [blocks.start, blocks.end],
+                chunks_kept: keep.len(),
+                chunks_total: manifest.chunks.len(),
+                bytes_present,
+                bytes_total: manifest.total_size_bytes,
+                present: present.iter().map(|e| [e.start, e.end]).collect(),
+            };
+            let sidecar = hocmesh::pipeline::ShardManifest::path_for(&output);
+            std::fs::write(&sidecar, serde_json::to_vec_pretty(&shard)?)?;
+            println!("{}", serde_json::to_string_pretty(&shard)?);
+        }
+        Command::StageServe {
+            model,
+            blocks,
+            listen,
+            next,
+        } => {
+            let blocks = hocmesh::pipeline::parse_blocks(&blocks)?;
+            let state = hocmesh::pipeline::StageState::load(&model, blocks, next)?;
+            let info = state.info().clone();
+            let listener = tokio::net::TcpListener::bind(&listen).await?;
+            println!(
+                "Stage serving blocks {}..{} of {} on http://{listen} ({} of {} model bytes present)",
+                info.blocks[0],
+                info.blocks[1],
+                info.block_count,
+                info.bytes_present,
+                info.bytes_total
+            );
+            axum::serve(listener, hocmesh::pipeline::stage_router(state)).await?;
+        }
+        Command::StageRun {
+            head,
+            model,
+            tokens,
+            max_new_tokens,
+        } => {
+            let prompt = hocmesh::pipeline::parse_tokens(&tokens)?;
+            let generated = match (head, model) {
+                (Some(head), None) => {
+                    hocmesh::pipeline::generate_over_chain(&head, &prompt, max_new_tokens).await?
+                }
+                (None, Some(model)) => {
+                    hocmesh::pipeline::generate_locally(&model, &prompt, max_new_tokens)?
+                }
+                _ => bail!(
+                    "give exactly one of --head (a chain of stages) or --model (this process)"
+                ),
+            };
+            println!("{}", serde_json::to_string_pretty(&generated)?);
         }
         Command::ModelCatalog => {
             println!(

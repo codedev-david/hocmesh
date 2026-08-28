@@ -1,0 +1,12 @@
+[package]
+name = "hocmesh-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+hocmesh-model = { path = "../hocmesh-model" }
+serde.workspace = true

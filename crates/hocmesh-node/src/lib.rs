@@ -15,3 +15,4 @@ pub mod control;
 pub mod daemon;
 pub mod install;
 pub mod loadtest;
+pub mod pipeline;

@@ -201,6 +201,139 @@ pub fn metadata_string(bytes: &[u8], key: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// A fixed-width metadata value, read without being converted.
+///
+/// Kept as the type the file declared so the caller decides what a narrowing
+/// conversion means. A hyperparameter written as `i32` and read as `u32` is
+/// fine at 4096 and catastrophic at -1, and the reader is not the place to
+/// decide which one a given key is allowed to be.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Scalar {
+    Unsigned(u64),
+    Signed(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+/// Read a fixed-width value of the given type. Strings and arrays are not
+/// scalars and are refused rather than coerced.
+fn read_scalar(reader: &mut Reader<'_>, value_type: ValueType) -> Partial<Option<Scalar>> {
+    let width = match value_type.fixed_width() {
+        Some(width) => width,
+        None => return Ok(None),
+    };
+    let bytes = reader.take(width)?;
+    let mut eight = [0u8; 8];
+    eight[..width].copy_from_slice(bytes);
+    Ok(Some(match value_type {
+        ValueType::U8 | ValueType::U16 | ValueType::U32 | ValueType::U64 => {
+            Scalar::Unsigned(u64::from_le_bytes(eight))
+        }
+        ValueType::Bool => Scalar::Bool(bytes[0] != 0),
+        ValueType::I8 => Scalar::Signed(i64::from(bytes[0] as i8)),
+        ValueType::I16 => Scalar::Signed(i64::from(i16::from_le_bytes([bytes[0], bytes[1]]))),
+        ValueType::I32 => Scalar::Signed(i64::from(i32::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        ValueType::I64 => Scalar::Signed(i64::from_le_bytes(eight)),
+        ValueType::F32 => Scalar::Float(f64::from(f32::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        ValueType::F64 => Scalar::Float(f64::from_le_bytes(eight)),
+        ValueType::String | ValueType::Array => return Ok(None),
+    }))
+}
+
+/// Walk the key/value block and hand every scalar to `wanted`, stopping at the
+/// first one it accepts.
+///
+/// Shared by every typed accessor so there is one implementation of the walk
+/// and one place where truncation is distinguished from absence.
+fn find_scalar(
+    bytes: &[u8],
+    key: &str,
+    mut wanted: impl FnMut(Scalar) -> Option<Scalar>,
+) -> Result<Option<Scalar>> {
+    let mut reader = Reader::new(bytes);
+
+    let Ok(magic) = reader.take(4) else {
+        bail!("file is too short to be a GGUF model");
+    };
+    ensure!(magic == MAGIC, "file does not start with the GGUF magic");
+    let Ok(version) = reader.u32() else {
+        bail!("truncated GGUF header: no version");
+    };
+    ensure!(
+        SUPPORTED_VERSIONS.contains(&version),
+        "GGUF version {version} is not supported (this build reads versions {}-{})",
+        SUPPORTED_VERSIONS.start(),
+        SUPPORTED_VERSIONS.end()
+    );
+    let (Ok(_tensors), Ok(pairs)) = (reader.u64(), reader.u64()) else {
+        return Ok(None);
+    };
+    if pairs > MAX_KV_PAIRS {
+        bail!("GGUF header claims {pairs} metadata entries, which is not plausible");
+    }
+
+    for _ in 0..pairs {
+        let (Ok(found_key), Ok(code)) = (reader.string(), reader.u32()) else {
+            return Ok(None);
+        };
+        let value_type = ValueType::from_code(code)?;
+        if found_key != key.as_bytes() {
+            if skip_value(&mut reader, value_type).is_err() {
+                return Ok(None);
+            }
+            continue;
+        }
+        let Ok(Some(scalar)) = read_scalar(&mut reader, value_type) else {
+            // Present and not a scalar. Reporting "absent" would be a lie and
+            // guessing at a conversion would be worse.
+            bail!("GGUF key {key} is not a number");
+        };
+        return match wanted(scalar) {
+            Some(value) => Ok(Some(value)),
+            None => bail!("GGUF key {key} holds {scalar:?}, which does not fit"),
+        };
+    }
+    Ok(None)
+}
+
+/// A metadata value read as a count.
+///
+/// Every hyperparameter this reader wants -- head counts, embedding widths,
+/// layer counts -- is a count, and converters disagree about whether to write
+/// one as `u32` or `i32`. Both are accepted; a negative value is refused rather
+/// than wrapped, because a wrapped count would size an allocation.
+pub fn metadata_u64(bytes: &[u8], key: &str) -> Result<Option<u64>> {
+    Ok(find_scalar(bytes, key, |scalar| match scalar {
+        Scalar::Unsigned(value) => Some(Scalar::Unsigned(value)),
+        Scalar::Signed(value) => u64::try_from(value).ok().map(Scalar::Unsigned),
+        Scalar::Bool(value) => Some(Scalar::Unsigned(u64::from(value))),
+        Scalar::Float(_) => None,
+    })?
+    .and_then(|scalar| match scalar {
+        Scalar::Unsigned(value) => Some(value),
+        _ => None,
+    }))
+}
+
+/// A metadata value read as a real number, widening an integer where a file
+/// wrote one (`rope.freq_base` is `f32` in most files and `u32` in a few).
+pub fn metadata_f32(bytes: &[u8], key: &str) -> Result<Option<f32>> {
+    Ok(find_scalar(bytes, key, |scalar| match scalar {
+        Scalar::Float(value) => Some(Scalar::Float(value)),
+        Scalar::Unsigned(value) => Some(Scalar::Float(value as f64)),
+        Scalar::Signed(value) => Some(Scalar::Float(value as f64)),
+        Scalar::Bool(_) => None,
+    })?
+    .and_then(|scalar| match scalar {
+        Scalar::Float(value) => Some(value as f32),
+        _ => None,
+    }))
+}
+
 /// Step over a value of known type without interpreting it.
 fn skip_value(reader: &mut Reader<'_>, value_type: ValueType) -> Partial<()> {
     match value_type {

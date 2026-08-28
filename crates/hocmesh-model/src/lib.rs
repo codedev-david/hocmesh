@@ -173,6 +173,50 @@ impl ChunkStore {
         Ok(())
     }
 
+    /// Write a model file holding only the chunks this node was asked to keep.
+    ///
+    /// This is what makes "no machine holds the whole model" a fact about the
+    /// disk rather than a claim about intent. The file is created at its full
+    /// declared length so every tensor sits at the offset the header promises,
+    /// but only the requested chunks are written; the rest is a hole. On any
+    /// filesystem that supports sparse files the absent bytes occupy nothing.
+    ///
+    /// Returns the byte ranges that really are present, in file order, which is
+    /// what [`crate::gguf::TensorDirectory`] consumers check a stage's layer
+    /// range against before reading a single weight. A hole reads back as zeros
+    /// rather than as an error, and zeros are a perfectly valid weight matrix,
+    /// so the caller must check rather than assume.
+    pub fn materialize_partial(
+        &self,
+        manifest: &ModelManifest,
+        output: impl AsRef<Path>,
+        keep: &[u32],
+    ) -> Result<Vec<gguf::ByteExtent>> {
+        manifest.validate()?;
+        let file = fs::File::create(output)?;
+        file.set_len(manifest.total_size_bytes)?;
+
+        let mut present: Vec<gguf::ByteExtent> = Vec::new();
+        let mut offset = 0_u64;
+        for chunk in &manifest.chunks {
+            let start = offset;
+            offset += chunk.size_bytes;
+            if !keep.contains(&chunk.index) {
+                continue;
+            }
+            let data = self.read(&chunk.sha256)?;
+            ensure!(data.len() as u64 == chunk.size_bytes, "chunk size mismatch");
+            write_at(&file, start, &data)?;
+            // Chunks are contiguous, so a run of kept chunks is one extent.
+            match present.last_mut() {
+                Some(last) if last.end == start => last.end = offset,
+                _ => present.push(gguf::ByteExtent { start, end: offset }),
+            }
+        }
+        file.sync_all()?;
+        Ok(present)
+    }
+
     fn chunk_path(&self, hash: &str) -> Result<PathBuf> {
         ensure!(is_sha256(hash), "invalid SHA-256 digest");
         Ok(self.root.join("chunks").join(&hash[..2]).join(hash))
@@ -280,6 +324,29 @@ pub fn validate_format_header(format: ModelFormat, bytes: &[u8]) -> Result<()> {
                 length > 1 && length <= 100_000_000,
                 "invalid safetensors header length"
             );
+        }
+    }
+    Ok(())
+}
+
+/// Write at an absolute offset without disturbing a shared cursor.
+///
+/// Both platforms offer this; neither offers it through the same trait, and
+/// seeking instead would make the operation order-dependent for no gain.
+fn write_at(file: &fs::File, offset: u64, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(data, offset)?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut written = 0_usize;
+        while written < data.len() {
+            let n = file.seek_write(&data[written..], offset + written as u64)?;
+            ensure!(n > 0, "write made no progress");
+            written += n;
         }
     }
     Ok(())
