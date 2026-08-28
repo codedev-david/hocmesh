@@ -8,9 +8,11 @@
     nothing can: see docs/DISTRIBUTION.md for what this does and does not buy.
 
     With no certificate configured this reports that the artifacts are unsigned
-    and succeeds, so a fork or a local build still works. Pass -Required (CI
-    does, for tagged releases) to turn a missing certificate into a failure
-    rather than a silently unsigned release.
+    and succeeds, so a fork or a local build still works. Pass -Required to
+    turn a missing certificate into a failure rather than a silently unsigned
+    release. Release builds do not pass it yet: there is no certificate to
+    fail over, and requiring one would only stop the release. Add -Required to
+    the workflow in the same change that adds the certificate.
 #>
 [CmdletBinding()]
 param(
