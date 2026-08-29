@@ -24,31 +24,110 @@ pub enum RopeStyle {
     Halved,
 }
 
-/// The architectures whose block layout is the one implemented here.
+/// The architectures this build knows the rotary pairing for.
 ///
-/// Sharing a name with llama is not enough: this list is the set whose
-/// attention and feed-forward shape is `attn_norm -> q,k,v -> rope ->
-/// attention -> out, ffn_norm -> gate*up -> down`, with RMS norm and SwiGLU.
-/// Optional per-head query/key norms and projection biases are part of that
-/// shape -- they are additional terms, not a different one.
+/// Read this as an answer to one question, not as a list of supported models.
+/// Which pairs of elements a rotary embedding rotates together is the single
+/// fact a GGUF file does not carry -- llama.cpp fixes it per architecture in
+/// its own source -- so it is the single fact a name has to supply.
 ///
-/// A name on this list is necessary and not sufficient. The list cannot see
-/// inside the file, so it cannot tell a Qwen3 that this build computes
-/// correctly from one carrying a tensor this build would ignore. That check
-/// lives in `Stage::load`, which enumerates what the file actually holds and
-/// refuses anything it would not consume.
+/// It is deliberately no longer the gate. A name here is not sufficient: the
+/// list cannot see inside the file, so it cannot tell a Qwen3 this build
+/// computes correctly from one carrying a tensor this build would ignore, and
+/// `Stage::load` enumerates what the file actually holds and refuses anything
+/// it would not consume. It is not necessary either: the shape below --
+/// `attn_norm -> q,k,v -> rope -> attention -> out, ffn_norm -> gate*up ->
+/// down`, RMS norm and SwiGLU, with optional per-head query/key norms and
+/// projection biases as additional terms rather than different ones -- is what
+/// most published models are, under names that did not exist when this list was
+/// last edited. [`ASSUME_ARCHITECTURE`] lets an operator point one of those at
+/// the entry that answers its rotary question, and every other check still
+/// applies to it.
 ///
 /// `stablelm` was on this list and should not have been: llama.cpp's stablelm
 /// normalises with LayerNorm, which subtracts a mean and adds a bias that
 /// `rms_norm` does neither of. It did not fail, it generated fluent, wrong
 /// text -- the exact outcome the doc comment above `RopeStyle` promises to
 /// avoid. Putting it back means implementing LayerNorm first.
+///
+/// That is also the honest limit of [`ASSUME_ARCHITECTURE`]. A LayerNorm model
+/// that carries no norm bias, or one that puts GELU where this build puts
+/// SiLU, has the same tensors under the same names, so nothing in the file
+/// contradicts the operator who names it as llama. Everything a file can be
+/// asked is asked; the two axes it has no way to answer are why the override
+/// is opt-in and says so.
 const KNOWN: &[(&str, RopeStyle)] = &[
     ("llama", RopeStyle::Interleaved),
     ("mistral", RopeStyle::Interleaved),
     ("qwen2", RopeStyle::Halved),
     ("qwen3", RopeStyle::Halved),
 ];
+
+/// Read a file whose declared architecture this build does not know by name.
+///
+/// Set it to a name on [`KNOWN`] -- `HOCMESH_ASSUME_ARCHITECTURE=llama` -- to
+/// say "this file is that shape, so use that rotary pairing".
+///
+/// Narrower than it looks, because the declared name is not what decides
+/// whether a file can be run. Everything that is actually *in* the file is
+/// checked against what this engine implements whatever the header claims:
+/// every tensor of every block is enumerated and one this build would not read
+/// is refused, every tensor that is read must have the shape the configuration
+/// implies, and every metadata key that would change the maths is refused when
+/// it is set. A file that is not this shape stays refused with this variable
+/// set, on the evidence rather than on the name.
+///
+/// What the variable supplies is the one fact that is genuinely not in a GGUF
+/// file: which pairs of elements a rotary embedding rotates together.
+/// llama.cpp fixes that per architecture in its own source, so a name this
+/// build has not been told about carries no answer to it. Getting it wrong
+/// does not fail -- it generates fluent, wrong text -- which is why the
+/// default is to refuse rather than to guess, and why supplying it is a
+/// deliberate act with an operator behind it.
+pub const ASSUME_ARCHITECTURE: &str = "HOCMESH_ASSUME_ARCHITECTURE";
+
+/// Which rotary pairing to use for a file declaring `architecture`.
+fn rope_style_for(architecture: &str) -> Result<RopeStyle> {
+    let lookup = |name: &str| {
+        KNOWN
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, style)| *style)
+    };
+    if let Some(style) = lookup(architecture) {
+        return Ok(style);
+    }
+    let known = KNOWN
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let assumed = std::env::var(ASSUME_ARCHITECTURE)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let Some(assumed) = assumed else {
+        bail!(
+            "architecture {architecture:?} is not one this build knows the rotary pairing \
+             for (it knows {known}). Everything else about this file is checked against \
+             what this engine implements -- every tensor of every block, their shapes, and \
+             the metadata keys that would change the maths -- but which pairs of elements a \
+             rotary embedding rotates together is not written in a GGUF file at all, and \
+             llama.cpp fixes it per architecture in its own source. If this model has one \
+             of those shapes, say which with {ASSUME_ARCHITECTURE}=<name>; the rest of the \
+             file will still have to prove itself. Guessing is not offered because a wrong \
+             pairing does not fail, it generates fluent, wrong text."
+        );
+    };
+    let Some(style) = lookup(&assumed) else {
+        bail!(
+            "{ASSUME_ARCHITECTURE} is set to {assumed:?}, which is not an architecture this \
+             build knows either (it knows {known}). It names the shape to read \
+             {architecture:?} as, not the shape the file already claims to be."
+        );
+    };
+    Ok(style)
+}
 
 /// Everything the forward pass needs, and nothing else.
 #[derive(Debug, Clone, PartialEq)]
@@ -131,17 +210,7 @@ impl ModelConfig {
     pub fn from_header(bytes: &[u8]) -> Result<Self> {
         let architecture = gguf::architecture(bytes)?
             .context("GGUF file does not declare general.architecture")?;
-        let Some((_, rope_style)) = KNOWN.iter().find(|(name, _)| *name == architecture) else {
-            bail!(
-                "architecture {architecture:?} is not one this engine implements \
-                 (it knows {})",
-                KNOWN
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        };
+        let rope_style = rope_style_for(&architecture)?;
 
         let required = |key: &str| -> Result<u64> {
             gguf::metadata_u64(bytes, &format!("{architecture}.{key}"))?
@@ -201,7 +270,7 @@ impl ModelConfig {
         Self::refuse_unimplemented_metadata(bytes, &architecture)?;
 
         Ok(ModelConfig {
-            rope_style: *rope_style,
+            rope_style,
             block_count,
             embedding_length,
             head_count,

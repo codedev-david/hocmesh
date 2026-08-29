@@ -50,8 +50,9 @@ That engine is `hocmesh-engine`, added in 0.5.0. The three sub-pieces:
    RoPE, grouped-query attention and SwiGLU over an activation handed to it.
    Weights are read through `WeightFile` one tensor at a time, so a stage never
    touches a byte outside its own range. F32, F16, BF16, Q8\_0, Q4\_0, Q4\_1,
-   Q5\_0 and Q5\_1 are decoded; anything else, and any architecture not on the
-   known list, is refused at load rather than guessed at.
+   Q5\_0, Q5\_1 and the k-quants Q2\_K through Q6\_K are decoded; anything else
+   is refused at load rather than guessed at, as is any file carrying a tensor
+   or a metadata key this build would not act on.
 3. ~~The stage protocol~~ — **done for the single-sequence case.** `stage-serve`
    exposes `GET /stage/info`, `POST /stage/token`, `POST /stage/forward` and
    `POST /stage/reset`; each stage forwards to its `--next` and the tail's logits
@@ -64,11 +65,29 @@ That engine is `hocmesh-engine`, added in 0.5.0. The three sub-pieces:
 
 - **Model families the engine does not implement.** The block shape it runs is
   `attn_norm -> q,k,v -> rope -> attention -> out, ffn_norm -> gate*up -> down`
-  with RMS norm and SwiGLU, which covers `llama`, `mistral`, `qwen2`, `qwen3`
-  and `stablelm`. Mixture-of-experts models are not among them: routing means
-  the weights a token needs are chosen per token, which a static layer-range
-  split does not express. An architecture the engine has not been told about is
-  refused at load rather than guessed at.
+  with RMS norm and SwiGLU, plus optional per-head query/key norms and
+  projection biases. Mixture-of-experts models are not among them: routing
+  means the weights a token needs are chosen per token, which a static
+  layer-range split does not express.
+
+  What decides whether a file loads is now the file, not its architecture
+  string. Every tensor of every block is enumerated and one this build would
+  not read is refused; every tensor that is read must have the shape the header
+  implies; every metadata key that would change the maths -- sliding windows,
+  expert counts, logit softcapping, ALiBi, rotary scaling -- is refused when it
+  is set. The name list survives for one question only, and it is the one a
+  GGUF file cannot answer: which pairs of elements a rotary embedding rotates
+  together, which llama.cpp fixes per architecture in its own source. A model
+  published under a name this build has not been told about is refused with
+  that named as the missing fact, and `HOCMESH_ASSUME_ARCHITECTURE=llama` (or
+  `qwen3`, ...) supplies it -- after which every check above still has to pass.
+
+  Two axes stay unanswerable and the override says so: a LayerNorm model with
+  no norm bias, and a GELU feed-forward, carry the same tensors under the same
+  names as the shapes this build runs. That is why the override is opt-in
+  rather than a default guess. `stablelm` is the cautionary case -- it was on
+  the known list and generated fluent, wrong text, because llama.cpp normalises
+  it with LayerNorm.
 - **Parity on a downloaded checkpoint, on every push.** The forward pass is
   checked against llama.cpp -- see below -- on a generated fixture, because a
   fixture is what CI can afford to download and run. The same comparison has
@@ -267,9 +286,11 @@ span — 1 chunk of 7 — instead of the whole file.
 `[start, end)` plus whatever shared tensors that range genuinely owns, and
 `Stage::forward(&activation)` runs RMS norm, RoPE, grouped-query attention and
 SwiGLU over a hidden state it was handed. F32, F16, BF16, Q8\_0, Q4\_0, Q4\_1,
-Q5\_0 and Q5\_1 are decoded; anything else is refused. The architecture is read
-from the header and checked against a list, never inferred from a family name,
-because a wrong RoPE layout does not crash — it generates fluent nonsense.
+Q5\_0, Q5\_1 and the k-quants Q2\_K through Q6\_K are decoded; anything else is
+refused. What a file is allowed to be is decided by the tensors and metadata it
+actually holds; the architecture string in the header answers one question the
+file cannot, the RoPE pair layout, because a wrong RoPE layout does not crash —
+it generates fluent nonsense.
 
 *Tested:* `crates/hocmesh-engine/tests/split_matches_whole.rs`. The same model
 run whole and run in two, three, four and eight pieces produces **bit-identical**

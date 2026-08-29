@@ -2,6 +2,36 @@
 
 ## 0.5.1
 
+### The file decides whether it can run, not the name in its header
+
+The engine gated on a list of four architecture strings, and the list's own doc
+comment admitted the problem: a name is necessary and not sufficient, because
+the list cannot see inside the file. It cut the other way too. The block shape
+this engine implements — RMS norm, SwiGLU, `attn_norm -> q,k,v -> rope ->
+attention -> out` — is what most published models are, under names that did not
+exist when the list was last edited, and every one of them was refused.
+
+- **The structural checks are the gate.** Every tensor of every block is
+  enumerated and one this build would not read is refused; every tensor that is
+  read must have the shape the header implies; every metadata key that would
+  change the maths — sliding windows, expert counts, logit softcapping, ALiBi,
+  rotary scaling — is refused when set. All of that already existed; it now runs
+  for any architecture rather than only for the four whose names were listed.
+- **The name answers one question, the one a GGUF file cannot.** Which pairs of
+  elements a rotary embedding rotates together is not in the file at all —
+  llama.cpp fixes it per architecture in its own source. An unknown architecture
+  is refused with *that* named as the missing fact, and
+  `HOCMESH_ASSUME_ARCHITECTURE=llama` supplies it. The file then still has to
+  prove itself: a test loads a fixture declaring an unknown architecture *and*
+  carrying a tensor this build does not read, and asserts it is still refused.
+  If that ever passes, the override has become a bypass.
+- **The two axes a file cannot answer are stated rather than papered over.** A
+  LayerNorm model with no norm bias, and a GELU feed-forward, carry the same
+  tensors under the same names. That is why the override is opt-in and why
+  `stablelm` — which was on the known list, and generated fluent, wrong text
+  because llama.cpp normalises it with LayerNorm — is documented where someone
+  about to use the override will read it.
+
 ### The uplink requirement is on the job, not on the door
 
 A pipeline is not made of interchangeable parts. The stage holding the first

@@ -17,6 +17,6 @@ pub mod fixture;
 pub mod stage;
 pub mod weights;
 
-pub use config::{ModelConfig, RopeStyle};
+pub use config::{ASSUME_ARCHITECTURE, ModelConfig, RopeStyle};
 pub use stage::{Activation, Session, Stage};
 pub use weights::{Tensor, WeightFile};
