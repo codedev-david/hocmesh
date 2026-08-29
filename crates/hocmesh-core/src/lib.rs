@@ -1,3 +1,4 @@
+pub mod bandwidth;
 pub mod compute;
 pub mod hardware;
 pub mod identity;
@@ -5,5 +6,6 @@ pub mod limits;
 pub mod matrix;
 pub mod proximity;
 pub mod reputation;
+pub mod roles;
 pub mod tensor;
 pub mod verify;

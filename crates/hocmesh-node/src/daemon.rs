@@ -2,6 +2,7 @@ use crate::client::HocMeshClient;
 use crate::control::{ControlSeed, ControlServer, DaemonMetrics, note_exchange};
 use anyhow::{Context, Result, ensure};
 use hocmesh_ai::{InferenceAssignment, PromptOutput};
+use hocmesh_core::bandwidth::UplinkMeter;
 use hocmesh_core::compute::execute_work;
 use hocmesh_core::proximity::Vivaldi;
 use hocmesh_gpu::{InferenceBackend, InferenceRequest, LlamaCppBackend};
@@ -111,19 +112,34 @@ async fn run_until<S: std::future::Future<Output = ()>>(
     // daemon that had just proved otherwise.
     metrics.record_contact();
 
+    // Created here rather than inside the seed server because the heartbeat
+    // starts first and has to advertise whatever the serving has measured so
+    // far -- which, for a node that has not served yet, is nothing.
+    let uplink = Arc::new(UplinkMeter::new());
+
     let heartbeat_client = client.clone();
     let heartbeat_caps = capabilities.clone();
     let heartbeat_metrics = metrics.clone();
+    let heartbeat_uplink = Arc::clone(&uplink);
     let heartbeat = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
             // Re-read every tick rather than capturing once: this is what makes
             // a limits change through the control surface reach the coordinator
-            // without a restart.
-            let Some(snapshot) = heartbeat_caps.read().ok().map(|caps| caps.clone()) else {
-                tracing::error!("capability lock poisoned; stopping heartbeat");
-                return;
+            // without a restart. The uplink is folded in on the same tick, so
+            // the coordinator and the local dashboard read one figure rather
+            // than two that drift apart.
+            let measured = heartbeat_uplink.kbps().unwrap_or(0);
+            let snapshot = {
+                let Ok(mut caps) = heartbeat_caps.write() else {
+                    tracing::error!("capability lock poisoned; stopping heartbeat");
+                    return;
+                };
+                if caps.model_bandwidth_kbps != measured {
+                    caps.model_bandwidth_kbps = measured;
+                }
+                caps.clone()
             };
             let outcome = heartbeat_client.heartbeat(&snapshot).await;
             note_exchange(&heartbeat_metrics, &outcome);
@@ -200,7 +216,7 @@ async fn run_until<S: std::future::Future<Output = ()>>(
     {
         let store = Arc::new(ChunkStore::open(config.home.join("model-cache"))?);
         let manifests = ModelRegistry::open(config.home.join("model-registry.db"))?.list()?;
-        let state = SeedServerState::new(store, manifests)?;
+        let state = SeedServerState::measuring(store, manifests, Arc::clone(&uplink))?;
         let listener = tokio::net::TcpListener::bind(listen).await?;
         seed_server = Some(tokio::spawn(async move {
             axum::serve(listener, seed_router(state)).await

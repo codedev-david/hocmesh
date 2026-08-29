@@ -1,7 +1,8 @@
 use anyhow::{Result, bail, ensure};
+use hocmesh_core::proximity::{self, UNKNOWN_EDGE_MICROS};
 use hocmesh_gpu::{BackendKind, DeviceCapability};
 use hocmesh_model::ModelManifest;
-use hocmesh_protocol::{AuthProof, InferenceBilling};
+use hocmesh_protocol::{AuthProof, InferenceBilling, NetworkCoordinate};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -421,6 +422,17 @@ pub struct NodeProfile {
     /// profile answers the question.
     #[serde(default)]
     pub memory_bandwidth_bytes_per_second: Option<u64>,
+    /// Where this node sits in latency space, once it has fitted a position.
+    ///
+    /// `None` means unknown, which is not the same as nearby: a node that has
+    /// measured nothing is assumed far from everything, so that not measuring
+    /// is never the cheap way into a tight pipeline.
+    #[serde(default)]
+    pub coordinate: Option<NetworkCoordinate>,
+    /// Whether this node has shown an uplink fast enough to hold the first
+    /// stage of a pipeline. See `hocmesh_core::roles`.
+    #[serde(default)]
+    pub prefill_eligible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -450,6 +462,14 @@ pub struct CandidateScore {
     /// shape of the whole pipeline.
     #[serde(default)]
     pub memory_bandwidth_bytes_per_second: Option<u64>,
+    /// This node's position in latency space, copied from its profile so the
+    /// planner can measure the hops between stages without a second lookup.
+    #[serde(default)]
+    pub coordinate: Option<NetworkCoordinate>,
+    /// Whether this node may hold stage zero. Copied from its profile for the
+    /// same reason.
+    #[serde(default)]
+    pub prefill_eligible: bool,
 }
 
 pub fn rank_candidates(
@@ -502,6 +522,8 @@ pub fn rank_candidates(
                 memory_bandwidth_bytes_per_second: device
                     .memory_bandwidth_bytes_per_second
                     .or(node.memory_bandwidth_bytes_per_second),
+                coordinate: node.coordinate,
+                prefill_eligible: node.prefill_eligible,
             });
         }
     }
@@ -677,6 +699,127 @@ fn layer_spans(stages: &[CandidateScore], layer_count: u32) -> Vec<(u32, u32)> {
     spans
 }
 
+/// Round-trip microseconds between two candidates, or the unmeasured cost.
+///
+/// Both ends have to have fitted a plausible position for the prediction to
+/// mean anything. When either has not, the pair is charged
+/// [`UNKNOWN_EDGE_MICROS`], which is worse than any real link -- so a node that
+/// has never measured its position cannot win a place in a pipeline by being
+/// unmeasured, only by being measured and close.
+fn edge_micros(a: &CandidateScore, b: &CandidateScore) -> u64 {
+    if a.node_id == b.node_id {
+        return 0;
+    }
+    match (a.coordinate.as_ref(), b.coordinate.as_ref()) {
+        (Some(x), Some(y)) if proximity::is_plausible(x) && proximity::is_plausible(y) => {
+            proximity::predicted_rtt_micros(x, y)
+        }
+        _ => UNKNOWN_EDGE_MICROS,
+    }
+}
+
+/// What one chain of stages costs, lower being better.
+///
+/// Every token crosses every hop, so the sum of the adjacent edges is what a
+/// request actually pays -- not the diameter of the set, and not the average.
+/// The worst single hop breaks ties, because two chains costing the same in
+/// total are not equally good if one of them has a stall in the middle. The
+/// head's rank breaks what is left, so the answer does not depend on iteration
+/// order.
+fn chain_cost(chain: &[&CandidateScore], head_rank: usize) -> (u64, u64, usize) {
+    let hops: Vec<u64> = chain
+        .windows(2)
+        .map(|pair| edge_micros(pair[0], pair[1]))
+        .collect();
+    (
+        hops.iter().sum(),
+        hops.iter().copied().max().unwrap_or(0),
+        head_rank,
+    )
+}
+
+/// Choose and order the machines that will hold the stages.
+///
+/// Ranking scores each machine on its own merits -- how much of the model it
+/// already holds, how loaded it is, how far it is from the requester. That is
+/// the right question for a batch, where the machines never speak to each
+/// other. It is the wrong question for a pipeline: the five best machines
+/// individually can be the five worst as a chain, because a token has to cross
+/// every hop between them and a hop across an ocean costs more than anything
+/// the ranking was measuring.
+///
+/// So the head is chosen from the machines allowed to hold it, and the rest of
+/// the chain is grown from that head by nearest neighbour -- every eligible
+/// head tried, the cheapest whole chain kept. That is a heuristic, not an
+/// optimum; the exact answer is a shortest Hamiltonian path, and paying for it
+/// would cost more than the hops it saved.
+///
+/// Returns an error rather than a slow pipeline when no machine may hold the
+/// head. A pipeline whose first stage cannot push its activations out is a
+/// pipeline that will disappoint quietly, in a way that looks like the model
+/// being slow rather than the placement being wrong.
+fn order_pipeline(candidates: &[CandidateScore], count: usize) -> Result<Vec<CandidateScore>> {
+    ensure!(
+        candidates.len() >= count,
+        "insufficient eligible devices for {count} pipeline stages"
+    );
+    // One device per machine: two stages on one box is not a pipeline, it is
+    // the same memory bus twice, and it would let a single failure take out
+    // two stages of a chain that exists to spread them.
+    let mut first_per_node: Vec<usize> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if seen.insert(candidate.node_id.clone()) {
+            first_per_node.push(index);
+        }
+    }
+    ensure!(
+        first_per_node.len() >= count,
+        "a pipeline of {count} stages needs {count} distinct machines, and only          {} offered a device",
+        first_per_node.len()
+    );
+    let heads: Vec<usize> = first_per_node
+        .iter()
+        .copied()
+        .filter(|&i| candidates[i].prefill_eligible)
+        .collect();
+    ensure!(
+        !heads.is_empty(),
+        "no eligible machine has shown an uplink of at least {} kbit/s, which is          what holding the first stage of a pipeline asks for; the later stages          have no such requirement, so a plan without pipeline parallelism can          still be served",
+        hocmesh_core::roles::PREFILL_UPLINK_KBPS
+    );
+
+    let mut best: Option<((u64, u64, usize), Vec<usize>)> = None;
+    for &head in &heads {
+        let mut chain = vec![head];
+        let mut rest: Vec<usize> = first_per_node
+            .iter()
+            .copied()
+            .filter(|&i| i != head)
+            .collect();
+        while chain.len() < count {
+            let tail = *chain.last().expect("chain starts with the head");
+            let Some(position) = (0..rest.len()).min_by_key(|&k| {
+                let next = rest[k];
+                (edge_micros(&candidates[tail], &candidates[next]), next)
+            }) else {
+                break;
+            };
+            chain.push(rest.remove(position));
+        }
+        if chain.len() < count {
+            continue;
+        }
+        let borrowed: Vec<&CandidateScore> = chain.iter().map(|&i| &candidates[i]).collect();
+        let cost = chain_cost(&borrowed, head);
+        if best.as_ref().is_none_or(|(seen, _)| cost < *seen) {
+            best = Some((cost, chain));
+        }
+    }
+    let (_, chain) = best.expect("at least one eligible head produced a full chain");
+    Ok(chain.into_iter().map(|i| candidates[i].clone()).collect())
+}
+
 pub fn plan_parallelism(
     candidates: &[CandidateScore],
     layer_count: u32,
@@ -695,7 +838,8 @@ pub fn plan_parallelism(
     let mut pipeline = Vec::new();
     if pipeline_count > 1 {
         kinds.insert(ParallelismKind::Pipeline);
-        let stages = &candidates[..pipeline_count];
+        let ordered = order_pipeline(candidates, pipeline_count)?;
+        let stages = &ordered[..];
         let spans = layer_spans(stages, layer_count);
         for (index, (candidate, (start, end))) in stages.iter().zip(spans).enumerate() {
             pipeline.push(PipelineStage {
@@ -857,6 +1001,8 @@ mod tests {
             recent_failures: 0,
             online: true,
             memory_bandwidth_bytes_per_second: None,
+            coordinate: None,
+            prefill_eligible: true,
         }
     }
     fn requirements() -> InferenceRequirements {
@@ -920,6 +1066,8 @@ mod tests {
                 score: 1.0,
                 estimated_transfer_bytes: 0,
                 memory_bandwidth_bytes_per_second: None,
+                coordinate: None,
+                prefill_eligible: true,
             },
             CandidateScore {
                 node_id: "b".into(),
@@ -927,6 +1075,8 @@ mod tests {
                 score: 2.0,
                 estimated_transfer_bytes: 0,
                 memory_bandwidth_bytes_per_second: None,
+                coordinate: None,
+                prefill_eligible: true,
             },
             CandidateScore {
                 node_id: "c".into(),
@@ -934,6 +1084,8 @@ mod tests {
                 score: 3.0,
                 estimated_transfer_bytes: 0,
                 memory_bandwidth_bytes_per_second: None,
+                coordinate: None,
+                prefill_eligible: true,
             },
         ];
         let next = reroute(
@@ -1020,6 +1172,8 @@ mod tests {
             score: 0.0,
             estimated_transfer_bytes: 0,
             memory_bandwidth_bytes_per_second: None,
+            coordinate: None,
+            prefill_eligible: true,
         }];
         assert!(
             reroute(
@@ -1044,6 +1198,8 @@ mod tests {
             score: 0.0,
             estimated_transfer_bytes: 0,
             memory_bandwidth_bytes_per_second: bandwidth,
+            coordinate: None,
+            prefill_eligible: true,
         }
     }
 
@@ -1174,5 +1330,139 @@ mod tests {
             .map(|s| s.layer_end - s.layer_start)
             .collect();
         assert_eq!(held, vec![24, 8]);
+    }
+
+    // -- Choosing the chain, not just the machines -------------------------
+
+    /// A coordinate at `(x, 0, 0)` with no access-link cost and full
+    /// confidence. Distance along one axis is then just the difference in `x`,
+    /// which keeps these tests readable as a line of machines.
+    fn at(x: i64) -> Option<NetworkCoordinate> {
+        Some(NetworkCoordinate {
+            vector_micros: [x, 0, 0],
+            height_micros: 0,
+            error_permille: 0,
+        })
+    }
+
+    fn placed(id: &str, x: Option<i64>, prefill: bool) -> CandidateScore {
+        CandidateScore {
+            node_id: id.into(),
+            device_id: format!("dev-{id}"),
+            score: 0.0,
+            estimated_transfer_bytes: 0,
+            memory_bandwidth_bytes_per_second: None,
+            coordinate: x.and_then(at),
+            prefill_eligible: prefill,
+        }
+    }
+
+    /// The whole point of ordering separately from ranking. Ranking put the
+    /// two machines on the far side of the world second and third because each
+    /// is individually excellent; as a chain they cost two ocean crossings,
+    /// and the neighbours ranked below them cost almost nothing.
+    #[test]
+    fn a_chain_of_near_machines_beats_a_chain_of_better_distant_ones() {
+        let candidates = vec![
+            placed("head", Some(0), true),
+            placed("far-a", Some(150_000), true),
+            placed("far-b", Some(150_100), true),
+            placed("near-a", Some(500), true),
+            placed("near-b", Some(900), true),
+        ];
+        let chain = order_pipeline(&candidates, 3).unwrap();
+        let ids: Vec<&str> = chain.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["head", "near-a", "near-b"],
+            "the chain was picked by individual rank, so every token now crosses \
+             an ocean twice to reach machines that were only better in isolation"
+        );
+    }
+
+    /// Refusing loudly rather than planning a pipeline that will be slow for a
+    /// reason nobody can see. The message has to name the threshold, because
+    /// "no eligible machine" without a number is not something an operator can
+    /// act on.
+    #[test]
+    fn a_pipeline_is_refused_when_no_machine_may_hold_the_head() {
+        let candidates = vec![
+            placed("a", Some(0), false),
+            placed("b", Some(100), false),
+            placed("c", Some(200), false),
+        ];
+        let error = order_pipeline(&candidates, 3).unwrap_err().to_string();
+        assert!(
+            error.contains(&hocmesh_core::roles::PREFILL_UPLINK_KBPS.to_string()),
+            "the refusal does not say how fast a link would have to be: {error}"
+        );
+        assert!(
+            error.contains("without pipeline parallelism"),
+            "the refusal does not say the request is still servable: {error}"
+        );
+    }
+
+    /// Two stages on one box share a memory bus and a power supply. That is
+    /// not a pipeline, and one failure would take out two stages of it.
+    #[test]
+    fn two_stages_never_land_on_the_same_machine() {
+        let mut candidates = vec![placed("one", Some(0), true)];
+        // The same machine offering a second and third accelerator.
+        for device in 1..3 {
+            let mut extra = placed("one", Some(0), true);
+            extra.device_id = format!("dev-one-{device}");
+            candidates.push(extra);
+        }
+        candidates.push(placed("two", Some(10), true));
+        let error = order_pipeline(&candidates, 3).unwrap_err().to_string();
+        assert!(
+            error.contains("distinct machines"),
+            "three devices on two machines were accepted as a three-stage \
+             pipeline: {error}"
+        );
+
+        candidates.push(placed("three", Some(20), true));
+        let chain = order_pipeline(&candidates, 3).unwrap();
+        let machines: BTreeSet<&str> = chain.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(machines.len(), 3);
+    }
+
+    /// A machine that has never fitted a position cannot win a place by being
+    /// unmeasured. Unknown is charged more than any real link, not less.
+    #[test]
+    fn an_unplaced_machine_does_not_look_nearby() {
+        let candidates = vec![
+            placed("head", Some(0), true),
+            placed("nowhere", None, true),
+            placed("near", Some(1_000), true),
+        ];
+        let chain = order_pipeline(&candidates, 2).unwrap();
+        assert_eq!(
+            chain[1].node_id, "near",
+            "a machine with no coordinate was preferred over a measured \
+             neighbour, so not reporting a position is now an advantage"
+        );
+    }
+
+    /// Ranking may guess about an unmeasured link; the head of a pipeline may
+    /// not. This is the seam between the two, exercised end to end.
+    #[test]
+    fn only_a_measured_head_is_planned_into_a_pipeline() {
+        let candidates = [
+            placed("slow-but-close", Some(0), false),
+            placed("fast", Some(80_000), true),
+            placed("fast-neighbour", Some(80_100), true),
+        ];
+        let plan = plan_parallelism(&candidates, 12, &requirements()).unwrap();
+        validate_plan(&plan, 12, requirements().batch_size).unwrap();
+        assert_eq!(
+            plan.pipeline
+                .first()
+                .expect("a pipeline was planned")
+                .node_id,
+            "fast",
+            "the first stage went to a machine that has not shown it can push \
+             activations out"
+        );
     }
 }

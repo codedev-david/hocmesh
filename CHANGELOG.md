@@ -2,6 +2,68 @@
 
 ## 0.5.1
 
+### The uplink requirement is on the job, not on the door
+
+A pipeline is not made of interchangeable parts. The stage holding the first
+layers reads the whole prompt and pushes a full set of activations downstream
+before a single token comes back, so the link out of *that* machine sets the
+time to first token for everyone waiting on it. Every stage after it passes one
+narrow vector per token and is almost indifferent to bandwidth. Requiring a fast
+uplink of every participant would have bought nothing on most of the pipeline
+while excluding most of the machines that could have run it.
+
+- **Roles are derived from measured capability, not declared.** A node cannot
+  claim to be prefill-class; it reports hardware and a measured uplink, which is
+  the surface the rest of the system already treats as untrusted. Anyone may
+  join. Anyone may seed a model, serve a decode stage, or take a batch of
+  prompts, on whatever connection they have. One gigabit is asked for in exactly
+  one place: holding the first stage of a pipeline.
+- **The uplink is now measured instead of asserted.** Every node used to report
+  a hardcoded 100 Mbps. A number every machine reports identically cannot
+  separate any machine from any other, so a policy gating on it would have been
+  a policy gating on nothing — and would have looked, in every test and every
+  dashboard, exactly like a policy that worked. The figure now comes from real
+  chunks served to real peers while seeding, with no extra traffic.
+- **Unmeasured is not slow and is certainly not fast.** A node that has served
+  nothing reports nothing, and `0` means "nothing measured it" rather than
+  "slow". The two consumers are deliberately split: ranking assumes an ordinary
+  broadband link, because refusing to rank an unmeasured node would deadlock
+  (it earns a measurement by seeding, it only seeds a model it was sent, and it
+  is only sent one if it ranked well). The prefill gate assumes nothing,
+  because a bad guess there costs every request routed through that stage.
+- **The clock times the drain, not the handler.** Axum hands a finished
+  response to hyper and only then writes it, so timing the handler would have
+  measured the disk the chunk came off and reported it as a network speed. The
+  body is streamed and the measurement closes when the last slice leaves. The
+  residual bias — the kernel send buffer gives the first bytes a free ride — is
+  documented rather than hidden, and transfers too small to out-run it are
+  discarded rather than averaged in.
+
+### Pipelines are placed as chains, not as five good machines
+
+Ranking scores each machine on its own merits, which is the right question for a
+batch, where the machines never speak to each other. It is the wrong question
+for a pipeline: every token crosses every hop, so the five best machines
+individually can be the five worst as a chain.
+
+- **Stages are ordered by the hops between them.** The cost of a chain is the
+  sum of its adjacent edges — what a request actually pays — tie-broken by its
+  worst single hop, because two chains costing the same in total are not equally
+  good if one has a stall in the middle. Distances come from the Vivaldi network
+  coordinates the mesh already fits, so "geographically closer, fewer hops" is
+  answered with measured latency rather than with an IP database.
+- **A machine that has never fitted a position cannot win by being unmeasured.**
+  An unknown edge is charged more than any real link.
+- **Two stages never land on one machine.** That is not a pipeline; it is the
+  same memory bus twice, and one failure would take out two stages of a chain
+  that exists to spread them.
+- **No eligible head is an error, not a quiet downgrade.** A pipeline whose
+  first stage cannot push its activations out disappoints in a way that looks
+  like the model being slow rather than the placement being wrong. The refusal
+  names the threshold and says a plan without pipeline parallelism can still be
+  served.
+- **`validate_plan` now runs in production.** It had no callers outside tests.
+
 ### The k-quants load, which is most published models
 
 `q4_k_m` and its relatives are what models on Hugging Face actually ship as —

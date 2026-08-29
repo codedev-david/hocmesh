@@ -62,7 +62,44 @@ hocMESH splits a model by layer range: node A holds blocks 0..k, node B holds
 k..2k, and the hidden state hops from one to the next. The hidden state is small
 — 8192 values in bf16 is 16 KB — so each hop moves 16 KB regardless of how large
 the model is. At 1 Gb/s that serialises in 0.13 ms. **Network bandwidth is not a
-constraint on this design and never will be.**
+constraint on this design and never will be** — during decode.
+
+### Prefill is the exception, and it is one machine's problem
+
+The sentence above is true per token, and prefill does not run per token. The
+first stage reads the whole prompt at once and pushes an activation for *every*
+position downstream before a single token comes back:
+
+```
+prompt_tokens × hidden_size × 4 bytes
+   4096 tokens × 8192 × 4  =  134 MB   in one go
+```
+
+At 1 Gb/s that is 1.1 seconds; at a domestic 20 Mb/s upload it is 54 seconds,
+and it is on the critical path to the first token with nothing to overlap it
+against. Below roughly a gigabit the transfer dominates whatever the machine
+saved by being fast at arithmetic.
+
+This is a property of **one position in the chain**, not of the chain. Every
+stage after the first passes one narrow vector per token and is as indifferent
+to bandwidth as the paragraph above says. So the requirement attaches to the
+job rather than to the door: anyone may join, seed a model, serve a decode
+stage or take a batch of prompts on whatever connection they have, and
+`hocmesh-core::roles` asks for a *measured* gigabit in exactly one place —
+hosting the prefill stage. The measurement comes from real chunks served to
+real peers while seeding, so a node earns it by doing work that is open to
+everyone.
+
+### Hops are paid once per token, so the chain matters more than the links
+
+The 15 ms figure in the table below is per hop, and every token crosses every
+hop. That makes pipeline placement a different question from batch placement:
+batches never speak to each other, so ranking each machine on its own merits is
+right, whereas a pipeline's cost is the sum of its *adjacent* edges. The five
+best machines individually can be the five worst as a chain. Stages are
+therefore ordered by the Vivaldi network coordinates the mesh already fits,
+minimising that sum and tie-breaking on the worst single hop, since two chains
+costing the same in total are not equally good if one has a stall in the middle.
 
 What the split does solve is capacity. Fourteen nodes with 20 GB of usable RAM
 each hold the 480B model between them, and it runs. Nothing else makes it run.

@@ -7,12 +7,16 @@ use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path as AxumPath, State},
-    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
+    http::{
+        HeaderValue, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
     routing::get,
 };
+use hocmesh_core::bandwidth::UplinkMeter;
 use hocmesh_model::{ChunkRef, ChunkStore, ModelManifest, sha256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +24,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,12 +310,27 @@ pub async fn seed_from_peer(
 pub struct SeedServerState {
     store: Arc<ChunkStore>,
     manifests: Arc<BTreeMap<(String, String), ModelManifest>>,
+    uplink: Arc<UplinkMeter>,
 }
 
 impl SeedServerState {
     pub fn new(
         store: Arc<ChunkStore>,
         manifests: impl IntoIterator<Item = ModelManifest>,
+    ) -> Result<Self> {
+        Self::measuring(store, manifests, Arc::new(UplinkMeter::new()))
+    }
+
+    /// Serve, and report what the serving measured into a meter someone else
+    /// holds.
+    ///
+    /// A node advertises its uplink on a heartbeat that starts before the seed
+    /// server does, so the meter has to outlive and predate this state rather
+    /// than be owned by it.
+    pub fn measuring(
+        store: Arc<ChunkStore>,
+        manifests: impl IntoIterator<Item = ModelManifest>,
+        uplink: Arc<UplinkMeter>,
     ) -> Result<Self> {
         let mut map = BTreeMap::new();
         for manifest in manifests {
@@ -323,8 +343,62 @@ impl SeedServerState {
         Ok(Self {
             store,
             manifests: Arc::new(map),
+            uplink,
         })
     }
+
+    /// The uplink this server measures while it serves.
+    ///
+    /// Handed out so the node can advertise the figure. Sharing the meter
+    /// rather than copying a number keeps one reading of this machine's link
+    /// instead of two that can disagree.
+    #[must_use]
+    pub fn uplink(&self) -> Arc<UplinkMeter> {
+        Arc::clone(&self.uplink)
+    }
+}
+
+/// How much of a chunk is handed to the writer at a time.
+///
+/// Small enough that a chunk leaves in many pieces, so the later pieces are
+/// asked for at the rate the socket drains rather than all at once; large
+/// enough that the per-piece bookkeeping is noise beside the transfer.
+const DRAIN_SLICE: usize = 256 * 1024;
+
+/// A chunk response that times itself as it leaves.
+///
+/// Timing `serve_chunk` would have measured the disk. Axum takes the finished
+/// response and only then hands it to hyper to write, so at the moment the
+/// handler returns, nothing has gone over the wire at all -- a node with a fast
+/// SSD and a slow link would have advertised the SSD.
+///
+/// Returning a stream puts the clock where the bytes are. Hyper asks for the
+/// next slice once it has somewhere to put the previous one, so the interval
+/// between the first ask and the last is how long the network took to accept
+/// everything before that final slice. That last slice is left out of the
+/// count: it has been handed over but not yet carried, and crediting the link
+/// with it would be crediting it with work it has not done.
+fn metered_body(bytes: Vec<u8>, meter: Arc<UplinkMeter>) -> Body {
+    let total = bytes.len() as u64;
+    let state = (Bytes::from(bytes), None::<Instant>, meter, total);
+    Body::from_stream(futures::stream::unfold(
+        state,
+        |(mut buffer, started, meter, total)| async move {
+            if buffer.is_empty() {
+                return None;
+            }
+            let started = started.unwrap_or_else(Instant::now);
+            let take = DRAIN_SLICE.min(buffer.len());
+            let slice = buffer.split_to(take);
+            if buffer.is_empty() {
+                meter.record(total - take as u64, started.elapsed());
+            }
+            Some((
+                Ok::<Bytes, std::io::Error>(slice),
+                (buffer, Some(started), meter, total),
+            ))
+        },
+    ))
 }
 
 pub fn seed_router(state: SeedServerState) -> Router {
@@ -355,11 +429,18 @@ async fn serve_chunk(
 ) -> Response {
     match state.store.read(&digest) {
         Ok(bytes) => {
-            let mut response = Bytes::from(bytes).into_response();
-            response.headers_mut().insert(
+            let length = bytes.len();
+            let mut response = metered_body(bytes, state.uplink()).into_response();
+            let headers = response.headers_mut();
+            headers.insert(
                 CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
             );
+            // Streaming would otherwise drop the length and fall back to
+            // chunked encoding, which costs the caller its progress figure.
+            if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+                headers.insert(CONTENT_LENGTH, value);
+            }
             response
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
@@ -582,6 +663,109 @@ mod tests {
         .unwrap();
         assert_eq!(seeded, manifest);
         assert!(seeded.chunks.iter().all(|chunk| target.contains(chunk)));
+        server.abort();
+        drop(target);
+        drop(source_store);
+        std::fs::remove_dir_all(source_root).unwrap();
+        std::fs::remove_dir_all(target_root).unwrap();
+    }
+
+    /// The measurement has to time the *drain*, not the handler. Axum hands a
+    /// finished response to hyper and only then writes it, so timing the
+    /// handler would have measured the disk the chunk came off and reported it
+    /// as a network speed -- a number that would look plausible, rise when the
+    /// page cache was warm, and never once describe the link.
+    #[tokio::test]
+    async fn the_clock_runs_while_the_body_drains_not_while_it_is_built() {
+        use futures::StreamExt;
+
+        let meter = Arc::new(UplinkMeter::new());
+        let payload = vec![0u8; 4 * DRAIN_SLICE];
+        let body = metered_body(payload, Arc::clone(&meter));
+        assert_eq!(
+            meter.kbps(),
+            None,
+            "the transfer was recorded before anything was sent"
+        );
+
+        let mut stream = body.into_data_stream();
+        let mut drained = 0usize;
+        while let Some(slice) = stream.next().await {
+            drained += slice.unwrap().len();
+            // A slow consumer, which is what a real remote peer is.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(drained, 4 * DRAIN_SLICE);
+
+        let kbps = meter.kbps().expect("a drained body was not measured");
+        // Four slices, three of them behind a 5 ms sleep, so the drain took at
+        // least 15 ms. Anything above the rate that implies means the clock
+        // stopped early -- which is the bug this test exists to catch.
+        let ceiling = (4 * DRAIN_SLICE as u64 * 8 / 1000) / 15 * 1000;
+        assert!(
+            kbps <= ceiling,
+            "measured {kbps} kbit/s for a transfer that demonstrably took at \
+             least 15 ms, so the clock is not stopping when the last slice \
+             leaves"
+        );
+    }
+
+    /// End to end through the real server, because a correct meter that
+    /// nothing calls is not a measurement.
+    #[tokio::test]
+    async fn seeding_a_real_chunk_leaves_a_measured_uplink_behind() {
+        let unique = format!("{}-{}", std::process::id(), hocmesh_protocol_time());
+        let source_root = std::env::temp_dir().join(format!("hocmesh-meter-source-{unique}"));
+        let target_root = std::env::temp_dir().join(format!("hocmesh-meter-target-{unique}"));
+        let source_store = Arc::new(ChunkStore::open(&source_root).unwrap());
+        // Comfortably over the size below which a transfer is timing the round
+        // trip rather than the link.
+        let payload = vec![7u8; 4 << 20];
+        let digest = source_store.put(&payload).unwrap();
+        let manifest = ModelManifest {
+            schema_version: 1,
+            model_id: "m".into(),
+            revision: "1".into(),
+            format: ModelFormat::Gguf,
+            architecture: "llama".into(),
+            parameter_count: None,
+            tensor_dtype: None,
+            total_size_bytes: payload.len() as u64,
+            chunks: vec![ChunkRef {
+                index: 0,
+                sha256: digest,
+                size_bytes: payload.len() as u64,
+            }],
+            metadata: Default::default(),
+        };
+        let uplink = Arc::new(UplinkMeter::new());
+        let state = SeedServerState::measuring(
+            source_store.clone(),
+            [manifest.clone()],
+            Arc::clone(&uplink),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, seed_router(state)).await.unwrap() });
+        let target = ChunkStore::open(&target_root).unwrap();
+        seed_from_peer(
+            &HttpPeerSource::new(format!("http://{address}")).unwrap(),
+            &target,
+            "m",
+            "1",
+        )
+        .await
+        .unwrap();
+
+        let kbps = uplink.kbps().expect(
+            "a 4 MiB chunk was served and nothing was measured, so the node \
+             will report an unmeasured link forever and never qualify to hold \
+             a prefill stage",
+        );
+        assert!(kbps > 0);
+
         server.abort();
         drop(target);
         drop(source_store);

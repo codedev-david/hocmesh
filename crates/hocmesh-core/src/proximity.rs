@@ -51,6 +51,14 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// Predicted round-trip time between two coordinates, in microseconds.
 ///
 /// Heights add because each end of the path crosses its own access link.
+/// Distance assumed between two nodes that have measured nothing.
+///
+/// Chosen to be worse than any plausible measurement rather than better, for
+/// the same reason `UNKNOWN` is the middle of an axis and not the top: if
+/// unmeasured looked close, the cheapest way to be picked for a tight cluster
+/// would be to stop measuring.
+pub const UNKNOWN_EDGE_MICROS: u64 = 400_000;
+
 pub fn predicted_rtt_micros(a: &NetworkCoordinate, b: &NetworkCoordinate) -> u64 {
     let mut sum = 0.0f64;
     for axis in 0..COORDINATE_DIMENSIONS {

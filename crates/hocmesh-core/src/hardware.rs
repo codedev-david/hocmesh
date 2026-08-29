@@ -61,7 +61,11 @@ pub fn detect_capabilities_with_models(
         model_seed_url,
         cached_model_manifests,
         coordinator_latency_micros: 0,
-        model_bandwidth_kbps: 100_000,
+        // Zero means "nothing has measured this link", which is what is true
+        // of a machine that has not yet served a byte. A constant here made
+        // every node in the hocmesh report the same uplink, so any policy that
+        // gated on it was gating on nothing while looking like it worked.
+        model_bandwidth_kbps: 0,
         accelerator_load_permille: 0,
         ai_runtime_ready: false,
         // Fail safe: until an operator's limits are applied, advertise only the

@@ -537,11 +537,10 @@ pub fn best<'a>(
 
 /// Distance assumed between two nodes that have measured nothing.
 ///
-/// Chosen to be worse than any plausible measurement rather than better, for
-/// the same reason `UNKNOWN` is the middle of an axis and not the top: if
-/// unmeasured looked close, the cheapest way to be picked for a tight cluster
-/// would be to stop measuring.
-pub const UNKNOWN_EDGE_MICROS: u64 = 400_000;
+/// Lives in `hocmesh-core` because the AI planner has to agree with the
+/// scheduler about what "unmeasured" costs; two constants with the same value
+/// in two crates is one edit away from being two different values.
+pub use hocmesh_core::proximity::UNKNOWN_EDGE_MICROS;
 
 /// One vertex of the resource graph.
 #[derive(Debug, Clone)]

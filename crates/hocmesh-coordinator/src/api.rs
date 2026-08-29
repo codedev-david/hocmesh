@@ -15,11 +15,13 @@ use hocmesh_ai::{
     SettleInferenceResponse, SubmitInferenceRequest, SubmitInferenceResponse,
     fail_inference_body_hash, inference_settings_digest, plan_body_hash, plan_parallelism,
     rank_candidates, refund_inference_body_hash, register_model_body_hash,
-    report_inference_body_hash, submit_inference_body_hash,
+    report_inference_body_hash, submit_inference_body_hash, validate_plan,
 };
+use hocmesh_core::bandwidth;
 use hocmesh_core::compute::{split_work, work_cost_mcu};
 use hocmesh_core::proximity;
 use hocmesh_core::reputation::Reputation;
+use hocmesh_core::roles::{self, NodeRole};
 use hocmesh_core::verify::{self, AuditNonce, Verdict};
 use hocmesh_gpu::{BackendKind, DeviceCapability};
 use hocmesh_ledger::{
@@ -244,11 +246,13 @@ async fn plan_ai(
                 devices,
                 cached_chunks,
                 network_latency_ms: scoring_latency_ms(requester.as_ref(), &capabilities),
-                bandwidth_mbps: (capabilities.model_bandwidth_kbps as f64 / 1000.0).max(0.001),
+                bandwidth_mbps: ranking_bandwidth_mbps(&capabilities),
                 load_fraction: (capabilities.accelerator_load_permille.min(1000) as f64) / 1000.0,
                 recent_failures: 0,
                 online: true,
                 memory_bandwidth_bytes_per_second: capabilities.memory_bandwidth_bytes_per_second,
+                coordinate: capabilities.network_coordinate,
+                prefill_eligible: roles::can_serve(&capabilities, NodeRole::Prefill),
             });
         }
         (manifest, nodes)
@@ -259,6 +263,8 @@ async fn plan_ai(
     }
     let plan = plan_parallelism(&candidates, req.layer_count, &req.requirements)
         .map_err(|error| ApiError::conflict(error.to_string()))?;
+    validate_plan(&plan, req.layer_count, req.requirements.batch_size)
+        .map_err(ApiError::internal)?;
     Ok(Json(PlanResponse {
         manifest_digest: manifest.digest().map_err(ApiError::internal)?,
         candidates,
@@ -316,6 +322,12 @@ async fn submit_inference(
         }
         let plan = plan_parallelism(&candidates, req.layer_count, &req.requirements)
             .map_err(|error| ApiError::conflict(error.to_string()))?;
+        // The planner is the only producer today, so this should never fire.
+        // It is here because of how it would fail if it ever did: a stage
+        // discovering it has no layers to run, hours into a job whose escrow
+        // is already committed and whose plan is already in the database.
+        validate_plan(&plan, req.layer_count, req.requirements.batch_size)
+            .map_err(ApiError::internal)?;
         let requester_pk = conn
             .query_row(
                 "SELECT public_key_b64 FROM nodes WHERE node_id=?1",
@@ -1362,6 +1374,23 @@ fn refundable_batches(
     Ok(out)
 }
 
+/// The uplink to assume for ranking, in Mbit/s.
+///
+/// A machine that has never served a byte has no measurement, and ranking
+/// still has to put a number on what moving a model to it would cost. It
+/// assumes an ordinary broadband link rather than refusing, because refusing
+/// would be a deadlock and not a safeguard: a node earns its measurement by
+/// serving, it can only serve a model it was sent, and it is only sent one if
+/// it ranked well enough to be picked.
+///
+/// The prefill gate does not get this courtesy. A bad guess here costs one
+/// slow transfer; a bad guess there costs every request routed through that
+/// stage for as long as the job runs.
+fn ranking_bandwidth_mbps(caps: &NodeCapabilities) -> f64 {
+    let kbps = roles::measured_uplink_kbps(caps).unwrap_or(bandwidth::ASSUMED_KBPS);
+    (kbps as f64 / 1000.0).max(0.001)
+}
+
 fn ai_context(
     conn: &Connection,
     requester_node_id: &str,
@@ -1421,11 +1450,13 @@ fn ai_context(
                 Default::default()
             },
             network_latency_ms: scoring_latency_ms(requester.as_ref(), &capabilities),
-            bandwidth_mbps: (capabilities.model_bandwidth_kbps as f64 / 1000.0).max(0.001),
+            bandwidth_mbps: ranking_bandwidth_mbps(&capabilities),
             load_fraction: capabilities.accelerator_load_permille.min(1000) as f64 / 1000.0,
             recent_failures: 0,
             online: true,
             memory_bandwidth_bytes_per_second: capabilities.memory_bandwidth_bytes_per_second,
+            coordinate: capabilities.network_coordinate,
+            prefill_eligible: roles::can_serve(&capabilities, NodeRole::Prefill),
         });
     }
     Ok((manifest, nodes, seed_peers))
