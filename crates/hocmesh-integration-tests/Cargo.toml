@@ -15,6 +15,7 @@ hocmesh-ai = { path = "../hocmesh-ai" }
 # headless machine for no gain.
 hocmesh-desktop = { path = "../hocmesh-desktop", default-features = false }
 hocmesh-core = { path = "../hocmesh-core" }
+hocmesh-engine = { path = "../hocmesh-engine" }
 hocmesh-gpu = { path = "../hocmesh-gpu" }
 hocmesh-model = { path = "../hocmesh-model" }
 hocmesh-ledger = { path = "../hocmesh-ledger" }

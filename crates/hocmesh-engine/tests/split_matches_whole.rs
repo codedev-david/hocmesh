@@ -210,28 +210,83 @@ fn position_comes_from_the_activation_and_not_from_the_cache() {
     assert!(error.contains("out of order"), "{error}");
 }
 
-/// A model with no `output.weight` ties its head to its embedding table. That
-/// is loadable when one stage holds both ends and must be refused, clearly,
-/// when it does not.
+/// A model with no `output.weight` uses its embedding table as the output
+/// head. Most small models do this, so a split that could not cope with it
+/// would not be much of a split.
+///
+/// The table is a shared tensor, and a shard carries the shared tensors
+/// whichever end of the model it holds -- so the stage with the last block has
+/// the table even though it will never embed anything with it. What is checked
+/// here is that splitting such a model changes nothing, exactly as for a model
+/// that carries a separate head.
 #[test]
-fn a_tied_output_head_is_refused_when_the_ends_are_on_different_stages() {
+fn a_tied_output_head_survives_being_split_across_stages() {
     let (_dir, path) = model(Recipe {
         block_count: 4,
         separate_output_head: false,
         ..Recipe::default()
     });
-    let mut file = WeightFile::open(&path).expect("open");
-    assert!(
-        Stage::load(&mut file, 0..4).is_ok(),
-        "one stage holds both ends"
-    );
+    let tokens = [5u32, 9, 2, 14, 7];
 
+    let whole = run(&path, &[], &tokens);
+    for cuts in [&[2u32][..], &[1, 3][..], &[1, 2, 3][..]] {
+        assert_eq!(
+            run(&path, cuts, &tokens),
+            whole,
+            "a tied head split at {cuts:?} computed something else"
+        );
+    }
+
+    // And the stage that holds the tail alone loads, which is the case the
+    // whole arrangement used to refuse.
     let mut file = WeightFile::open(&path).expect("open");
+    let tail = Stage::load(&mut file, 2..4).expect("a tail-only stage loads a tied head");
+    assert!(
+        tail.logits(&Activation {
+            hidden: vec![0.0; tail.config.embedding_length as usize],
+            tokens: 1,
+            position: 0,
+        })
+        .is_ok(),
+        "a tail-only stage must be able to produce logits"
+    );
+}
+
+/// A file with neither an output head nor an embedding table cannot produce
+/// logits at all, and says so rather than reading zeros.
+#[test]
+fn a_model_with_no_head_and_no_embedding_table_is_refused() {
+    let (_dir, path) = model(Recipe {
+        block_count: 4,
+        separate_output_head: false,
+        ..Recipe::default()
+    });
+    let stripped = strip_tensor(&path, "token_embd.weight");
+    let mut file = WeightFile::open(&stripped).expect("open");
+    // A tail-only range, so the failure is the head's rather than the
+    // embedding lookup's -- the stage never intended to embed anything.
     let error = Stage::load(&mut file, 2..4)
         .err()
-        .expect("a split tied head must be refused")
+        .expect("a model with nothing to make logits from must be refused")
         .to_string();
-    assert!(error.contains("ties its output head"), "{error}");
+    assert!(error.contains("holds neither"), "{error}");
+}
+
+/// Copy a model with one tensor's name altered so the file no longer declares
+/// it. The replacement is the same length, so no offset in the directory
+/// moves and the file stays readable.
+fn strip_tensor(path: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let mut bytes = std::fs::read(path).expect("read model");
+    let needle = name.as_bytes();
+    let at = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("the tensor to strip must be in the file");
+    let last = at + needle.len() - 1;
+    bytes[last] = b'_';
+    let out = path.with_extension("stripped.gguf");
+    std::fs::write(&out, bytes).expect("write model");
+    out
 }
 
 /// An empty range is a network hop that computes nothing, and a range past the

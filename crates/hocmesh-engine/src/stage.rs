@@ -162,24 +162,38 @@ impl Stage {
 
         let output_norm = last.then(|| file.load("output_norm.weight")).transpose()?;
         // A model with no `output.weight` ties its head to its embedding
-        // table. On the last stage of a split model that table lives on
-        // another machine, so tying is only usable when one stage holds both.
+        // table: one matrix, read as a lookup at the front of the model and as
+        // rows of output weights at the back. The stage holding the last block
+        // therefore has to read that table even when it does not hold block 0
+        // and will never embed anything with it. It can: a shard carries the
+        // shared tensors whichever end of the model it holds, because either
+        // end needs them. Tied embeddings are the rule rather than the
+        // exception among the small models worth splitting, so refusing them
+        // would rule out most of the point.
         let output_head = if last {
             match file.load_optional("output.weight")? {
                 Some(head) => Some(head),
-                None => {
-                    ensure!(
-                        first,
-                        "this model ties its output head to its embedding table, so the \
-                         stage holding the last block must also hold the first"
-                    );
-                    embedding.clone()
-                }
+                None if embedding.is_some() => embedding.clone(),
+                None => Some(file.load("token_embd.weight").context(
+                    "this model ties its output head to its embedding table, but this \
+                     file holds neither, so the stage with the last block has nothing \
+                     to turn its activation into logits with",
+                )?),
             }
         } else {
             None
         };
-
+        if let Some(head) = &output_head {
+            // Rows of the head are vocabulary entries, its columns the model
+            // width. Taking the count from the tensor rather than from
+            // metadata stops a header that disagrees with the file from
+            // indexing past the end of it.
+            head.expect_shape(
+                "output head",
+                &[u64::from(config.embedding_length), head.dimensions[1]],
+            )?;
+            config.vocab_size = head.dimensions[1] as u32;
+        }
         let depth = layers.len();
         Ok(Stage {
             config,

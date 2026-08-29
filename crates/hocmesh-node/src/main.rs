@@ -213,6 +213,11 @@ enum Command {
         feed_forward_length: u32,
         #[arg(long, default_value_t = 96)]
         vocab: u32,
+        /// How to store the weights: f32, f16, bf16, q4_0, q4_1, q5_0, q5_1
+        /// or q8_0. Norms stay f32 whatever this says, exactly as they do in
+        /// a real conversion.
+        #[arg(long, default_value = "f32")]
+        weights: String,
     },
     /// Write a model file holding only the layers one stage runs.
     ///
@@ -915,6 +920,7 @@ stored at: {}",
             kv_heads,
             feed_forward_length,
             vocab,
+            weights,
         } => {
             let recipe = hocmesh_engine::fixture::Recipe {
                 block_count: blocks,
@@ -923,11 +929,12 @@ stored at: {}",
                 head_count_kv: kv_heads,
                 feed_forward_length,
                 vocab_size: vocab,
+                weight_kind: hocmesh_engine::dequant::kind_by_name(&weights)?,
                 ..hocmesh_engine::fixture::Recipe::default()
             };
             recipe.write(&output)?;
             println!(
-                "Wrote a {blocks}-block {}-wide fixture to {} ({} bytes)",
+                "Wrote a {blocks}-block {}-wide {weights} fixture to {} ({} bytes)",
                 embedding_length,
                 output.display(),
                 std::fs::metadata(&output)?.len()

@@ -127,6 +127,37 @@ impl Metadata {
         string(&mut self.bytes, value);
         self.entries += 1;
     }
+
+    /// An array is a type code, then the element type, then a count, then the
+    /// elements with no per-element type of their own.
+    fn array(&mut self, key: &str, element: u32, count: usize) {
+        string(&mut self.bytes, key);
+        self.bytes.extend_from_slice(&9u32.to_le_bytes()); // ValueType::Array
+        self.bytes.extend_from_slice(&element.to_le_bytes());
+        self.bytes.extend_from_slice(&(count as u64).to_le_bytes());
+        self.entries += 1;
+    }
+
+    fn string_array(&mut self, key: &str, values: &[String]) {
+        self.array(key, 8, values.len());
+        for value in values {
+            string(&mut self.bytes, value);
+        }
+    }
+
+    fn f32_array(&mut self, key: &str, values: &[f32]) {
+        self.array(key, 6, values.len());
+        for value in values {
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    fn i32_array(&mut self, key: &str, values: &[i32]) {
+        self.array(key, 5, values.len());
+        for value in values {
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
 }
 
 impl Recipe {
@@ -208,6 +239,37 @@ impl Recipe {
         metadata.u32(&format!("{arch}.context_length"), 256);
         metadata.f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-5);
         metadata.f32(&format!("{arch}.rope.freq_base"), 10_000.0);
+
+        // A vocabulary this engine never reads. It takes token ids directly --
+        // tokenising is a separate problem with its own correctness argument,
+        // and mixing the two would prove neither. llama.cpp, though, refuses to
+        // load any model that has no vocabulary at all ("key not found in
+        // model: tokenizer.ggml.model"), so without these entries the fixture
+        // cannot be handed to the reference implementation and the forward pass
+        // has nothing to be checked against. They exist for that comparison and
+        // for nothing else, which is why the pieces are placeholders rather
+        // than anything resembling real text.
+        let vocab = self.vocab_size as usize;
+        let mut pieces = Vec::with_capacity(vocab);
+        let mut kinds = Vec::with_capacity(vocab);
+        for id in 0..self.vocab_size {
+            // 2 = UNKNOWN, 3 = CONTROL, 1 = NORMAL, in llama.cpp's numbering.
+            let (piece, kind) = match id {
+                0 => ("<unk>".to_string(), 2),
+                1 => ("<s>".to_string(), 3),
+                2 => ("</s>".to_string(), 3),
+                _ => (format!("tok{id}"), 1),
+            };
+            pieces.push(piece);
+            kinds.push(kind);
+        }
+        metadata.string("tokenizer.ggml.model", "llama");
+        metadata.string_array("tokenizer.ggml.tokens", &pieces);
+        metadata.f32_array("tokenizer.ggml.scores", &vec![0.0; vocab]);
+        metadata.i32_array("tokenizer.ggml.token_type", &kinds);
+        metadata.u32("tokenizer.ggml.bos_token_id", 1);
+        metadata.u32("tokenizer.ggml.eos_token_id", 2);
+        metadata.u32("tokenizer.ggml.unknown_token_id", 0);
 
         // Offsets are relative to the start of the tensor data section and
         // each tensor is aligned, exactly as a real converter emits them.

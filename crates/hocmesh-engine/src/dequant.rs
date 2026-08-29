@@ -27,6 +27,27 @@ pub const Q5_1: u32 = 7;
 pub const Q8_0: u32 = 8;
 pub const BF16: u32 = 30;
 
+/// Resolve the name a person would type to the code the format uses.
+///
+/// The error lists what is accepted rather than saying the input was wrong,
+/// because the set is small, arbitrary, and impossible to guess.
+pub fn kind_by_name(name: &str) -> anyhow::Result<u32> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "f32" => F32,
+        "f16" => F16,
+        "bf16" => BF16,
+        "q4_0" => Q4_0,
+        "q4_1" => Q4_1,
+        "q5_0" => Q5_0,
+        "q5_1" => Q5_1,
+        "q8_0" => Q8_0,
+        other => anyhow::bail!(
+            "unknown weight format {other}; use one of \
+             f32, f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0"
+        ),
+    })
+}
+
 /// Whether [`dequantize`] can reconstruct this GGML type code.
 #[must_use]
 pub fn is_supported(kind: u32) -> bool {

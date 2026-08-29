@@ -58,12 +58,21 @@ jobs:
         run: cargo check --workspace --all-features --locked
       - name: Test
         run: cargo test --workspace --all-features --locked --exclude hocmesh-integration-tests
+      # The reference parity tests check this engine's forward pass against
+      # llama.cpp. They skip when it is absent, which is right on a developer
+      # machine and wrong here -- a skip and a pass look identical in a log.
+      # So the runtime is installed, and HOCMESH_REQUIRE_REFERENCE below turns
+      # any remaining skip into a failure.
+      - name: Install the reference implementation
+        run: cargo run --locked -p hocmesh -- runtime-install
       - name: Integration tests
         # Every one of these stands up a four-validator quorum and at least
         # one coordinator, and several of them are timing tests. Run them one
         # at a time: a two-core runner that is hosting two such stacks starves
         # the very timeouts under test.
         run: cargo test -p hocmesh-integration-tests --all-features --locked -- --test-threads=1
+        env:
+          HOCMESH_REQUIRE_REFERENCE: 1
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Proofs

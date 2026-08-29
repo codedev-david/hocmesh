@@ -104,7 +104,7 @@ by the quorum against evidence the worker signed.
 - Replicated critical layers. **Not done.**
 - Node departure recovery. **Decided, not automated.** A stage that drops takes its KV cache with it; the answer is replay from the prompt on a replacement, and `stage/reset` is the mechanism. Nothing orchestrates the replacement yet.
 - Micro-batching. **Not done.** One sequence at a time per chain.
-- Parity against another implementation. **Not done, and it is the honest gap.** The split is proved to change nothing; that the unsplit result matches llama.cpp on a converted model is not.
+- Parity against another implementation. **Done.** `reference_parity.rs` checks the forward pass against llama.cpp: identical tokens for the unsplit model and for a three-stage split, and bit-identical decoding for every quantised format. What remains of the gap is narrow -- it is held on a generated fixture rather than a downloaded checkpoint, and quantised *generation* is not compared because llama.cpp takes a different arithmetic path there (it quantises activations too), which the fixture's near-tied logits would turn into noise.
 - GPU execution of a stage. **Not done.** The engine is CPU. GPU inference still goes through the llama.cpp adapters, which load whole models, so the distributed path and the accelerated path do not yet meet.
 
 ## Priority 7 — heterogeneous accelerators

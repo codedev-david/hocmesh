@@ -62,11 +62,20 @@ That engine is `hocmesh-engine`, added in 0.5.0. The three sub-pieces:
 
 ### What is still open
 
-- **Parity with another implementation.** The split is proved to change nothing,
-  which is the property distribution rests on. That the *unsplit* result matches
-  llama.cpp on a converted model is not proved — the tensor directory is
-  cross-checked against a foreign writer, the arithmetic is not. Until it is,
-  the engine is verified as self-consistent rather than as correct.
+- **Model families the engine does not implement.** The block shape it runs is
+  `attn_norm -> q,k,v -> rope -> attention -> out, ffn_norm -> gate*up -> down`
+  with RMS norm and SwiGLU, which covers `llama`, `mistral`, `qwen2`, `qwen3`
+  and `stablelm`. Mixture-of-experts models are not among them: routing means
+  the weights a token needs are chosen per token, which a static layer-range
+  split does not express. An architecture the engine has not been told about is
+  refused at load rather than guessed at.
+- **Parity on a downloaded checkpoint, on every push.** The forward pass is
+  checked against llama.cpp -- see below -- on a generated fixture, because a
+  fixture is what CI can afford to download and run. The same comparison has
+  been run by hand against a real checkpoint (SmolLM2-135M: 30 blocks,
+  grouped-query attention, a tied output head), whole and split three ways, and
+  it matched on every prompt tried. What is missing is not the evidence but the
+  automation: nothing re-runs that on each commit.
 - **Resuming a sequence elsewhere.** A stage that drops mid-sequence takes its KV
   cache with it. Re-running the prompt against a replacement is correct and
   costs the prompt again; migrating the cache is not implemented.
@@ -272,12 +281,25 @@ equal, a separate test asserts the fixture produces finite logits with a real
 spread and more than one winning token — otherwise every comparison above would
 pass while computing nothing.
 
-*Not tested, and worth saying plainly:* the arithmetic is not compared against
-llama.cpp on a real converted model. What is proved is that splitting changes
-nothing, which is the property distribution depends on; what is not proved is
-that the unsplit result matches another implementation's for a downloaded
-model. The tensor directory *is* cross-checked against a foreign writer; the
-forward pass is not. That comparison is the next thing worth adding.
+*Also tested, and it is the comparison everything else here leans on:*
+`reference_parity.rs` checks the forward pass against llama.cpp. llama.cpp runs
+as a server and is fed token ids rather than text, so no tokeniser sits between
+the two implementations and a tokenising difference cannot be mistaken for an
+arithmetic one. On f32 weights the unsplit engine generates exactly what
+llama.cpp generates; so does a three-stage split, compared against llama.cpp
+running the model whole. Separately, every quantised format — `q4_0`, `q4_1`,
+`q5_0`, `q5_1`, `q8_0`, `f16`, `bf16` — decodes bit-identically to llama.cpp's
+own decoding of the same bytes, checked element by element on every tensor.
+
+Two limits are deliberate. Quantised *generation* is not compared, because
+llama.cpp does not decode to f32 and multiply there; it quantises the
+activations too and takes integer dot products. That is a different arithmetic
+path, so small differences are nobody's bug — and the fixture's random weights
+leave its logits nearly tied, so an argmax over them is decided by rounding.
+Comparing generated tokens under those conditions measures noise, which is why
+what is asserted for quantised weights is the decoding rather than the output.
+And the comparison runs on a generated fixture rather than a downloaded
+checkpoint; see *What is still open*.
 
 **Step 3 — Stage runner and KV-cache ownership. Done, with the recovery
 question answered one way.** A stage owns the KV cache for the blocks it holds

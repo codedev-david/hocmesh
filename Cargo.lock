@@ -1855,6 +1855,7 @@ dependencies = [
  "hocmesh-ai",
  "hocmesh-core",
  "hocmesh-desktop",
+ "hocmesh-engine",
  "hocmesh-gpu",
  "hocmesh-ledger",
  "hocmesh-model",
