@@ -11,6 +11,7 @@ Primary deliverables:
 - `docs/HOCMESH_AI.md` — implemented AI architecture, commands, and runtime boundaries.
 - `docs/ARCHITECTURE.md` — implemented and future topology.
 - `docs/DISTRIBUTED_INFERENCE.md` — the arithmetic that decides how a model can be split across a network, and the build order for the missing execution engine.
+- `docs/PERFORMANCE.md` — why decoding is bandwidth-bound, what splitting a model across machines can and cannot make faster, where the engine measures against llama.cpp today, and the ordered plan for closing the gap.
 - `docs/LEDGER.md` — replicated CU accounting design.
 - `docs/PROTOCOL.md` — signed wire behavior (current protocol v3).
 - `docs/SECURITY.md` — threat model and hardening requirements.

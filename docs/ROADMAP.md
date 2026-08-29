@@ -126,6 +126,18 @@ by the quorum against evidence the worker signed.
 - Signed auto-update.
 - RPM packaging. **Done.** `scripts/package-linux-rpm.sh` and an `rpm` target on the desktop bundle, both in the release job with checksums and signatures, alongside MSI, PKG, DEB and AppImage.
 
+## Priority 9 — decode speed
+
+Priorities 5 through 7 answer *can this model run here at all*. This one answers *would anyone wait for it*. The arithmetic, the measurements and the reasoning behind the order are in `docs/PERFORMANCE.md`; the short version is that decoding is bound by memory bandwidth, that splitting a model across machines buys capacity and aggregate throughput but not single-stream latency, and that the engine is currently an order of magnitude below what the hardware it already runs on can do.
+
+- Weights stay in their stored format. The engine expands every tensor to `f32` in RAM, so a q4 model occupies eight times its file size and streams eight times the bytes per token. Dequantise per block inside the dot product instead. This is simultaneously the largest speed win and a large capacity win.
+- SIMD and threading in the inner loop. `dot` in `crates/hocmesh-engine/src/stage.rs` is one scalar multiply-add per iteration on one core; there is no `rayon` in the workspace and no intrinsics in the engine. Measured against llama.cpp on the same f32 file, the engine reaches 3.5 tok/s to llama.cpp's 36.1 — 1.9 GB/s against 19.5 GB/s of the same memory bus.
+- Mixture-of-experts. Dense SwiGLU is the only feed-forward the engine implements; `ffn_gate_exps` and `ffn_gate_inp` appear nowhere in the codebase, so every model actually worth distributing today fails to load. This is the difference between paying a 30B model's bandwidth and paying a 3B model's.
+- GPU execution of a *stage*, not just of a whole model. A consumer card has roughly fifty times a laptop's memory bandwidth, and the layer split is already the right shape to spread a model across several of them. This is the item that joins the split path to the accelerated path, which today do not meet.
+- Speculative decoding across the chain. A draft model proposes k tokens and the pipeline verifies them in one pass, so the weights are read once for k tokens instead of once each. It is the only item here that shortens *single-stream* latency on a distributed model rather than raising throughput.
+- Latency-aware stage ordering. Follows from the Priority 6 routing item: the scoring exists, the reordering does not. Worth roughly a fifth of a token's wall time on a wide-area mesh and nothing on a LAN.
+- Continuous batching. Keeps every stage busy with several requests in flight, which is what makes the aggregate throughput of a long pipeline usable for agents and batch runs.
+
 ## North-star demonstration
 
 Run an AI model that **none of the participating machines can run individually**, using only compute contributed by community nodes and credits previously earned through contribution.

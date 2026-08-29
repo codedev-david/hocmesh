@@ -46,6 +46,13 @@ genuinely has neither a head nor an embedding table.
   it takes token ids directly — but llama.cpp refuses to load a model without
   it, so without these entries the fixture could not be handed to the reference
   implementation at all.
+- **`docs/PERFORMANCE.md`** works out what the engine's speed can and cannot
+  become. Decoding is bound by memory bandwidth, so splitting a model across
+  machines buys capacity and aggregate throughput but leaves a single stream
+  exactly as fast as one machine would be; the document has the arithmetic, the
+  measurements taken against llama.cpp on this hardware, and the ordered plan,
+  which is also now Priority 9 in the roadmap. It says plainly which target is
+  unreachable, because the arithmetic does not negotiate.
 
 ## 0.5.0
 

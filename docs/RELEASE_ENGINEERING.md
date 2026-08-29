@@ -91,3 +91,8 @@ Reproducible-build notes:
 - Avoid embedding local absolute paths, machine-specific timestamps, or private
   validator configuration into release artifacts.
 - Preserve `Cargo.lock` for application releases.
+- Run `scripts/checksums.sh` after staging a release commit and before making
+  it. `SHA256SUMS.txt` hashes the tracked source tree, so it is only true of the
+  commit it ships in; regenerating it afterwards, or not at all, leaves a file
+  that states hashes with authority and is wrong. Nothing in CI verifies it,
+  which is exactly why it has to be part of the procedure.
