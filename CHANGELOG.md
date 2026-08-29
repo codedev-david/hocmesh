@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.5.1
+
+### The forward pass is now checked against an implementation nobody here wrote
+
+0.5.0 shipped the engine and proved that splitting a model changes nothing.
+That proof compared hocMESH against hocMESH: if the attention layout or a
+dequantiser had been wrong, a split model would have reproduced a whole model's
+mistake exactly and every assertion would still have passed. This release
+closes that gap, and closing it found a real bug.
+
+- **New test `reference_parity.rs`** drives llama.cpp as a server and feeds it
+  token ids rather than text, so no tokeniser sits between the two
+  implementations and a tokenising difference cannot be mistaken for an
+  arithmetic one. On f32 weights the unsplit engine generates exactly what
+  llama.cpp generates; so does a three-stage split, compared against llama.cpp
+  running the model whole. Every quantised format — `q4_0`, `q4_1`, `q5_0`,
+  `q5_1`, `q8_0`, `f16`, `bf16` — decodes bit-identically to llama.cpp's own
+  decoding, checked element by element on every tensor.
+- **CI installs the reference implementation and sets
+  `HOCMESH_REQUIRE_REFERENCE=1`**, so a missing llama.cpp fails the build rather
+  than skipping the comparison. A skip and a pass look identical in a log.
+
+### Fixed: a model with a tied output head could not be split
+
+Most small models — SmolLM2, Qwen3 0.6B, Llama 3.2 1B — have no
+`output.weight` and reuse the embedding table as the output head. The engine
+refused to load the last stage of such a model unless that same stage also held
+block 0, which for any real split it does not. The whole class was
+unsplittable, and the fixture never caught it because the fixture writes a
+separate head by default.
+
+The check was asking the wrong question: it tested *where the stage sits*
+rather than *whether the table is there*. A shard already carries the shared
+tensors whichever end of the model it holds, so the table was present the whole
+time. `Stage::load` now reads it, and the refusal is kept only for a file that
+genuinely has neither a head nor an embedding table.
+
+### Also
+
+- **`model-fixture --weights`** writes the fixture in any supported format
+  (`f32`, `f16`, `bf16`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`) rather than
+  only f32, which is what lets the parity test cover the quantised paths.
+- **The fixture now carries tokenizer metadata.** The engine never reads it —
+  it takes token ids directly — but llama.cpp refuses to load a model without
+  it, so without these entries the fixture could not be handed to the reference
+  implementation at all.
+
 ## 0.5.0
 
 ### A model now runs across machines none of which hold it whole
