@@ -287,9 +287,24 @@ as a server and is fed token ids rather than text, so no tokeniser sits between
 the two implementations and a tokenising difference cannot be mistaken for an
 arithmetic one. On f32 weights the unsplit engine generates exactly what
 llama.cpp generates; so does a three-stage split, compared against llama.cpp
-running the model whole. Separately, every quantised format — `q4_0`, `q4_1`,
-`q5_0`, `q5_1`, `q8_0`, `f16`, `bf16` — decodes bit-identically to llama.cpp's
+running the model whole. Separately, every quantised format this engine reads
+— `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `f16`, `bf16`, and the k-quants
+`Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K` — decodes bit-identically to llama.cpp's
 own decoding of the same bytes, checked element by element on every tensor.
+
+The k-quants are checked separately and on a wider fixture, because a k-quant
+super-block is 256 elements across and llama.cpp will not store a row that is
+not a multiple of that — it quietly picks another type instead. The assertion
+is over *types decoded* rather than tensors compared, since asking for
+`q4_k_m` gets a per-tensor mixture: a count could not tell "Q4_K decoded
+correctly" apart from "nothing in this file was Q4_K".
+
+This build reads the k-quants and deliberately does not write them.
+Quantising well is a search for per-sub-block scales, not a formula, and a
+worse encoder would produce files that load, run at full speed, and generate
+measurably worse text than the same model quantised by llama.cpp — with
+nothing to report as an error. `quantize` therefore refuses them by name and
+says what to use instead.
 
 Two limits are deliberate. Quantised *generation* is not compared, because
 llama.cpp does not decode to f32 and multiply there; it quantises the

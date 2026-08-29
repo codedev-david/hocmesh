@@ -30,6 +30,7 @@ use anyhow::{Context, Result, bail};
 use hocmesh_gpu::runtime;
 use serde::Deserialize;
 use std::{
+    collections::BTreeSet,
     env, fs,
     net::TcpListener,
     path::{Path, PathBuf},
@@ -293,11 +294,11 @@ fn every_quantised_format_decodes_to_exactly_what_llama_cpp_decodes() -> Result<
         let compared = compare_tensors(&quantised, &restored)
             .with_context(|| format!("comparing {format} against llama.cpp's own decoding"))?;
         assert!(
-            compared > 0,
+            !compared.is_empty(),
             "no tensor in the {format} file was actually stored as {format}, \
              so this comparison checked nothing"
         );
-        checked.push((format, compared));
+        checked.push((format, kind_names(&compared)));
     }
 
     // If llama.cpp wrote none of them the loop above proved nothing, and a test
@@ -362,8 +363,14 @@ fn quantised_generation_is_not_compared_because_the_fixture_is_nearly_tied() -> 
 
 /// Decode every quantised tensor of `quantised` with our decoder and compare it
 /// against the same tensor in `restored`, which llama.cpp decoded itself.
-/// Returns how many tensors were actually compared.
-fn compare_tensors(quantised: &Path, restored: &Path) -> Result<usize> {
+///
+/// Returns the set of GGML type codes actually decoded, not a count. Asking
+/// llama.cpp for `q4_k_m` does not get a file full of Q4_K -- it picks a type
+/// per tensor, and on a tensor it will not quantise it picks something else
+/// entirely. A count cannot tell the difference between "Q4_K decoded
+/// correctly" and "nothing in this file was Q4_K", and the second one is how a
+/// decoder test passes while checking nothing.
+fn compare_tensors(quantised: &Path, restored: &Path) -> Result<BTreeSet<u32>> {
     use hocmesh_model::gguf;
 
     let left = fs::read(quantised)?;
@@ -371,7 +378,7 @@ fn compare_tensors(quantised: &Path, restored: &Path) -> Result<usize> {
     let left_dir = gguf::tensor_directory(&left)?.context("no tensor directory")?;
     let right_dir = gguf::tensor_directory(&right)?.context("no tensor directory")?;
 
-    let mut compared = 0;
+    let mut compared = BTreeSet::new();
     for tensor in &left_dir.tensors {
         // Tensors llama.cpp left as f32 -- the norms, and anything too small to
         // be worth quantising -- say nothing about a decoder.
@@ -401,9 +408,220 @@ fn compare_tensors(quantised: &Path, restored: &Path) -> Result<usize> {
                 tensor.name
             );
         }
-        compared += 1;
+        compared.insert(tensor.kind);
     }
     Ok(compared)
+}
+
+/// The same claim for the k-quants, which is where most real model files live.
+///
+/// Split from the plain formats because it needs a differently shaped fixture.
+/// A k-quant super-block is 256 elements wide and llama.cpp will not store a
+/// row that is not a multiple of that -- it silently picks another type
+/// instead. The narrow fixture the rest of this file uses would therefore
+/// produce a file with no k-quant tensor in it at all, and a decoder test that
+/// decodes nothing passes.
+///
+/// That is also why the assertion at the end is about *types* rather than
+/// tensors: asking for `q4_k_m` gets a mixture chosen per tensor, so the only
+/// way to know Q2_K through Q6_K were each exercised is to record what was
+/// actually decoded and require all five.
+///
+/// Bit-exactness again, for the same reason: unpacking six-bit scales that
+/// straddle byte boundaries has no rounding freedom, and a tolerance would
+/// hide precisely the off-by-one-field mistakes this exists to catch.
+#[test]
+fn every_k_quant_decodes_to_exactly_what_llama_cpp_decodes() -> Result<()> {
+    let workspace = workspace_root()?;
+    let Some(reference) = reference(&workspace) else {
+        return skip();
+    };
+    build_node(&workspace)?;
+    let node = workspace.join("target").join("debug").join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let home = tmp.path.join("home");
+    let source = tmp.path.join("f32.gguf");
+    write_wide_fixture(&node, &home, &source)?;
+
+    let mut checked = Vec::new();
+    let mut decoded = BTreeSet::new();
+    for format in ["q2_k", "q3_k_m", "q4_k_m", "q5_k_m", "q6_k"] {
+        let quantised = tmp.path.join(format!("{format}.gguf"));
+        let restored = tmp.path.join(format!("{format}-back.gguf"));
+
+        let written = Command::new(&reference.quantize)
+            .arg(&source)
+            .arg(&quantised)
+            .arg(format)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?
+            .success();
+        if !written {
+            eprintln!("llama.cpp will not write {format} here; skipping it");
+            continue;
+        }
+        run_ok(
+            Command::new(&reference.quantize)
+                .arg("--allow-requantize")
+                .arg(&quantised)
+                .arg(&restored)
+                .arg("f32"),
+            "llama-quantize back to f32",
+        )?;
+
+        let compared = compare_tensors(&quantised, &restored)
+            .with_context(|| format!("comparing {format} against llama.cpp's own decoding"))?;
+        assert!(
+            !compared.is_empty(),
+            "no tensor in the {format} file was stored quantised at all"
+        );
+        checked.push((format, kind_names(&compared)));
+        decoded.extend(compared);
+    }
+
+    // The point of the assertion. Anything missing here is a decoder this file
+    // did not check, however many tensors it compared.
+    let wanted = BTreeSet::from([
+        hocmesh_engine::dequant::Q2_K,
+        hocmesh_engine::dequant::Q3_K,
+        hocmesh_engine::dequant::Q4_K,
+        hocmesh_engine::dequant::Q5_K,
+        hocmesh_engine::dequant::Q6_K,
+    ]);
+    let missing = wanted.difference(&decoded).copied().collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "no tensor was stored as {:?}, so those decoders are unchecked; \
+         llama.cpp wrote {checked:?}",
+        kind_names(&missing.into_iter().collect())
+    );
+    eprintln!("decoded identically to llama.cpp: {checked:?}");
+    Ok(())
+}
+
+/// A k-quant file written by llama.cpp loads and generates, end to end.
+///
+/// The decoder being bit-exact is a claim about `dequantize`. It says nothing
+/// about whether a real `q4_k_m` file -- the form most published models
+/// actually ship in -- gets as far as the decoder, because a second gate reads
+/// the type code at load time and used to refuse these outright. A decoder
+/// nothing can reach is not support.
+///
+/// So this runs the model, and asserts the logits differ from the same
+/// fixture in f32: identical logits would mean the quantised weights never
+/// reached the arithmetic, which is exactly how a load path that silently
+/// substituted something else would look.
+#[test]
+fn a_k_quant_model_from_llama_cpp_loads_and_generates() -> Result<()> {
+    let workspace = workspace_root()?;
+    let Some(reference) = reference(&workspace) else {
+        return skip();
+    };
+    build_node(&workspace)?;
+    let node = workspace.join("target").join("debug").join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let home = tmp.path.join("home");
+    let source = tmp.path.join("f32.gguf");
+    write_wide_fixture(&node, &home, &source)?;
+
+    let quantised = tmp.path.join("q4_k_m.gguf");
+    run_ok(
+        Command::new(&reference.quantize)
+            .arg(&source)
+            .arg(&quantised)
+            .arg("q4_k_m"),
+        "llama-quantize to q4_k_m",
+    )?;
+
+    // A mixture, as llama.cpp chooses it: this file holds Q4_K and Q6_K
+    // tensors, so running it exercises two decoders through the load path
+    // rather than one.
+    let kinds = stored_kinds(&quantised)?;
+    assert!(
+        kinds.contains(&hocmesh_engine::dequant::Q4_K),
+        "llama.cpp wrote no Q4_K tensor, so this runs an ordinary file: \
+         {:?}",
+        kind_names(&kinds)
+    );
+
+    let mut runs = Vec::new();
+    for model in [&source, &quantised] {
+        runs.push(serde_json::from_str::<Generated>(&run_capture(
+            node_command(&node, &home)
+                .arg("stage-run")
+                .arg("--model")
+                .arg(model)
+                .arg("--tokens")
+                .arg("3,17,5")
+                .arg("--max-new-tokens")
+                .arg("4"),
+            "stage-run",
+        )?)?);
+    }
+
+    for run in &runs {
+        assert_eq!(
+            run.tokens.len(),
+            7,
+            "a three-token prompt plus four new ones is seven: {:?}",
+            run.tokens
+        );
+    }
+    assert_ne!(
+        runs[0].logits_sha256, runs[1].logits_sha256,
+        "a q4_k_m file produced logits bit-identical to f32, which would mean \
+         its weights are not reaching the arithmetic at all"
+    );
+    eprintln!("ran a q4_k_m file holding {:?}", kind_names(&kinds));
+    Ok(())
+}
+
+/// Which GGML types a file actually stores, ignoring the f32 norms.
+fn stored_kinds(model: &Path) -> Result<BTreeSet<u32>> {
+    let bytes = fs::read(model)?;
+    let directory =
+        hocmesh_model::gguf::tensor_directory(&bytes)?.context("no tensor directory")?;
+    Ok(directory
+        .tensors
+        .iter()
+        .map(|tensor| tensor.kind)
+        .filter(|kind| *kind != hocmesh_engine::dequant::F32)
+        .collect())
+}
+
+/// GGML type codes as their names, so a failure says `Q4_K` and not `12`.
+fn kind_names(kinds: &BTreeSet<u32>) -> Vec<String> {
+    kinds
+        .iter()
+        .map(|kind| hocmesh_engine::dequant::type_name(*kind).to_string())
+        .collect()
+}
+
+/// A fixture whose every row is a multiple of the 256-element k-quant
+/// super-block, so llama.cpp stores k-quants rather than falling back.
+fn write_wide_fixture(node: &Path, home: &Path, output: &Path) -> Result<()> {
+    run_ok(
+        node_command(node, home)
+            .arg("model-fixture")
+            .arg("--output")
+            .arg(output)
+            .arg("--weights")
+            .arg("f32")
+            .arg("--family")
+            .arg("llama")
+            // 256 wide, 512 deep in the feed-forward, 512 vocabulary entries:
+            // every tensor's leading dimension is then 256 or 512.
+            .arg("--embedding-length")
+            .arg("256")
+            .arg("--feed-forward-length")
+            .arg("512")
+            .arg("--vocab")
+            .arg("512"),
+        "model-fixture (k-quant width)",
+    )
 }
 
 /// Both implementations must have generated the whole run before their

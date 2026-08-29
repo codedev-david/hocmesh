@@ -2,6 +2,34 @@
 
 ## 0.5.1
 
+### The k-quants load, which is most published models
+
+`q4_k_m` and its relatives are what models on Hugging Face actually ship as —
+four of the six entries in this build's own catalogue default to it — and until
+now every one of them was refused at load. The engine read the eight formats
+whose blocks are a flat scale and a run of nibbles, and a k-quant is not that:
+it is a 256-element super-block carrying sixteen sub-block scales packed six
+bits at a time across byte boundaries, plus a second scale for the minimum.
+
+- **`Q2_K`, `Q3_K`, `Q4_K`, `Q5_K` and `Q6_K` now decode**, including the
+  six-bit scale/minimum unpacking shared by `Q4_K` and `Q5_K` and the
+  `kmask1`/`kmask2` scale reconstruction `Q3_K` uses.
+- **Each one is checked against llama.cpp**, bit for bit, on every tensor of a
+  file llama.cpp quantised itself. Bit-exactness rather than closeness: this is
+  integer unpacking and one multiply, so there is no rounding freedom, and a
+  tolerance would hide precisely the off-by-one-field mistakes worth catching.
+  The test asserts over the *set of types decoded*, because `q4_k_m` produces a
+  per-tensor mixture and a tensor count cannot distinguish a correct decoder
+  from an absent one.
+- **A `q4_k_m` file written by llama.cpp now loads and generates end to end**,
+  which the decoder being right does not by itself establish — a second gate at
+  load time used to refuse these outright, and a decoder nothing can reach is
+  not support.
+- **Reading and writing are now separate permissions.** `quantize` refuses the
+  k-quants by name and says to use llama.cpp instead. A formula-based encoder
+  would emit files that load and run and quietly generate worse text than the
+  same model quantised properly, and nothing anywhere would call that an error.
+
 ### The forward pass is now checked against an implementation nobody here wrote
 
 0.5.0 shipped the engine and proved that splitting a model changes nothing.

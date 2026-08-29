@@ -5,13 +5,26 @@
 //! layouts are exact and small, and they are reproduced here rather than
 //! linked against so that a stage can be executed by this repository alone.
 //!
-//! Only the types whose layout is simple enough to state completely are
-//! implemented. The k-quants (`Q2_K` through `Q8_K`) and the i-quants carry
-//! per-sub-block scale codebooks, and a subtly wrong reconstruction of one of
-//! them would produce activations that are wrong without being detectably
-//! wrong -- the exact failure [`hocmesh_model::gguf::block_layout`] refuses to
-//! risk by returning `None` for a type it does not know. So an unsupported
-//! type is an error naming itself, never a best effort.
+//! Two groups are implemented. The plain block types (`Q4_0` through `Q8_0`)
+//! carry one scale per 32 elements. The k-quants (`Q2_K` through `Q6_K`) carry
+//! a super-block of 256 with its own scale *and* a second, quantised level of
+//! per-sub-block scales packed six bits at a time across byte boundaries --
+//! which is why `q4_k_m` files are the ones most models actually ship as, and
+//! why refusing them meant refusing most of the catalogue.
+//!
+//! A subtly wrong reconstruction of any of them produces activations that are
+//! wrong without being detectably wrong: no crash, no warning, just different
+//! text. That is the failure [`hocmesh_model::gguf::block_layout`] refuses to
+//! risk by returning `None` for a type it does not know, and it is why every
+//! type here is checked against llama.cpp's own decoder, bit for bit, by
+//! `every_quantised_format_decodes_to_exactly_what_llama_cpp_decodes` and
+//! `every_k_quant_decodes_to_exactly_what_llama_cpp_decodes` rather than
+//! against a hand-written expectation that shares an author with the decoder. An unsupported type is still an error naming itself, never a best
+//! effort.
+//!
+//! `Q8_K` is deliberately absent. It exists only as an intermediate for
+//! integer dot products and is never stored in a file, so implementing it
+//! would add a path nothing can reach and nothing can test.
 //!
 //! Format reference: <https://github.com/ggml-org/ggml/blob/master/src/ggml-common.h>
 
@@ -25,7 +38,16 @@ pub const Q4_1: u32 = 3;
 pub const Q5_0: u32 = 6;
 pub const Q5_1: u32 = 7;
 pub const Q8_0: u32 = 8;
+pub const Q2_K: u32 = 10;
+pub const Q3_K: u32 = 11;
+pub const Q4_K: u32 = 12;
+pub const Q5_K: u32 = 13;
+pub const Q6_K: u32 = 14;
 pub const BF16: u32 = 30;
+
+/// Elements in one k-quant super-block. Every k-quant type uses this, which is
+/// also why a tensor whose row is not a multiple of it cannot be stored as one.
+const QK_K: usize = 256;
 
 /// Resolve the name a person would type to the code the format uses.
 ///
@@ -51,6 +73,23 @@ pub fn kind_by_name(name: &str) -> anyhow::Result<u32> {
 /// Whether [`dequantize`] can reconstruct this GGML type code.
 #[must_use]
 pub fn is_supported(kind: u32) -> bool {
+    matches!(
+        kind,
+        F32 | F16 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2_K | Q3_K | Q4_K | Q5_K | Q6_K | BF16
+    )
+}
+
+/// Whether [`quantize`] can *produce* this GGML type code.
+///
+/// A strict subset of [`is_supported`], and the two must not be conflated.
+/// Reading a k-quant is unpacking a documented layout; writing one well means
+/// searching for the scales that minimise error across a super-block, which
+/// llama.cpp does with a different algorithm per type. A naive encoder here
+/// would produce files that load, run, and generate worse text than the same
+/// model quantised properly -- so this build reads k-quants and declines to
+/// write them.
+#[must_use]
+pub fn can_quantize(kind: u32) -> bool {
     matches!(kind, F32 | F16 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | BF16)
 }
 
@@ -67,11 +106,11 @@ pub fn type_name(kind: u32) -> &'static str {
         Q5_1 => "Q5_1",
         Q8_0 => "Q8_0",
         9 => "Q8_1",
-        10 => "Q2_K",
-        11 => "Q3_K",
-        12 => "Q4_K",
-        13 => "Q5_K",
-        14 => "Q6_K",
+        Q2_K => "Q2_K",
+        Q3_K => "Q3_K",
+        Q4_K => "Q4_K",
+        Q5_K => "Q5_K",
+        Q6_K => "Q6_K",
         15 => "Q8_K",
         16..=23 | 29 => "an i-quant",
         24 => "I8",
@@ -138,7 +177,8 @@ pub fn dequantize(kind: u32, data: &[u8], out: &mut [f32]) -> Result<()> {
     ensure!(
         is_supported(kind),
         "GGML type {} ({kind}) is not one this engine can execute; \
-         requantise the model to Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, F16, BF16 or F32",
+         requantise the model to Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_0, Q4_0, \
+         Q4_1, Q5_0, Q5_1, F16, BF16 or F32",
         type_name(kind)
     );
     let per_block = layout.elements as usize;
@@ -256,9 +296,227 @@ pub fn dequantize(kind: u32, data: &[u8], out: &mut [f32]) -> Result<()> {
                 }
             }
         }
+        // 256 elements as two f16 super-block scales -- one for the values,
+        // one for the minimums -- twelve bytes holding eight 6-bit scale/min
+        // pairs, and 128 bytes of nibbles. The sub-block scales are what make
+        // this type worth having and what make it easy to get wrong: they are
+        // six bits each, so half of them straddle a byte boundary and are
+        // reassembled from two places.
+        Q4_K => {
+            for (block, out) in data
+                .chunks_exact(144)
+                .zip(out.chunks_exact_mut(QK_K))
+                .take(blocks)
+            {
+                let d = f16_to_f32(le_u16(block, 0));
+                let dmin = f16_to_f32(le_u16(block, 2));
+                let scales = &block[4..16];
+                let qs = &block[16..144];
+                for pair in 0..4 {
+                    let (sc, m) = scale_min_k4(pair * 2, scales);
+                    let (d1, m1) = (d * f32::from(sc), dmin * f32::from(m));
+                    let (sc, m) = scale_min_k4(pair * 2 + 1, scales);
+                    let (d2, m2) = (d * f32::from(sc), dmin * f32::from(m));
+                    let q = &qs[pair * 32..pair * 32 + 32];
+                    let out = &mut out[pair * 64..pair * 64 + 64];
+                    for (i, byte) in q.iter().enumerate() {
+                        out[i] = d1 * f32::from(byte & 0x0f) - m1;
+                        out[i + 32] = d2 * f32::from(byte >> 4) - m2;
+                    }
+                }
+            }
+        }
+        // Q4_K plus a fifth bit per element. The extra bits sit in a 32-byte
+        // field where the bit selected advances two places per 64 elements, so
+        // one byte of it serves four different sub-blocks.
+        Q5_K => {
+            for (block, out) in data
+                .chunks_exact(176)
+                .zip(out.chunks_exact_mut(QK_K))
+                .take(blocks)
+            {
+                let d = f16_to_f32(le_u16(block, 0));
+                let dmin = f16_to_f32(le_u16(block, 2));
+                let scales = &block[4..16];
+                let qh = &block[16..48];
+                let qs = &block[48..176];
+                for pair in 0..4 {
+                    let (sc, m) = scale_min_k4(pair * 2, scales);
+                    let (d1, m1) = (d * f32::from(sc), dmin * f32::from(m));
+                    let (sc, m) = scale_min_k4(pair * 2 + 1, scales);
+                    let (d2, m2) = (d * f32::from(sc), dmin * f32::from(m));
+                    // Derived from `pair` rather than shifted in place: the
+                    // fourth iteration would shift the high mask out of a u8
+                    // entirely, which is a panic in debug and a silent zero in
+                    // release.
+                    let (low_bit, high_bit) = (1u8 << (pair * 2), 2u8 << (pair * 2));
+                    let q = &qs[pair * 32..pair * 32 + 32];
+                    let out = &mut out[pair * 64..pair * 64 + 64];
+                    for (i, byte) in q.iter().enumerate() {
+                        let low = (byte & 0x0f) + if qh[i] & low_bit != 0 { 16 } else { 0 };
+                        let high = (byte >> 4) + if qh[i] & high_bit != 0 { 16 } else { 0 };
+                        out[i] = d1 * f32::from(low) - m1;
+                        out[i + 32] = d2 * f32::from(high) - m2;
+                    }
+                }
+            }
+        }
+        // Six bits per element -- four low in a nibble, two high in a shared
+        // byte -- with a signed 8-bit scale per 16 elements and one f16 scale
+        // over the whole super-block. Unlike the other k-quants this one is
+        // symmetric: the stored value is biased by 32 rather than offset by a
+        // separate minimum, so there is no `dmin`.
+        Q6_K => {
+            for (block, out) in data
+                .chunks_exact(210)
+                .zip(out.chunks_exact_mut(QK_K))
+                .take(blocks)
+            {
+                let d = f16_to_f32(le_u16(block, 208));
+                for half in 0..2 {
+                    let ql = &block[half * 64..half * 64 + 64];
+                    let qh = &block[128 + half * 32..128 + half * 32 + 32];
+                    let sc = &block[192 + half * 8..192 + half * 8 + 8];
+                    let out = &mut out[half * 128..half * 128 + 128];
+                    for i in 0..32 {
+                        let group = i / 16;
+                        let parts = [
+                            (i, i32::from(ql[i] & 0x0f) | (i32::from(qh[i] & 3) << 4), 0),
+                            (
+                                i + 32,
+                                i32::from(ql[i + 32] & 0x0f) | (i32::from((qh[i] >> 2) & 3) << 4),
+                                2,
+                            ),
+                            (
+                                i + 64,
+                                i32::from(ql[i] >> 4) | (i32::from((qh[i] >> 4) & 3) << 4),
+                                4,
+                            ),
+                            (
+                                i + 96,
+                                i32::from(ql[i + 32] >> 4) | (i32::from(qh[i] >> 6) << 4),
+                                6,
+                            ),
+                        ];
+                        for (at, value, scale_offset) in parts {
+                            let scale = f32::from(sc[group + scale_offset] as i8);
+                            out[at] = d * scale * (value - 32) as f32;
+                        }
+                    }
+                }
+            }
+        }
+        // Two bits per element, with a 4-bit scale and a 4-bit minimum packed
+        // into one byte per 16 elements. The four two-bit fields of a byte are
+        // elements 32 apart, not adjacent.
+        Q2_K => {
+            for (block, out) in data
+                .chunks_exact(84)
+                .zip(out.chunks_exact_mut(QK_K))
+                .take(blocks)
+            {
+                let d = f16_to_f32(le_u16(block, 80));
+                let dmin = f16_to_f32(le_u16(block, 82));
+                let scales = &block[0..16];
+                for half in 0..2 {
+                    let q = &block[16 + half * 32..16 + half * 32 + 32];
+                    for j in 0..4 {
+                        let shift = 2 * j;
+                        for lane in 0..2 {
+                            let packed = scales[half * 8 + j * 2 + lane];
+                            let dl = d * f32::from(packed & 0x0f);
+                            let ml = dmin * f32::from(packed >> 4);
+                            let at = half * 128 + j * 32 + lane * 16;
+                            for i in 0..16 {
+                                let value = (q[lane * 16 + i] >> shift) & 3;
+                                out[at + i] = dl * f32::from(value) - ml;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Three bits per element: two low bits in a shared byte and one high
+        // bit in a mask whose sense is inverted -- a set bit means "do not
+        // subtract 4". The sixteen 6-bit scales are packed across twelve bytes
+        // in an order that is not the obvious one, which `q3_k_scales` undoes.
+        Q3_K => {
+            for (block, out) in data
+                .chunks_exact(110)
+                .zip(out.chunks_exact_mut(QK_K))
+                .take(blocks)
+            {
+                let d = f16_to_f32(le_u16(block, 108));
+                let hmask = &block[0..32];
+                let scales = q3_k_scales(&block[96..108]);
+                for half in 0..2 {
+                    let q = &block[32 + half * 32..32 + half * 32 + 32];
+                    for j in 0..4 {
+                        let shift = 2 * j;
+                        let high_bit = 1u8 << (half * 4 + j);
+                        for lane in 0..2 {
+                            let scale = f32::from(scales[half * 8 + j * 2 + lane]) - 32.0;
+                            let dl = d * scale;
+                            let at = half * 128 + j * 32 + lane * 16;
+                            for i in 0..16 {
+                                let source = lane * 16 + i;
+                                let low = i32::from((q[source] >> shift) & 3);
+                                let carry = if hmask[source] & high_bit != 0 { 0 } else { 4 };
+                                out[at + i] = dl * (low - carry) as f32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         _ => bail!("unreachable: {} passed the support check", type_name(kind)),
     }
     Ok(())
+}
+
+/// One 6-bit scale and one 6-bit minimum out of a Q4_K/Q5_K scale field.
+///
+/// The first four pairs are whole bytes masked to six bits. The last four are
+/// split: four low bits come from the byte at `j + 4`, and the two high bits
+/// come from the top of a byte in the first half. Reading the second group as
+/// if it were the first is the classic way to get this type wrong, and it
+/// produces weights that are merely a bit off rather than obviously broken.
+fn scale_min_k4(j: usize, packed: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (packed[j] & 63, packed[j + 4] & 63)
+    } else {
+        (
+            (packed[j + 4] & 0x0f) | ((packed[j - 4] >> 6) << 4),
+            (packed[j + 4] >> 4) | ((packed[j] >> 6) << 4),
+        )
+    }
+}
+
+/// The sixteen 6-bit scales of a Q3_K super-block, unpacked.
+///
+/// Twelve bytes hold sixteen values. The low four bits of each scale live in
+/// the first eight bytes, and the high two bits are gathered four-at-a-time
+/// from the last four -- so a scale is assembled from two bytes that are not
+/// adjacent. Reproduced from llama.cpp's word-at-a-time form because the
+/// interleave is defined by that arithmetic, not by any simpler rule.
+fn q3_k_scales(packed: &[u8]) -> [u8; 16] {
+    const LOW_TWO: u32 = 0x0303_0303;
+    const LOW_FOUR: u32 = 0x0f0f_0f0f;
+    let word = |at: usize| {
+        u32::from_le_bytes([packed[at], packed[at + 1], packed[at + 2], packed[at + 3]])
+    };
+    let (first, second, high) = (word(0), word(4), word(8));
+    let words = [
+        (first & LOW_FOUR) | ((high & LOW_TWO) << 4),
+        (second & LOW_FOUR) | (((high >> 2) & LOW_TWO) << 4),
+        ((first >> 4) & LOW_FOUR) | (((high >> 4) & LOW_TWO) << 4),
+        ((second >> 4) & LOW_FOUR) | (((high >> 6) & LOW_TWO) << 4),
+    ];
+    let mut out = [0u8; 16];
+    for (word, chunk) in words.iter().zip(out.chunks_exact_mut(4)) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    out
 }
 
 /// Quantise `values` into `kind`, for building test fixtures.
@@ -269,7 +527,13 @@ pub fn dequantize(kind: u32, data: &[u8], out: &mut [f32]) -> Result<()> {
 /// test can build a model file whose weights it knows exactly, and so
 /// round-tripping is testable without shipping a fixture.
 pub fn quantize(kind: u32, values: &[f32], out: &mut Vec<u8>) -> Result<()> {
-    ensure!(is_supported(kind), "cannot quantise to {}", type_name(kind));
+    ensure!(
+        can_quantize(kind),
+        "this build reads {} but does not write it; quantise with llama.cpp \
+         instead, whose encoder searches for the per-sub-block scales that a \
+         formula cannot find",
+        type_name(kind)
+    );
     let per_block = hocmesh_model::gguf::block_layout(kind)
         .map(|layout| layout.elements as usize)
         .unwrap_or(1);
@@ -526,12 +790,47 @@ mod tests {
 
     #[test]
     fn an_unsupported_type_says_so_rather_than_guessing() {
-        let error = dequantize(12, &[0; 144], &mut [0.0; 256])
+        // There are two gates and they say different things. A type whose
+        // block layout is known but has no decoder here -- Q8_K, an
+        // intermediate for integer dot products that never appears in a file,
+        // and the i-quants -- names itself and lists what to requantise to.
+        for kind in [15, 16] {
+            let error = dequantize(kind, &[0; 292], &mut [0.0; 256])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("this engine can execute"), "{error}");
+            assert!(error.contains(type_name(kind)), "{error}");
+            assert!(!is_supported(kind));
+        }
+
+        // A type with no known layout stops one gate earlier, because reading
+        // on would mean guessing a block size and so mixing one tensor's bytes
+        // into another's values.
+        let error = dequantize(999, &[0; 292], &mut [0.0; 256])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("Q4_K"), "{error}");
-        assert!(!is_supported(12));
+        assert!(error.contains("not one this build knows"), "{error}");
         assert!(is_supported(Q8_0));
+    }
+
+    #[test]
+    fn a_k_quant_can_be_read_but_not_written() {
+        // The split exists because the two are not the same problem: decoding
+        // is unpacking a documented layout, encoding well means searching for
+        // per-sub-block scales. Conflating them would let this build write
+        // files that load and generate worse text than the same model
+        // quantised properly -- which nothing would report as an error.
+        for kind in [Q2_K, Q3_K, Q4_K, Q5_K, Q6_K] {
+            assert!(is_supported(kind), "{}", type_name(kind));
+            assert!(!can_quantize(kind), "{}", type_name(kind));
+            let error = quantize(kind, &[0.0; 256], &mut Vec::new())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("does not write it"), "{error}");
+        }
+        for kind in [F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0] {
+            assert!(can_quantize(kind), "{}", type_name(kind));
+        }
     }
 
     #[test]
