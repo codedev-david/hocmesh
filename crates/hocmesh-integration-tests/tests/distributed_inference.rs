@@ -35,6 +35,15 @@ struct Generated {
     argmax_per_step: Vec<u32>,
 }
 
+/// What `stage-sessions` prints.
+#[derive(Debug, Clone, Deserialize)]
+struct SessionReport {
+    live: usize,
+    peak: usize,
+    #[allow(dead_code)]
+    capacity: usize,
+}
+
 /// What `model-shard` prints.
 #[derive(Debug, Clone, Deserialize)]
 struct ShardReport {
@@ -292,6 +301,207 @@ fn a_stage_refuses_to_run_layers_whose_bytes_it_does_not_have() -> Result<()> {
         "the refusal should say which bytes are absent, not merely fail: {message}"
     );
 
+    Ok(())
+}
+
+/// Several sequences in flight over one chain, each one still exactly itself.
+///
+/// The serial pipeline had one attention cache per stage and no way to tell one
+/// caller from another, so two prompts in flight at once would have written into
+/// the same history -- and the failure would not have looked like a failure. Both
+/// callers would have got fluent, plausible, wrong tokens back.
+///
+/// So this runs the prompts twice: once one after another, which is the
+/// definition of correct, and once all at the same time. Every byte of every
+/// logit has to match, and the results have to come back in the order the
+/// prompts were given rather than the order they finished.
+///
+/// `peak` is what stops this passing for the wrong reason. A chain that handed
+/// the sequences one cache between them, or ran them strictly one after
+/// another, would produce identical output and prove nothing; peak is the most
+/// caches that ever existed side by side, so it says the three histories were
+/// really held apart rather than merely taking turns. It is checked on the last
+/// stage as well as the first, because a session id that reached the head and
+/// not the tail would leave the tail mixing the sequences back together --
+/// which is exactly the bug this is here to catch.
+#[test]
+fn concurrent_sequences_over_one_chain_stay_separate_and_come_back_in_order() -> Result<()> {
+    const BLOCKS: u32 = 6;
+    const NEW_TOKENS: &str = "5";
+    // Different lengths as well as different tokens: prompts that took the same
+    // number of steps could interleave perfectly and still hide an off-by-one in
+    // whose position is whose.
+    const PROMPTS: [&str; 3] = ["3,17,5", "9", "2,7,7,1"];
+
+    let workspace = workspace_root()?;
+    build_node(&workspace)?;
+    let node = workspace.join("target").join("debug").join(exe("hocmesh"));
+
+    let tmp = TestDir::new()?;
+    let home = tmp.path.join("home");
+    let whole = tmp.path.join("model.gguf");
+
+    run_ok(
+        node_command(&node, &home)
+            .arg("model-fixture")
+            .arg("--output")
+            .arg(&whole)
+            .arg("--blocks")
+            .arg(BLOCKS.to_string()),
+        "model-fixture",
+    )?;
+    run_ok(
+        node_command(&node, &home)
+            .arg("model-import")
+            .arg(&whole)
+            .arg("--model-id")
+            .arg("fixture")
+            .arg("--format")
+            .arg("gguf")
+            .arg("--architecture")
+            .arg("llama")
+            .arg("--chunk-size")
+            .arg("32768"),
+        "model-import",
+    )?;
+
+    let ranges = [(0u32, 2u32), (2, 4), (4, 6)];
+    let mut shards = Vec::new();
+    for (start, end) in ranges {
+        let path = tmp.path.join(format!("stage-{start}-{end}.gguf"));
+        run_ok(
+            node_command(&node, &home)
+                .arg("model-shard")
+                .arg("--model-id")
+                .arg("fixture")
+                .arg("--blocks")
+                .arg(format!("{start}..{end}"))
+                .arg("--output")
+                .arg(&path),
+            "model-shard",
+        )?;
+        shards.push((start, end, path));
+    }
+
+    let ports = [free_port()?, free_port()?, free_port()?];
+    let mut servers = Vec::new();
+    for index in (0..shards.len()).rev() {
+        let (start, end, path) = &shards[index];
+        let mut command = node_command(&node, &home);
+        command
+            .arg("stage-serve")
+            .arg("--model")
+            .arg(path)
+            .arg("--blocks")
+            .arg(format!("{start}..{end}"))
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{}", ports[index]));
+        if index + 1 < shards.len() {
+            command
+                .arg("--next")
+                .arg(format!("http://127.0.0.1:{}", ports[index + 1]));
+        }
+        servers.push(ProcessGuard::spawn(&mut command)?);
+        wait_for_port(ports[index])?;
+    }
+    let head = format!("http://127.0.0.1:{}", ports[0]);
+    let tail = format!("http://127.0.0.1:{}", ports[2]);
+
+    // One at a time. This is the answer the concurrent run has to reproduce.
+    let mut alone = Vec::new();
+    for prompt in PROMPTS {
+        alone.push(serde_json::from_str::<Generated>(&run_capture(
+            node_command(&node, &home)
+                .arg("stage-run")
+                .arg("--head")
+                .arg(&head)
+                .arg("--tokens")
+                .arg(prompt)
+                .arg("--max-new-tokens")
+                .arg(NEW_TOKENS),
+            "stage-run over the chain",
+        )?)?);
+    }
+
+    // Three prompts that generate the same thing would make every comparison
+    // below true of a chain that ignored its input entirely.
+    let distinct = alone
+        .iter()
+        .map(|run| run.logits_sha256.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        distinct.len(),
+        PROMPTS.len(),
+        "the prompts do not produce different output, so nothing below \
+         distinguishes separate sequences from mixed-up ones: {distinct:?}"
+    );
+
+    // A caller that runs its prompts one after another never has two sequences
+    // alive at once -- which is what makes the peak after the concurrent run
+    // mean something.
+    let serial: SessionReport = serde_json::from_str(&run_capture(
+        node_command(&node, &home)
+            .arg("stage-sessions")
+            .arg("--stage")
+            .arg(&head),
+        "stage-sessions after the serial run",
+    )?)?;
+    assert_eq!(
+        serial.peak, 1,
+        "sequences overlapped during a run that sent them one at a time"
+    );
+    assert_eq!(
+        serial.live, 0,
+        "a finished sequence is still holding a cache: {serial:?}"
+    );
+
+    // All three at once.
+    let mut command = node_command(&node, &home);
+    command.arg("stage-run-many").arg("--head").arg(&head);
+    for prompt in PROMPTS {
+        command.arg("--tokens").arg(prompt);
+    }
+    let together: Vec<Generated> = serde_json::from_str(&run_capture(
+        command.arg("--max-new-tokens").arg(NEW_TOKENS),
+        "stage-run-many over the chain",
+    )?)?;
+
+    assert_eq!(
+        together.len(),
+        alone.len(),
+        "a prompt went missing between the two runs"
+    );
+    for (index, (concurrent, sequential)) in together.iter().zip(&alone).enumerate() {
+        assert_eq!(
+            concurrent, sequential,
+            "prompt {index} ({:?}) generated something different when it shared \
+             the chain with the others\n  alone:    {:?}\n  together: {:?}",
+            PROMPTS[index], sequential.argmax_per_step, concurrent.argmax_per_step
+        );
+    }
+
+    // ...and they really did share it, at both ends of the chain.
+    for (label, address) in [("head", &head), ("tail", &tail)] {
+        let report: SessionReport = serde_json::from_str(&run_capture(
+            node_command(&node, &home)
+                .arg("stage-sessions")
+                .arg("--stage")
+                .arg(address),
+            "stage-sessions after the concurrent run",
+        )?)?;
+        assert!(
+            report.peak > 1,
+            "the {label} stage never held more than one sequence at a time, so \
+             the caches under test never coexisted and the comparison above              proves nothing: {report:?}"
+        );
+        assert_eq!(
+            report.live, 0,
+            "the {label} stage is still holding caches for finished sequences, \
+             which is how a long-running chain reaches its cap: {report:?}"
+        );
+    }
+
+    drop(servers);
     Ok(())
 }
 

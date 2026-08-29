@@ -18,5 +18,5 @@ pub mod stage;
 pub mod weights;
 
 pub use config::{ModelConfig, RopeStyle};
-pub use stage::{Activation, Stage};
+pub use stage::{Activation, Session, Stage};
 pub use weights::{Tensor, WeightFile};

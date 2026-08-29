@@ -291,6 +291,35 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         max_new_tokens: usize,
     },
+    /// Run several prompts through one chain at the same time.
+    ///
+    /// Each prompt gets its own session on every stage, so they interleave over
+    /// the wire instead of queueing behind one another, and they finish in
+    /// whatever order they finish in. Results print in the order the prompts
+    /// were given, so the caller never has to reassemble anything.
+    ///
+    /// This raises throughput, not single-stream speed: token N+1 of a sequence
+    /// genuinely depends on token N and no amount of concurrency changes that.
+    /// What changes is that one sequence no longer blocks the others.
+    StageRunMany {
+        /// The head of a chain of stages, as `http://host:port`.
+        #[arg(long)]
+        head: String,
+        /// One prompt per flag: `--tokens 3,17,5 --tokens 9,1`.
+        #[arg(long, required = true)]
+        tokens: Vec<String>,
+        #[arg(long, default_value_t = 8)]
+        max_new_tokens: usize,
+    },
+    /// Ask a stage how many sequences it is carrying.
+    ///
+    /// `peak` is the interesting number: a caller that ran its prompts one
+    /// after another never drives it above one, however many it sent.
+    StageSessions {
+        /// The stage to ask, as `http://host:port`.
+        #[arg(long)]
+        stage: String,
+    },
     /// List the models `model-pull` knows by name.
     ModelCatalog,
     /// Download the pinned llama.cpp build for this machine.
@@ -1046,6 +1075,24 @@ stored at: {}",
                 ),
             };
             println!("{}", serde_json::to_string_pretty(&generated)?);
+        }
+        Command::StageRunMany {
+            head,
+            tokens,
+            max_new_tokens,
+        } => {
+            let prompts = tokens
+                .iter()
+                .map(|line| hocmesh::pipeline::parse_tokens(line))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let generated =
+                hocmesh::pipeline::generate_many_over_chain(&head, &prompts, max_new_tokens)
+                    .await?;
+            println!("{}", serde_json::to_string_pretty(&generated)?);
+        }
+        Command::StageSessions { stage } => {
+            let report = hocmesh::pipeline::stage_sessions(&stage).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::ModelCatalog => {
             println!(

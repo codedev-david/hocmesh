@@ -22,23 +22,27 @@ fn run(path: &std::path::Path, cuts: &[u32], tokens: &[u32]) -> Vec<Vec<f32>> {
     bounds.extend_from_slice(cuts);
     bounds.push(config.block_count);
 
-    let mut stages: Vec<Stage> = bounds
+    let stages: Vec<Stage> = bounds
         .windows(2)
         .map(|pair| {
             let mut file = WeightFile::open(path).expect("open model");
             Stage::load(&mut file, pair[0]..pair[1]).expect("load stage")
         })
         .collect();
+    // One session per stage, held across the whole run: the caches are what
+    // carry a sequence forward, so a fresh one per token would answer a
+    // different question.
+    let mut sessions: Vec<hocmesh_engine::Session> = stages.iter().map(Stage::session).collect();
 
     let mut out = Vec::new();
     for (position, token) in tokens.iter().enumerate() {
         let mut activation = stages[0].embed(&[*token], position as u32).expect("embed");
-        for stage in stages.iter_mut() {
+        for (stage, session) in stages.iter().zip(&mut sessions) {
             // Round-trip through the wire encoding on every hop, so the test
             // exercises the bytes a real pipeline would actually send.
             let framed = activation.to_bytes();
             let received = Activation::from_bytes(&framed).expect("decode activation");
-            activation = stage.forward(&received).expect("forward");
+            activation = stage.forward(session, &received).expect("forward");
         }
         let logits = stages
             .last()
@@ -194,19 +198,23 @@ fn grouped_query_attention_splits_the_same_way() {
 fn position_comes_from_the_activation_and_not_from_the_cache() {
     let (_dir, path) = model(Recipe::default());
     let mut file = WeightFile::open(&path).expect("open");
-    let mut stage = Stage::load(&mut file, 0..4).expect("load");
+    let stage = Stage::load(&mut file, 0..4).expect("load");
+    let mut session = stage.session();
 
     let first = stage.embed(&[11], 0).expect("embed");
-    let once = stage.forward(&first).expect("forward");
-    stage.reset();
-    let again = stage.forward(&first).expect("forward");
-    assert_eq!(once, again, "a reset stage did not repeat itself");
+    let once = stage.forward(&mut session, &first).expect("forward");
+    // A new session is the replacement for the old `reset`: the sequence is
+    // forgotten by dropping its cache, not by clearing one every other
+    // sequence on this stage is also reading.
+    let mut session = stage.session();
+    let again = stage.forward(&mut session, &first).expect("forward");
+    assert_eq!(once, again, "a fresh session did not repeat itself");
 
-    stage.reset();
+    let mut session = stage.session();
     // Position 0 must be present before position 1 can be: the cache is
     // append-only within a sequence, and a gap is an error rather than a hole.
     let ahead = stage.embed(&[11], 1).expect("embed");
-    let error = stage.forward(&ahead).unwrap_err().to_string();
+    let error = stage.forward(&mut session, &ahead).unwrap_err().to_string();
     assert!(error.contains("out of order"), "{error}");
 }
 

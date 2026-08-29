@@ -121,6 +121,42 @@ struct KvCache {
     values: Vec<f32>,
 }
 
+/// Everything one sequence remembers while it runs through a stage.
+///
+/// The weights a stage holds are the same for every caller; the keys and
+/// values are not. Keeping them here rather than on the `Stage` is the whole
+/// reason a stage can serve more than one sequence at once -- two sequences
+/// cannot corrupt each other's attention when neither can reach the other's
+/// cache, and a sequence that is abandoned half-way is forgotten by dropping
+/// this rather than by clearing state the other sequences are still using.
+///
+/// A session belongs to exactly one stage: it has one cache per block that
+/// stage holds, so handing it to a different stage is a length mismatch.
+#[derive(Default)]
+pub struct Session {
+    caches: Vec<KvCache>,
+}
+
+impl Session {
+    /// How many positions this sequence has already written.
+    ///
+    /// Read from the cache rather than counted separately, so it cannot
+    /// disagree with what attention will actually see.
+    #[must_use]
+    pub fn filled(&self, config: &ModelConfig) -> u32 {
+        let width = config.k_width().max(1) as usize;
+        self.caches
+            .first()
+            .map_or(0, |cache| (cache.keys.len() / width) as u32)
+    }
+
+    /// Whether this session has run at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.caches.iter().all(|cache| cache.keys.is_empty())
+    }
+}
+
 /// A loaded range of blocks, ready to run.
 pub struct Stage {
     pub config: ModelConfig,
@@ -129,7 +165,6 @@ pub struct Stage {
     output_norm: Option<Tensor>,
     output_head: Option<Tensor>,
     layers: Vec<BlockWeights>,
-    cache: Vec<KvCache>,
 }
 
 impl Stage {
@@ -236,7 +271,6 @@ impl Stage {
             )?;
             config.vocab_size = head.dimensions[1] as u32;
         }
-        let depth = layers.len();
         Ok(Stage {
             config,
             blocks,
@@ -244,7 +278,6 @@ impl Stage {
             output_norm,
             output_head,
             layers,
-            cache: (0..depth).map(|_| KvCache::default()).collect(),
         })
     }
 
@@ -259,10 +292,11 @@ impl Stage {
     }
 
     /// Forget the sequence so far. Called between prompts, never within one.
-    pub fn reset(&mut self) {
-        for cache in &mut self.cache {
-            cache.keys.clear();
-            cache.values.clear();
+    /// A fresh session for one sequence: an empty cache per block held here.
+    #[must_use]
+    pub fn session(&self) -> Session {
+        Session {
+            caches: (0..self.layers.len()).map(|_| KvCache::default()).collect(),
         }
     }
 
@@ -290,7 +324,7 @@ impl Stage {
     }
 
     /// Run this stage's blocks over an activation.
-    pub fn forward(&mut self, input: &Activation) -> Result<Activation> {
+    pub fn forward(&self, session: &mut Session, input: &Activation) -> Result<Activation> {
         let width = self.config.embedding_length as usize;
         ensure!(
             input.tokens > 0 && input.hidden.len() == input.tokens * width,
@@ -300,7 +334,7 @@ impl Stage {
         );
         let mut hidden = input.hidden.clone();
         for depth in 0..self.layers.len() {
-            self.run_block(depth, &mut hidden, input.position, input.tokens)?;
+            self.run_block(session, depth, &mut hidden, input.position, input.tokens)?;
         }
         Ok(Activation {
             position: input.position,
@@ -330,7 +364,8 @@ impl Stage {
     }
 
     fn run_block(
-        &mut self,
+        &self,
+        session: &mut Session,
         depth: usize,
         hidden: &mut [f32],
         position: u32,
@@ -351,7 +386,7 @@ impl Stage {
         let group = config.group_size() as usize;
         let scale = 1.0 / (key_length as f32).sqrt();
         let layer = &self.layers[depth];
-        let cache = &mut self.cache[depth];
+        let cache = &mut session.caches[depth];
 
         let mut normed = vec![0.0f32; width];
         let mut q = vec![0.0f32; q_width];

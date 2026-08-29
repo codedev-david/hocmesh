@@ -21,6 +21,7 @@
 //!   weight matrix that produces confident nonsense.
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use axum::http::HeaderMap;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -29,10 +30,19 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use hocmesh_engine::{Activation, ModelConfig, Stage, WeightFile};
+use hocmesh_engine::{Activation, ModelConfig, Session, Stage, WeightFile};
 use hocmesh_model::gguf::ByteExtent;
 use serde::{Deserialize, Serialize};
-use std::{ops::Range, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::Mutex;
 
 /// How long a stage waits on the stage after it.
@@ -41,6 +51,30 @@ use tokio::sync::Mutex;
 /// dead next hop surfaces as an error rather than as a request that never
 /// returns.
 const HOP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Which sequence a request belongs to.
+///
+/// Every stage keeps one attention cache per sequence, so two requests
+/// arriving at the same stage are told apart by this and by nothing else. It
+/// travels in a header rather than inside the activation because the
+/// activation format exists to carry exact float bits between machines, and
+/// routing metadata has no business in it.
+const SESSION_HEADER: &str = "x-hocmesh-session";
+
+/// The sequence a caller means when it names none.
+///
+/// A single-sequence caller -- which is every caller that predates sessions --
+/// keeps working unchanged and gets one cache, exactly as before.
+const DEFAULT_SESSION: &str = "default";
+
+/// How many sequences one stage will hold caches for at once.
+///
+/// A cache is memory, and nothing stops a caller inventing session ids, so
+/// there has to be a limit. Refusing a new sequence is the only safe way to
+/// enforce it: evicting an existing one would let its next token attend over a
+/// cache that quietly lost its history, and that reads exactly like a working
+/// run. Refusal is visible; silent truncation is not.
+const MAX_SESSIONS: usize = 64;
 
 /// What a stage says about itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +100,9 @@ pub struct StageInfo {
 pub struct TokenRequest {
     pub token: u32,
     pub position: u32,
+    /// Which sequence this token continues. Absent means the default one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// The sidecar written beside a partially materialised model.
@@ -160,7 +197,28 @@ pub fn chunks_for_blocks(
 /// One stage, ready to serve.
 #[derive(Clone)]
 pub struct StageState {
-    stage: Arc<Mutex<Stage>>,
+    /// The weights, which every sequence reads and none of them writes.
+    ///
+    /// This used to be behind a mutex, which meant one sequence at a time per
+    /// machine no matter how much of the machine was idle. Nothing about a
+    /// forward pass needs exclusive access to a weight, so nothing here takes
+    /// it: what is genuinely per-sequence moved to `Session`, and the lock
+    /// moved with it.
+    stage: Arc<Stage>,
+    /// One cache per live sequence, each behind its own lock.
+    ///
+    /// The outer lock is held only long enough to find a sequence; the inner
+    /// one is held for the length of a forward pass. So two sequences run at
+    /// the same time, and two requests for the *same* sequence still take
+    /// their turn -- which is what correctness requires, because a sequence's
+    /// cache is append-only and position N+1 cannot be computed before N.
+    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
+    /// The most sessions this stage has ever held at once.
+    ///
+    /// The observable difference between "these sequences ran concurrently" and
+    /// "these sequences ran one after another and each looked fine" -- a serial
+    /// caller never drives this above one, however many prompts it sends.
+    peak: Arc<AtomicUsize>,
     next: Option<String>,
     info: StageInfo,
 }
@@ -214,7 +272,9 @@ impl StageState {
             }
         );
         Ok(StageState {
-            stage: Arc::new(Mutex::new(stage)),
+            stage: Arc::new(stage),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            peak: Arc::new(AtomicUsize::new(0)),
             next,
             info,
         })
@@ -224,6 +284,59 @@ impl StageState {
     pub fn info(&self) -> &StageInfo {
         &self.info
     }
+
+    /// The cache for one sequence, created the first time it is named.
+    ///
+    /// Returns the handle and releases the map, so holding a session for a
+    /// whole forward pass never blocks a different sequence from finding its
+    /// own.
+    async fn session(&self, id: &str) -> Result<Arc<Mutex<Session>>, StageError> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(existing) = sessions.get(id) {
+            return Ok(Arc::clone(existing));
+        }
+        if sessions.len() >= MAX_SESSIONS {
+            return Err(StageError(anyhow!(
+                "this stage is already holding caches for {MAX_SESSIONS} sequences and will \
+                 not start {id:?}; finish or release a sequence first. Evicting one instead \
+                 would let it carry on with a cache that had silently lost its history"
+            )));
+        }
+        let session = Arc::new(Mutex::new(self.stage.session()));
+        sessions.insert(id.to_string(), Arc::clone(&session));
+        self.peak.fetch_max(sessions.len(), Ordering::Relaxed);
+        Ok(session)
+    }
+
+    /// How many sequences this stage is holding caches for, now and at most.
+    pub async fn session_report(&self) -> SessionReport {
+        SessionReport {
+            live: self.sessions.lock().await.len(),
+            peak: self.peak.load(Ordering::Relaxed),
+            capacity: MAX_SESSIONS,
+        }
+    }
+}
+
+/// What a stage will say about the sequences it is carrying.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionReport {
+    /// Sequences holding a cache right now.
+    pub live: usize,
+    /// The most that have ever held one at the same time.
+    pub peak: usize,
+    /// How many this stage will hold before refusing a new one.
+    pub capacity: usize,
+}
+
+/// The sequence a request names, or the default one.
+fn session_of(headers: &HeaderMap) -> String {
+    headers
+        .get(SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_SESSION)
+        .to_string()
 }
 
 /// An error on the wire, which is an error a caller can act on rather than a
@@ -248,11 +361,17 @@ pub fn stage_router(state: StageState) -> Router {
         .route("/stage/token", post(token))
         .route("/stage/forward", post(forward))
         .route("/stage/reset", post(reset))
+        .route("/stage/sessions", get(sessions))
         .with_state(state)
 }
 
 async fn info(State(state): State<StageState>) -> Json<StageInfo> {
     Json(state.info.clone())
+}
+
+/// How many sequences this stage is carrying.
+async fn sessions(State(state): State<StageState>) -> Json<SessionReport> {
+    Json(state.session_report().await)
 }
 
 /// Embed a token and start it down the chain. Only the head can do this: it is
@@ -261,8 +380,9 @@ async fn token(
     State(state): State<StageState>,
     Json(request): Json<TokenRequest>,
 ) -> Result<Vec<u8>, StageError> {
+    let session = request.session.clone().unwrap_or(DEFAULT_SESSION.into());
     let activation = {
-        let stage = state.stage.lock().await;
+        let stage = &state.stage;
         if !stage.is_first() {
             return Err(StageError(anyhow!(
                 "this stage holds blocks {}..{} and has no embedding table; \
@@ -273,33 +393,38 @@ async fn token(
         }
         stage.embed(&[request.token], request.position)?
     };
-    advance(&state, activation).await
+    advance(&state, &session, activation).await
 }
 
 /// Take an activation from the stage before, run this stage's blocks, and pass
 /// it on.
-async fn forward(State(state): State<StageState>, body: Bytes) -> Result<Vec<u8>, StageError> {
+async fn forward(
+    State(state): State<StageState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Vec<u8>, StageError> {
     let activation = Activation::from_bytes(&body)?;
-    advance(&state, activation).await
+    advance(&state, &session_of(&headers), activation).await
 }
 
 /// Run the blocks and either hand the result to the next stage or, at the tail,
 /// turn it into logits.
-async fn advance(state: &StageState, input: Activation) -> Result<Vec<u8>, StageError> {
+async fn advance(
+    state: &StageState,
+    session: &str,
+    input: Activation,
+) -> Result<Vec<u8>, StageError> {
     let output = {
-        let mut stage = state.stage.lock().await;
-        stage.forward(&input)?
+        let handle = state.session(session).await?;
+        let mut cache = handle.lock().await;
+        state.stage.forward(&mut cache, &input)?
     };
     match &state.next {
         Some(address) => {
             let body = output.to_bytes();
-            Ok(post_activation(address, body).await?)
+            Ok(post_activation(address, session, body).await?)
         }
-        None => {
-            let stage = state.stage.lock().await;
-            let logits = stage.logits(&output)?;
-            Ok(encode_f32(&logits))
-        }
+        None => Ok(encode_f32(&state.stage.logits(&output)?)),
     }
 }
 
@@ -308,11 +433,24 @@ async fn advance(state: &StageState, input: Activation) -> Result<Vec<u8>, Stage
 /// A stage that reset while its neighbours did not would silently answer from
 /// half a conversation, so this propagates rather than being something an
 /// operator has to remember to do on every machine.
-async fn reset(State(state): State<StageState>) -> Result<StatusCode, StageError> {
-    state.stage.lock().await.reset();
+async fn reset(
+    State(state): State<StageState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StageError> {
+    // A named sequence is forgotten on its own; an unnamed reset still means
+    // what it always meant, which is "forget everything".
+    match headers.get(SESSION_HEADER).and_then(|v| v.to_str().ok()) {
+        Some(id) if !id.is_empty() => {
+            state.sessions.lock().await.remove(id);
+        }
+        _ => state.sessions.lock().await.clear(),
+    }
     if let Some(address) = &state.next {
-        let response = client()?
-            .post(format!("{}/stage/reset", address.trim_end_matches('/')))
+        let mut request = client()?.post(format!("{}/stage/reset", address.trim_end_matches('/')));
+        if let Some(id) = headers.get(SESSION_HEADER) {
+            request = request.header(SESSION_HEADER, id);
+        }
+        let response = request
             .send()
             .await
             .with_context(|| format!("resetting the stage at {address}"))?;
@@ -328,10 +466,11 @@ fn client() -> Result<reqwest::Client> {
         .context("building the inter-stage HTTP client")
 }
 
-async fn post_activation(address: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+async fn post_activation(address: &str, session: &str, body: Vec<u8>) -> Result<Vec<u8>> {
     let response = client()?
         .post(format!("{}/stage/forward", address.trim_end_matches('/')))
         .header("content-type", "application/octet-stream")
+        .header(SESSION_HEADER, session)
         .body(body)
         .send()
         .await
@@ -440,7 +579,26 @@ fn argmax(logits: &[f32]) -> Result<u32> {
     u32::try_from(best).context("token index does not fit in u32")
 }
 
+/// Hands out a session id no other run in this process is using.
+static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
+
+/// A session id unique to this run.
+///
+/// The process id is in it because two peers can drive the same chain, and a
+/// collision there would not error -- it would silently splice one caller's
+/// tokens into another's attention history and return fluent nonsense to both.
+fn fresh_session() -> String {
+    format!(
+        "run-{}-{}",
+        std::process::id(),
+        NEXT_RUN.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Drive a prompt through a chain of stages over the network.
+///
+/// Runs under a session of its own, so several of these can be in flight over
+/// the same chain at once without touching each other's caches.
 pub async fn generate_over_chain(
     head: &str,
     prompt: &[u32],
@@ -448,14 +606,87 @@ pub async fn generate_over_chain(
 ) -> Result<Generated> {
     ensure!(!prompt.is_empty(), "the prompt has no tokens");
     let head = head.trim_end_matches('/').to_string();
+    let session = fresh_session();
     let http = client()?;
-    let response = http
+    // No reset first: a fresh session has nothing to forget, and clearing the
+    // chain would take every *other* sequence's cache with it.
+    let outcome = run_session(&http, &head, &session, prompt, max_new_tokens).await;
+    // Release the cache even when the run failed: a chain quietly accumulating
+    // the wreckage of abandoned sequences is how the session cap gets hit. A
+    // release that itself fails is not worth failing the run over -- the answer
+    // is already computed -- but it is worth saying out loud.
+    if let Err(error) = http
         .post(format!("{head}/stage/reset"))
+        .header(SESSION_HEADER, &session)
         .send()
         .await
-        .with_context(|| format!("resetting the chain at {head}"))?;
-    ensure_ok(response, &head).await?;
+    {
+        tracing::warn!(%session, %error, "could not release the session at {head}");
+    }
+    outcome
+}
 
+/// Drive several prompts through one chain at the same time.
+///
+/// This is the part the serial loop could not do. Each prompt gets its own
+/// session, they are interleaved by the runtime rather than queued behind one
+/// another, and they finish in whatever order they finish in -- but the results
+/// come back in the order the prompts were given, matched by index, so a caller
+/// never has to care which one landed first.
+///
+/// What this buys is throughput, not latency: one sequence is no faster than it
+/// was, because token N+1 genuinely depends on token N. What changes is that
+/// the other sequences no longer wait for it.
+pub async fn generate_many_over_chain(
+    head: &str,
+    prompts: &[Vec<u32>],
+    max_new_tokens: usize,
+) -> Result<Vec<Generated>> {
+    ensure!(!prompts.is_empty(), "there are no prompts to run");
+    let head = head.trim_end_matches('/').to_string();
+    let mut running = tokio::task::JoinSet::new();
+    for (index, prompt) in prompts.iter().enumerate() {
+        let head = head.clone();
+        let prompt = prompt.clone();
+        running.spawn(async move {
+            (
+                index,
+                generate_over_chain(&head, &prompt, max_new_tokens).await,
+            )
+        });
+    }
+    // Collect into slots rather than a growing list: arrival order is not
+    // prompt order, and the caller asked about prompts.
+    let mut done: Vec<Option<Generated>> = (0..prompts.len()).map(|_| None).collect();
+    while let Some(joined) = running.join_next().await {
+        let (index, outcome) = joined.context("a generation task did not finish")?;
+        done[index] = Some(outcome.with_context(|| format!("prompt {index}"))?);
+    }
+    done.into_iter()
+        .enumerate()
+        .map(|(index, slot)| slot.with_context(|| format!("prompt {index} produced no result")))
+        .collect()
+}
+
+/// Ask a stage how many sequences it is carrying.
+pub async fn stage_sessions(stage: &str) -> Result<SessionReport> {
+    let stage = stage.trim_end_matches('/');
+    let response = client()?
+        .get(format!("{stage}/stage/sessions"))
+        .send()
+        .await
+        .with_context(|| format!("asking the stage at {stage} about its sessions"))?;
+    Ok(ensure_ok(response, stage).await?.json().await?)
+}
+
+/// One sequence, start to finish, under a session id the caller owns.
+async fn run_session(
+    http: &reqwest::Client,
+    head: &str,
+    session: &str,
+    prompt: &[u32],
+    max_new_tokens: usize,
+) -> Result<Generated> {
     let mut trace = Trace::new();
     let mut tokens = prompt.to_vec();
     let mut steps = 0_usize;
@@ -465,11 +696,15 @@ pub async fn generate_over_chain(
         let token = tokens[cursor];
         let response = http
             .post(format!("{head}/stage/token"))
-            .json(&TokenRequest { token, position })
+            .json(&TokenRequest {
+                token,
+                position,
+                session: Some(session.to_string()),
+            })
             .send()
             .await
             .with_context(|| format!("sending token {token} at position {position}"))?;
-        let body = ensure_ok(response, &head).await?.bytes().await?;
+        let body = ensure_ok(response, head).await?.bytes().await?;
         let next = trace.record(&decode_f32(&body)?)?;
         steps += 1;
         position += 1;
@@ -493,7 +728,8 @@ pub fn generate_locally(model: &Path, prompt: &[u32], max_new_tokens: usize) -> 
     ensure!(!prompt.is_empty(), "the prompt has no tokens");
     let mut file = WeightFile::open(model)?;
     let config = ModelConfig::from_header(&file.header)?;
-    let mut stage = Stage::load(&mut file, 0..config.block_count)?;
+    let stage = Stage::load(&mut file, 0..config.block_count)?;
+    let mut session = stage.session();
 
     let mut trace = Trace::new();
     let mut tokens = prompt.to_vec();
@@ -502,7 +738,7 @@ pub fn generate_locally(model: &Path, prompt: &[u32], max_new_tokens: usize) -> 
     let mut cursor = 0_usize;
     loop {
         let activation = stage.embed(&[tokens[cursor]], position)?;
-        let output = stage.forward(&activation)?;
+        let output = stage.forward(&mut session, &activation)?;
         let next = trace.record(&stage.logits(&output)?)?;
         steps += 1;
         position += 1;
