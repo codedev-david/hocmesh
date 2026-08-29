@@ -340,3 +340,135 @@ fn the_fixture_computes_something_worth_comparing() {
         "the same token won every position, so the sequence is not being read"
     );
 }
+
+/// The terms a block may carry beyond the nine every llama has.
+///
+/// Each of these is a real family's real arithmetic -- Qwen3's per-head
+/// query/key norms, Qwen2's projection biases, Gemma's head that is wider than
+/// `embedding_length / head_count` -- and each of them is invisible when it is
+/// missing. A build that ignores them loads the file, runs at full speed and
+/// produces fluent text, so the only way to know they are applied is to check
+/// that turning one on changes the answer, and that the answer still survives
+/// being split across stages.
+#[test]
+fn the_optional_block_terms_are_applied_and_survive_a_split() {
+    let prompt = [3u32, 17, 5, 41, 0, 22];
+    let plain = Recipe {
+        block_count: 6,
+        ..Recipe::default()
+    };
+    let (_dir, baseline_path) = model(plain.clone());
+    let baseline = run(&baseline_path, &[], &prompt);
+
+    for (name, recipe) in [
+        (
+            "per-head query and key norms",
+            Recipe {
+                qk_norm: true,
+                ..plain.clone()
+            },
+        ),
+        (
+            "query, key and value projection biases",
+            Recipe {
+                qkv_bias: true,
+                ..plain.clone()
+            },
+        ),
+        (
+            "an output projection bias",
+            Recipe {
+                output_bias: true,
+                ..plain.clone()
+            },
+        ),
+        (
+            "both at once",
+            Recipe {
+                qk_norm: true,
+                qkv_bias: true,
+                ..plain.clone()
+            },
+        ),
+        (
+            "a head wider than embedding_length / head_count",
+            Recipe {
+                key_length: Some(16),
+                ..plain.clone()
+            },
+        ),
+        (
+            "a value narrower than the key",
+            Recipe {
+                key_length: Some(16),
+                value_length: Some(8),
+                ..plain.clone()
+            },
+        ),
+    ] {
+        let (_dir, path) = model(recipe);
+        let whole = run(&path, &[], &prompt);
+
+        // A term that is loaded but never applied leaves the logits exactly
+        // where they were, which is the failure this is here to catch.
+        //
+        // Over the whole sequence rather than the first step: at position 0
+        // there is one key to attend to, so the softmax returns 1 whatever the
+        // score was, and anything touching only the query or the key --
+        // per-head norms, q and k biases -- cannot move that step's output.
+        // It shows up from the second token on, once there is more than one
+        // key to choose between.
+        let bits = |steps: &[Vec<f32>]| -> Vec<u32> {
+            steps.iter().flatten().map(|v| v.to_bits()).collect()
+        };
+        assert_ne!(
+            bits(&whole),
+            bits(&baseline),
+            "{name} made no difference to the output, so it is not being applied"
+        );
+        assert!(
+            whole.iter().flatten().all(|value| value.is_finite()),
+            "{name} produced non-finite logits"
+        );
+
+        for cuts in [vec![3u32], vec![2, 4], vec![1, 2, 3, 4, 5]] {
+            let split = run(&path, &cuts, &prompt);
+            for (step, (a, b)) in whole.iter().zip(&split).enumerate() {
+                assert_eq!(
+                    a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{name} with cuts {cuts:?} diverged at token {step}"
+                );
+            }
+        }
+    }
+}
+
+/// A tensor the forward pass would not read is a load error, not a silent
+/// omission.
+///
+/// This is the check that makes the architecture list safe to keep. The list
+/// can only see a name, and `qwen3` is the same name whether or not the file
+/// carries a term this build implements -- so the file itself has to be asked.
+#[test]
+fn a_block_carrying_an_unread_tensor_is_refused() {
+    let (_dir, path) = model(Recipe {
+        block_count: 2,
+        unknown_tensor: true,
+        ..Recipe::default()
+    });
+
+    let mut file = WeightFile::open(&path).expect("open");
+    let message = match Stage::load(&mut file, 0..2) {
+        Ok(_) => panic!("a tensor this build does not read must not load silently"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        message.contains("attn_sinks"),
+        "the message does not name the tensor: {message}"
+    );
+    assert!(
+        message.contains("fluent, wrong text"),
+        "the message does not say what running it anyway would do: {message}"
+    );
+}

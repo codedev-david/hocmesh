@@ -246,12 +246,20 @@ pub fn require_runtime(home: &Path) -> Result<PathBuf> {
 }
 
 /// Find `llama-cli` anywhere under `dir`.
+pub fn locate_executable(dir: &Path) -> Result<PathBuf> {
+    locate_named(dir, EXECUTABLE_STEM)
+}
+
+/// Find the executable called `stem` anywhere under `dir`.
 ///
 /// The archives do not agree on layout -- the Windows zip puts binaries at the
 /// root, the Linux and macOS tarballs put them under `build/bin` -- so the
-/// installed path is discovered rather than assumed. Depth is bounded, because
-/// this walks a tree an archive has just written into.
-pub fn locate_executable(dir: &Path) -> Result<PathBuf> {
+/// installed path is discovered rather than assumed. Anything that wants a
+/// sibling tool (`llama-server`, `llama-quantize`) has the same problem and
+/// must not solve it by guessing a layout: a flat join finds the Windows
+/// binaries and silently finds nothing on the other two platforms. Depth is
+/// bounded, because this walks a tree an archive has just written into.
+pub fn locate_named(dir: &Path, stem: &str) -> Result<PathBuf> {
     const MAX_DEPTH: usize = 8;
     let mut frontier = vec![(dir.to_path_buf(), 0usize)];
     let mut found: Option<PathBuf> = None;
@@ -267,7 +275,7 @@ pub fn locate_executable(dir: &Path) -> Result<PathBuf> {
                 }
                 continue;
             }
-            if !is_runtime_executable(&path) {
+            if !is_named(&path, stem) {
                 continue;
             }
             // Prefer the shallowest match, so a stray vendored or debug copy
@@ -281,24 +289,19 @@ pub fn locate_executable(dir: &Path) -> Result<PathBuf> {
             }
         }
     }
-    found.with_context(|| {
-        format!(
-            "no {EXECUTABLE_STEM} executable found under {}",
-            dir.display()
-        )
-    })
+    found.with_context(|| format!("no {stem} executable found under {}", dir.display()))
 }
 
 /// Whether a path is the llama.cpp CLI, under either naming convention.
 ///
 /// Both are matched on every host rather than only the local one, so a home
 /// directory synced between machines still reports honestly what it holds.
-fn is_runtime_executable(path: &Path) -> bool {
+fn is_named(path: &Path, stem: &str) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
     let lower = name.to_ascii_lowercase();
-    lower == EXECUTABLE_STEM || lower == format!("{EXECUTABLE_STEM}.exe")
+    lower == stem || lower == format!("{stem}.exe")
 }
 
 /// Make an extracted file executable on unix. A no-op elsewhere.
@@ -446,11 +449,12 @@ mod tests {
 
         // Found by scanning, before anything was recorded.
         let scanned = installed_runtime(&home).expect("scanning finds the executable");
-        assert!(is_runtime_executable(&scanned));
+        assert!(is_named(&scanned, EXECUTABLE_STEM));
 
         record_runtime(&home, &executable).expect("recording");
-        assert!(is_runtime_executable(
-            &installed_runtime(&home).expect("the pointer resolves")
+        assert!(is_named(
+            &installed_runtime(&home).expect("the pointer resolves"),
+            EXECUTABLE_STEM
         ));
         assert!(require_runtime(&home).is_ok());
 
@@ -481,6 +485,35 @@ mod tests {
             locate_executable(&root).expect("an executable"),
             shallow.join(EXECUTABLE_STEM)
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The sibling tools live wherever the archive put them, which is not the
+    /// same place on every platform: the Windows zip extracts them at the root
+    /// and the Linux and macOS tarballs put them under `build/bin`. Anything
+    /// that joins a fixed path onto the runtime directory works on one of the
+    /// three and silently finds nothing on the other two.
+    #[test]
+    fn a_sibling_tool_is_found_under_the_tarball_layout() {
+        let root = scratch("sibling");
+        let bin = root.join("build").join("bin");
+        fs::create_dir_all(&bin).expect("bin directory");
+        for stem in ["llama-cli", "llama-server", "llama-quantize"] {
+            fs::write(bin.join(stem), b"binary").expect("binary");
+        }
+
+        for stem in ["llama-server", "llama-quantize"] {
+            assert_eq!(
+                locate_named(&root, stem).expect("a sibling tool"),
+                bin.join(stem),
+                "{stem} was not found under the tarball layout"
+            );
+            assert!(
+                !root.join(stem).is_file(),
+                "the fixture must not also place {stem} at the root, or this                  test would pass for a flat join too"
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -218,6 +218,21 @@ enum Command {
         /// a real conversion.
         #[arg(long, default_value = "f32")]
         weights: String,
+        /// Which family's block shape to write: `llama`, `qwen2` or `qwen3`.
+        ///
+        /// The three differ in terms that are invisible from the output --
+        /// qwen2 keeps projection biases, qwen3 drops them and normalises each
+        /// head's query and key before rotating, and both pair rotary
+        /// dimensions by halves where llama interleaves them. A model missing
+        /// one of those still generates fluent text, which is why the fixture
+        /// can write each of them: the only way to know they are right is to
+        /// hand the same file to another implementation.
+        #[arg(long, default_value = "llama")]
+        family: String,
+        /// Width of one attention head, when it is not `embedding_length /
+        /// heads`. Writes `attention.key_length`, as Qwen3 and Gemma do.
+        #[arg(long)]
+        head_dim: Option<u32>,
     },
     /// Write a model file holding only the layers one stage runs.
     ///
@@ -921,8 +936,23 @@ stored at: {}",
             feed_forward_length,
             vocab,
             weights,
+            family,
+            head_dim,
         } => {
+            // Each family is the set of block terms that family really has,
+            // not a label on the same nine tensors: writing `qwen3` and
+            // leaving the head norms out would produce a file that no Qwen3
+            // conversion resembles and prove nothing about Qwen3.
+            let (architecture, qk_norm, qkv_bias) = match family.as_str() {
+                "llama" => ("llama", false, false),
+                "qwen2" => ("qwen2", false, true),
+                "qwen3" => ("qwen3", true, false),
+                other => anyhow::bail!(
+                    "unknown family {other:?}; the fixture writes llama, qwen2 or qwen3"
+                ),
+            };
             let recipe = hocmesh_engine::fixture::Recipe {
+                architecture: architecture.into(),
                 block_count: blocks,
                 embedding_length,
                 head_count: heads,
@@ -930,11 +960,14 @@ stored at: {}",
                 feed_forward_length,
                 vocab_size: vocab,
                 weight_kind: hocmesh_engine::dequant::kind_by_name(&weights)?,
+                key_length: head_dim,
+                qk_norm,
+                qkv_bias,
                 ..hocmesh_engine::fixture::Recipe::default()
             };
             recipe.write(&output)?;
             println!(
-                "Wrote a {blocks}-block {}-wide {weights} fixture to {} ({} bytes)",
+                "Wrote a {blocks}-block {}-wide {weights} {architecture} fixture to {} ({} bytes)",
                 embedding_length,
                 output.display(),
                 std::fs::metadata(&output)?.len()

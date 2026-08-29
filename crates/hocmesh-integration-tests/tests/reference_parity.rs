@@ -27,6 +27,7 @@
 //! runtime, so a silent skip there would be a hole rather than a courtesy.
 
 use anyhow::{Context, Result, bail};
+use hocmesh_gpu::runtime;
 use serde::Deserialize;
 use std::{
     env, fs,
@@ -67,9 +68,14 @@ fn reference(workspace: &Path) -> Option<Reference> {
         }
     }
     roots.into_iter().find_map(|root| {
-        let server = root.join(exe("llama-server"));
-        let quantize = root.join(exe("llama-quantize"));
-        (server.is_file() && quantize.is_file()).then_some(Reference { server, quantize })
+        // Discovered, not joined. The Windows zip puts the binaries at the
+        // root of the extracted tree and the Linux and macOS tarballs put them
+        // under `build/bin`, so a flat join finds a runtime on one platform
+        // and quietly finds none on the other two -- which read as a skip
+        // until `HOCMESH_REQUIRE_REFERENCE` turned skips into failures.
+        let server = runtime::locate_named(&root, "llama-server").ok()?;
+        let quantize = runtime::locate_named(&root, "llama-quantize").ok()?;
+        Some(Reference { server, quantize })
     })
 }
 
@@ -451,16 +457,103 @@ fn join(tokens: &[u32]) -> String {
         .join(",")
 }
 
+/// One real checkpoint shape per architecture this engine claims to run.
+///
+/// The architecture list is a promise, and until this existed the promise was
+/// checked against one shape: llama's. Every other name on it was believed on
+/// the strength of sharing a loader, which is exactly the reasoning the list's
+/// own doc comment warns against -- `qwen2` keeps projection biases and
+/// `qwen3` normalises each head's query and key before rotating, and a build
+/// that ignores either loads the file, runs, and generates fluent text that is
+/// not what the model says. There is no output to inspect that distinguishes
+/// that from a correct run, so the only check is another implementation.
+///
+/// The head width is *not* varied here, and that is a limit worth stating
+/// rather than hiding. Four of Qwen3's six sizes declare
+/// `attention.key_length` because `embedding_length / head_count` gives the
+/// wrong answer for them, so it is an axis that deserves a reference check --
+/// but llama.cpp b10657 does not apply that key to these files. Measured:
+/// with `qwen3.attention.key_length = 16` present and byte-correct in the
+/// header, it asked for `blk.0.attn_k.weight` of `[64, 16]`, which is
+/// `(embedding_length / head_count) * head_count_kv`; raising `head_count_kv`
+/// from 2 to 4 moved its expectation to `[64, 32]`, so the divided width, not
+/// the declared one, is what it used, and the same happens under `llama`. A
+/// fixture built on that key therefore never loads there and could only be
+/// made to pass by not testing it. The axis stays covered by
+/// `split_matches_whole`, which runs a decoupled key and value width through
+/// whole and split execution, and by the config unit tests that read the two
+/// keys -- neither of which is a second implementation, which is why this
+/// says so out loud.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_architecture_generates_what_llama_cpp_generates() -> Result<()> {
+    let workspace = workspace_root()?;
+    let Some(reference) = reference(&workspace) else {
+        return skip();
+    };
+    build_node(&workspace)?;
+    let node = workspace.join("target").join("debug").join(exe("hocmesh"));
+
+    for (family, head_dim) in [("llama", None), ("qwen2", None), ("qwen3", None::<u32>)] {
+        let tmp = TestDir::new()?;
+        let home = tmp.path.join("home");
+        let model = tmp.path.join("model.gguf");
+        write_family_fixture(&node, &home, &model, "f32", family, head_dim)?;
+
+        let server = LlamaServer::start(&reference, &model).await?;
+        for prompt in PROMPTS {
+            let ours: Generated = serde_json::from_str(&run_capture(
+                node_command(&node, &home)
+                    .arg("stage-run")
+                    .arg("--model")
+                    .arg(&model)
+                    .arg("--tokens")
+                    .arg(join(prompt))
+                    .arg("--max-new-tokens")
+                    .arg(NEW_TOKENS.to_string()),
+                "stage-run",
+            )?)?;
+            let theirs = server.generate(prompt, NEW_TOKENS).await?;
+            agreed_on_a_full_run(&ours, prompt, &theirs);
+
+            assert_eq!(
+                &ours.tokens[prompt.len()..],
+                theirs.as_slice(),
+                "hocmesh and llama.cpp disagree on what this {family} model generates \
+                 from {prompt:?}. The terms that differ between these families are the \
+                 per-head query and key norms, the projection biases, the rotary pairing \
+                 and the declared head width."
+            );
+        }
+    }
+    Ok(())
+}
+
 fn write_fixture(node: &Path, home: &Path, output: &Path, weights: &str) -> Result<()> {
-    run_ok(
-        node_command(node, home)
-            .arg("model-fixture")
-            .arg("--output")
-            .arg(output)
-            .arg("--weights")
-            .arg(weights),
-        "model-fixture",
-    )
+    write_family_fixture(node, home, output, weights, "llama", None)
+}
+
+/// Write a fixture shaped like one particular family.
+fn write_family_fixture(
+    node: &Path,
+    home: &Path,
+    output: &Path,
+    weights: &str,
+    family: &str,
+    head_dim: Option<u32>,
+) -> Result<()> {
+    let mut command = node_command(node, home);
+    command
+        .arg("model-fixture")
+        .arg("--output")
+        .arg(output)
+        .arg("--weights")
+        .arg(weights)
+        .arg("--family")
+        .arg(family);
+    if let Some(width) = head_dim {
+        command.arg("--head-dim").arg(width.to_string());
+    }
+    run_ok(&mut command, "model-fixture")
 }
 
 /// A llama.cpp server, stopped when this is dropped.

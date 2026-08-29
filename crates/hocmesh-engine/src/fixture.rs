@@ -32,6 +32,31 @@ pub struct Recipe {
     /// Whether to emit `output.weight`, or leave the head tied to the
     /// embedding table.
     pub separate_output_head: bool,
+    /// Width of one attention head, when it is not `embedding_length /
+    /// head_count`. Writes `attention.key_length` and, when it differs,
+    /// `attention.value_length`.
+    ///
+    /// The interesting case is a head wider than the division would give, so
+    /// that a build ignoring the key reads the wrong shape rather than merely
+    /// a different one.
+    pub key_length: Option<u32>,
+    pub value_length: Option<u32>,
+    /// Emit `attn_q_norm.weight` and `attn_k_norm.weight` -- the per-head
+    /// query/key normalisation Qwen3 and Gemma3 apply before rotating.
+    pub qk_norm: bool,
+    /// Emit `attn_q.bias`, `attn_k.bias` and `attn_v.bias` -- the projection
+    /// biases Qwen2 keeps.
+    ///
+    /// Qwen2 stops there: its output projection has no bias, and llama.cpp
+    /// refuses a qwen2 file that carries one ("wrong number of tensors;
+    /// expected 81, got 75", one per block). That is why the output bias is a
+    /// separate flag rather than the fourth member of this one.
+    pub qkv_bias: bool,
+    /// Emit `attn_output.bias`, which some families outside Qwen2 do have.
+    pub output_bias: bool,
+    /// Emit a tensor no build consumes, to check that a file carrying a term
+    /// the engine does not implement is refused rather than run.
+    pub unknown_tensor: bool,
 }
 
 impl Default for Recipe {
@@ -46,6 +71,12 @@ impl Default for Recipe {
             vocab_size: 48,
             weight_kind: dequant::F32,
             separate_output_head: true,
+            key_length: None,
+            value_length: None,
+            qk_norm: false,
+            qkv_bias: false,
+            output_bias: false,
+            unknown_tensor: false,
         }
     }
 }
@@ -192,27 +223,58 @@ impl Recipe {
         }
     }
 
+    /// Width of one query/key head in the model this recipe describes.
+    fn key_length(&self) -> u32 {
+        self.key_length
+            .unwrap_or(self.embedding_length / self.head_count.max(1))
+    }
+
+    /// Width of one value head.
+    fn value_length(&self) -> u32 {
+        self.value_length.unwrap_or_else(|| self.key_length())
+    }
+
     /// Write a complete GGUF file at `path`.
     pub fn write(&self, path: impl AsRef<Path>) -> Result<()> {
         let embed = u64::from(self.embedding_length);
         let ffn = u64::from(self.feed_forward_length);
-        let head_dim = embed / u64::from(self.head_count);
-        let kv = u64::from(self.head_count_kv) * head_dim;
+        let key_length = u64::from(self.key_length());
+        let value_length = u64::from(self.value_length());
+        let q_width = u64::from(self.head_count) * key_length;
+        let k_width = u64::from(self.head_count_kv) * key_length;
+        let v_width = u64::from(self.head_count_kv) * value_length;
+        let attention_width = u64::from(self.head_count) * value_length;
 
         let mut tensors =
             vec![self.tensor("token_embd.weight", vec![embed, u64::from(self.vocab_size)])?];
         for block in 0..self.block_count {
-            for (suffix, dimensions) in [
+            let mut shapes = vec![
                 ("attn_norm.weight", vec![embed]),
-                ("attn_q.weight", vec![embed, embed]),
-                ("attn_k.weight", vec![embed, kv]),
-                ("attn_v.weight", vec![embed, kv]),
-                ("attn_output.weight", vec![embed, embed]),
+                ("attn_q.weight", vec![embed, q_width]),
+                ("attn_k.weight", vec![embed, k_width]),
+                ("attn_v.weight", vec![embed, v_width]),
+                ("attn_output.weight", vec![attention_width, embed]),
                 ("ffn_norm.weight", vec![embed]),
                 ("ffn_gate.weight", vec![embed, ffn]),
                 ("ffn_up.weight", vec![embed, ffn]),
                 ("ffn_down.weight", vec![ffn, embed]),
-            ] {
+            ];
+            if self.qk_norm {
+                shapes.push(("attn_q_norm.weight", vec![key_length]));
+                shapes.push(("attn_k_norm.weight", vec![key_length]));
+            }
+            if self.qkv_bias {
+                shapes.push(("attn_q.bias", vec![q_width]));
+                shapes.push(("attn_k.bias", vec![k_width]));
+                shapes.push(("attn_v.bias", vec![v_width]));
+            }
+            if self.output_bias {
+                shapes.push(("attn_output.bias", vec![embed]));
+            }
+            if self.unknown_tensor {
+                shapes.push(("attn_sinks.weight", vec![u64::from(self.head_count)]));
+            }
+            for (suffix, dimensions) in shapes {
                 tensors.push(self.tensor(&format!("blk.{block}.{suffix}"), dimensions)?);
             }
         }
@@ -237,6 +299,15 @@ impl Recipe {
             self.feed_forward_length,
         );
         metadata.u32(&format!("{arch}.context_length"), 256);
+        if let Some(width) = self.key_length {
+            metadata.u32(&format!("{arch}.attention.key_length"), width);
+        }
+        if let Some(width) = self.value_length {
+            metadata.u32(&format!("{arch}.attention.value_length"), width);
+        }
+        // Rotation covers a whole head unless the head is wider than the
+        // default, in which case saying so keeps the file self-consistent.
+        metadata.u32(&format!("{arch}.rope.dimension_count"), self.key_length());
         metadata.f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-5);
         metadata.f32(&format!("{arch}.rope.freq_base"), 10_000.0);
 

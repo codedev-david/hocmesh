@@ -12,10 +12,12 @@
 //! same bits as running `0..16` in one — the property the whole design rests
 //! on, and the one [`crate::tests`] checks rather than assumes.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::ops::Range;
 
 use crate::config::{ModelConfig, RopeStyle};
+use hocmesh_model::gguf::TensorDirectory;
+
 use crate::weights::{Tensor, WeightFile};
 
 /// The activation passed between stages.
@@ -81,7 +83,15 @@ impl Activation {
     }
 }
 
-/// The nine tensors one transformer block is made of.
+/// The tensors one transformer block is made of.
+///
+/// Nine are required and six are optional. The optional ones are not
+/// decoration: a Qwen2 without its projection biases and a Qwen3 without its
+/// per-head query and key norms both load, run, and produce fluent text that
+/// is not what the model was trained to say. `Stage::load` refuses a block
+/// carrying any tensor that is neither in this list nor deliberately ignored,
+/// so a family that adds a term this engine has never heard of is a load
+/// error rather than a quality mystery.
 struct BlockWeights {
     attn_norm: Tensor,
     attn_q: Tensor,
@@ -92,6 +102,16 @@ struct BlockWeights {
     ffn_gate: Tensor,
     ffn_up: Tensor,
     ffn_down: Tensor,
+    /// Per-head RMS norm applied to the query before rotation -- Qwen3,
+    /// Gemma3, OLMo2. One weight vector, reused across every head.
+    attn_q_norm: Option<Tensor>,
+    /// The same for the key.
+    attn_k_norm: Option<Tensor>,
+    /// Projection biases -- Qwen2 and Qwen2.5 keep the ones Qwen3 dropped.
+    attn_q_bias: Option<Tensor>,
+    attn_k_bias: Option<Tensor>,
+    attn_v_bias: Option<Tensor>,
+    attn_output_bias: Option<Tensor>,
 }
 
 /// Keys and values already computed for earlier positions in this sequence.
@@ -138,25 +158,47 @@ impl Stage {
 
         let embed = u64::from(config.embedding_length);
         let ffn = u64::from(config.feed_forward_length);
-        let kv = u64::from(config.kv_width());
+        let q_width = u64::from(config.q_width());
+        let k_width = u64::from(config.k_width());
+        let v_width = u64::from(config.v_width());
+        let attention_width = u64::from(config.attention_width());
+        let key_length = u64::from(config.key_length);
         let mut layers = Vec::with_capacity(blocks.len());
         for index in blocks.clone() {
+            refuse_unknown_tensors(file.directory(), index)?;
             let get = |file: &mut WeightFile, suffix: &str, shape: &[u64]| -> Result<Tensor> {
                 let name = format!("blk.{index}.{suffix}");
                 let tensor = file.load(&name)?;
                 tensor.expect_shape(&name, shape)?;
                 Ok(tensor)
             };
+            let get_optional =
+                |file: &mut WeightFile, suffix: &str, shape: &[u64]| -> Result<Option<Tensor>> {
+                    let name = format!("blk.{index}.{suffix}");
+                    let Some(tensor) = file.load_optional(&name)? else {
+                        return Ok(None);
+                    };
+                    tensor.expect_shape(&name, shape)?;
+                    Ok(Some(tensor))
+                };
             layers.push(BlockWeights {
                 attn_norm: get(file, "attn_norm.weight", &[embed])?,
-                attn_q: get(file, "attn_q.weight", &[embed, embed])?,
-                attn_k: get(file, "attn_k.weight", &[embed, kv])?,
-                attn_v: get(file, "attn_v.weight", &[embed, kv])?,
-                attn_output: get(file, "attn_output.weight", &[embed, embed])?,
+                attn_q: get(file, "attn_q.weight", &[embed, q_width])?,
+                attn_k: get(file, "attn_k.weight", &[embed, k_width])?,
+                attn_v: get(file, "attn_v.weight", &[embed, v_width])?,
+                attn_output: get(file, "attn_output.weight", &[attention_width, embed])?,
                 ffn_norm: get(file, "ffn_norm.weight", &[embed])?,
                 ffn_gate: get(file, "ffn_gate.weight", &[embed, ffn])?,
                 ffn_up: get(file, "ffn_up.weight", &[embed, ffn])?,
                 ffn_down: get(file, "ffn_down.weight", &[ffn, embed])?,
+                // One head's width, not the whole vector: the same weights are
+                // applied to every head in turn.
+                attn_q_norm: get_optional(file, "attn_q_norm.weight", &[key_length])?,
+                attn_k_norm: get_optional(file, "attn_k_norm.weight", &[key_length])?,
+                attn_q_bias: get_optional(file, "attn_q.bias", &[q_width])?,
+                attn_k_bias: get_optional(file, "attn_k.bias", &[k_width])?,
+                attn_v_bias: get_optional(file, "attn_v.bias", &[v_width])?,
+                attn_output_bias: get_optional(file, "attn_output.bias", &[embed])?,
             });
         }
 
@@ -296,18 +338,26 @@ impl Stage {
     ) -> Result<()> {
         let config = &self.config;
         let width = config.embedding_length as usize;
-        let head_dim = config.head_dim() as usize;
-        let kv_width = config.kv_width() as usize;
+        // Query and key are `key_length` wide per head, the value
+        // `value_length`. Those are usually equal to each other and to
+        // `embedding_length / head_count`, and in the families that write the
+        // keys they are not -- so nothing below may divide to find them.
+        let key_length = config.key_length as usize;
+        let value_length = config.value_length as usize;
+        let q_width = config.q_width() as usize;
+        let k_width = config.k_width() as usize;
+        let v_width = config.v_width() as usize;
+        let attention_width = config.attention_width() as usize;
         let group = config.group_size() as usize;
-        let scale = 1.0 / (head_dim as f32).sqrt();
+        let scale = 1.0 / (key_length as f32).sqrt();
         let layer = &self.layers[depth];
         let cache = &mut self.cache[depth];
 
         let mut normed = vec![0.0f32; width];
-        let mut q = vec![0.0f32; width];
-        let mut k = vec![0.0f32; kv_width];
-        let mut v = vec![0.0f32; kv_width];
-        let mut attended = vec![0.0f32; width];
+        let mut q = vec![0.0f32; q_width];
+        let mut k = vec![0.0f32; k_width];
+        let mut v = vec![0.0f32; v_width];
+        let mut attended = vec![0.0f32; attention_width];
         let mut projected = vec![0.0f32; width];
         let mut gate = vec![0.0f32; config.feed_forward_length as usize];
         let mut up = vec![0.0f32; config.feed_forward_length as usize];
@@ -326,15 +376,22 @@ impl Stage {
             mat_vec(&layer.attn_q, &normed, &mut q);
             mat_vec(&layer.attn_k, &normed, &mut k);
             mat_vec(&layer.attn_v, &normed, &mut v);
-            rope(&mut q, head_dim, config, at);
-            rope(&mut k, head_dim, config, at);
+            add_bias(&mut q, layer.attn_q_bias.as_ref());
+            add_bias(&mut k, layer.attn_k_bias.as_ref());
+            add_bias(&mut v, layer.attn_v_bias.as_ref());
+            // Before the rotation, not after: normalising a rotated vector
+            // gives different numbers, and they are wrong ones.
+            norm_each_head(&mut q, key_length, layer.attn_q_norm.as_ref(), config);
+            norm_each_head(&mut k, key_length, layer.attn_k_norm.as_ref(), config);
+            rope(&mut q, key_length, config, at);
+            rope(&mut k, key_length, config, at);
 
             // The cache is append-only within a sequence, so a position is
             // written exactly once and every later step reads the same bytes.
             ensure!(
-                cache.keys.len() == at * kv_width,
+                cache.keys.len() == at * k_width,
                 "position {at} arrived out of order: the cache holds {} positions",
-                cache.keys.len() / kv_width.max(1)
+                cache.keys.len() / k_width.max(1)
             );
             cache.keys.extend_from_slice(&k);
             cache.values.extend_from_slice(&v);
@@ -342,22 +399,24 @@ impl Stage {
             let mut scores = vec![0.0f32; at + 1];
             for head in 0..config.head_count as usize {
                 let kv_head = head / group;
-                let query = &q[head * head_dim..(head + 1) * head_dim];
+                let query = &q[head * key_length..(head + 1) * key_length];
                 for (past, score) in scores.iter_mut().enumerate() {
-                    let key = &cache.keys[past * kv_width + kv_head * head_dim..][..head_dim];
+                    let key = &cache.keys[past * k_width + kv_head * key_length..][..key_length];
                     *score = dot(query, key) * scale;
                 }
                 softmax(&mut scores);
-                let out = &mut attended[head * head_dim..(head + 1) * head_dim];
+                let out = &mut attended[head * value_length..(head + 1) * value_length];
                 out.fill(0.0);
                 for (past, weight) in scores.iter().enumerate() {
-                    let value = &cache.values[past * kv_width + kv_head * head_dim..][..head_dim];
+                    let value =
+                        &cache.values[past * v_width + kv_head * value_length..][..value_length];
                     for (slot, element) in out.iter_mut().zip(value) {
                         *slot += weight * element;
                     }
                 }
             }
             mat_vec(&layer.attn_output, &attended, &mut projected);
+            add_bias(&mut projected, layer.attn_output_bias.as_ref());
             for (slot, delta) in row.iter_mut().zip(&projected) {
                 *slot += delta;
             }
@@ -380,6 +439,93 @@ impl Stage {
             }
         }
         Ok(())
+    }
+}
+
+/// Refuse a block carrying a tensor this build would not read.
+///
+/// Loading is pull-based: `Stage::load` names the tensors it wants and never
+/// looks at what else is there, and nothing downstream notices. A GGUF holding
+/// `blk.0.attn_q_norm.weight` in a build that does not apply it loads, runs at
+/// full speed, and generates fluent text that is not what the model was
+/// trained to say -- there is no error, no warning, and no output to inspect
+/// that would tell anyone. An architecture allow-list cannot catch this,
+/// because the name is the same on both sides of the change: `qwen3` covers
+/// files with per-head norms and files without.
+///
+/// So the check is inverted. Rather than listing architectures that are
+/// believed to fit, list the tensor suffixes this build actually consumes and
+/// refuse everything else. That stays correct as new families appear without
+/// anyone editing it, and it fails at load with the tensor's own name in the
+/// message.
+fn refuse_unknown_tensors(directory: &TensorDirectory, index: u32) -> Result<()> {
+    /// Every suffix the forward pass reads, required or optional.
+    const CONSUMED: &[&str] = &[
+        "attn_norm.weight",
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+        "attn_output.weight",
+        "ffn_norm.weight",
+        "ffn_gate.weight",
+        "ffn_up.weight",
+        "ffn_down.weight",
+        "attn_q_norm.weight",
+        "attn_k_norm.weight",
+        "attn_q.bias",
+        "attn_k.bias",
+        "attn_v.bias",
+        "attn_output.bias",
+    ];
+    let prefix = format!("blk.{index}.");
+    for tensor in directory.tensors_for_layers(index..index + 1) {
+        let suffix = tensor
+            .name
+            .strip_prefix(&prefix)
+            .unwrap_or(tensor.name.as_str());
+        if CONSUMED.contains(&suffix) {
+            continue;
+        }
+        bail!(
+            "{} is a tensor this build does not read. Running this model would silently \
+             leave it out of the forward pass and generate fluent, wrong text, so it is \
+             refused instead. The block shapes this engine implements are listed on \
+             `BlockWeights`.",
+            tensor.name
+        );
+    }
+    Ok(())
+}
+
+/// Add a projection bias, if the model has one.
+fn add_bias(values: &mut [f32], bias: Option<&Tensor>) {
+    let Some(bias) = bias else {
+        return;
+    };
+    for (slot, delta) in values.iter_mut().zip(&bias.values) {
+        *slot += delta;
+    }
+}
+
+/// RMS-normalise each head of a query or key vector in place.
+///
+/// One weight vector of a single head's width, applied to every head in turn.
+/// Qwen3, Gemma3, OLMo2 and Cohere2 all do this between the projection and the
+/// rotation; the families that do not have no such tensor, and this is then a
+/// no-op.
+fn norm_each_head(
+    values: &mut [f32],
+    head_dim: usize,
+    weight: Option<&Tensor>,
+    config: &ModelConfig,
+) {
+    let Some(weight) = weight else {
+        return;
+    };
+    let mut normed = vec![0.0f32; head_dim];
+    for head in values.chunks_exact_mut(head_dim) {
+        rms_norm(head, &weight.values, config.rms_norm_eps, &mut normed);
+        head.copy_from_slice(&normed);
     }
 }
 

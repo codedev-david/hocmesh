@@ -27,14 +27,27 @@ pub enum RopeStyle {
 /// The architectures whose block layout is the one implemented here.
 ///
 /// Sharing a name with llama is not enough: this list is the set whose
-/// attention and feed-forward shape is exactly `attn_norm -> q,k,v -> rope ->
+/// attention and feed-forward shape is `attn_norm -> q,k,v -> rope ->
 /// attention -> out, ffn_norm -> gate*up -> down`, with RMS norm and SwiGLU.
+/// Optional per-head query/key norms and projection biases are part of that
+/// shape -- they are additional terms, not a different one.
+///
+/// A name on this list is necessary and not sufficient. The list cannot see
+/// inside the file, so it cannot tell a Qwen3 that this build computes
+/// correctly from one carrying a tensor this build would ignore. That check
+/// lives in `Stage::load`, which enumerates what the file actually holds and
+/// refuses anything it would not consume.
+///
+/// `stablelm` was on this list and should not have been: llama.cpp's stablelm
+/// normalises with LayerNorm, which subtracts a mean and adds a bias that
+/// `rms_norm` does neither of. It did not fail, it generated fluent, wrong
+/// text -- the exact outcome the doc comment above `RopeStyle` promises to
+/// avoid. Putting it back means implementing LayerNorm first.
 const KNOWN: &[(&str, RopeStyle)] = &[
     ("llama", RopeStyle::Interleaved),
     ("mistral", RopeStyle::Interleaved),
     ("qwen2", RopeStyle::Halved),
     ("qwen3", RopeStyle::Halved),
-    ("stablelm", RopeStyle::Halved),
 ];
 
 /// Everything the forward pass needs, and nothing else.
@@ -50,6 +63,18 @@ pub struct ModelConfig {
     /// equal is ordinary multi-head.
     pub head_count_kv: u32,
     pub feed_forward_length: u32,
+    /// Width of one attention head's query and key.
+    ///
+    /// Read from `attention.key_length`, which most files omit because it is
+    /// `embedding_length / head_count`. The families that write it -- Qwen3 at
+    /// four of its six sizes, every Gemma -- are exactly the ones where that
+    /// division gives the wrong answer, and deriving it there produces a
+    /// tensor-shape complaint that blames the file for a key this engine did
+    /// not read.
+    pub key_length: u32,
+    /// Width of one attention head's value. Usually equal to `key_length`;
+    /// `attention.value_length` may say otherwise.
+    pub value_length: u32,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     /// How many of each head's dimensions are rotated. The rest are carried
@@ -60,10 +85,10 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    /// Width of one attention head.
+    /// Width of one attention head's query and key.
     #[must_use]
     pub fn head_dim(&self) -> u32 {
-        self.embedding_length / self.head_count.max(1)
+        self.key_length
     }
 
     /// How many query heads share each key/value head.
@@ -72,10 +97,29 @@ impl ModelConfig {
         self.head_count / self.head_count_kv.max(1)
     }
 
-    /// Width of the concatenated key or value vector for one position.
+    /// Width of the concatenated key vector for one position.
     #[must_use]
-    pub fn kv_width(&self) -> u32 {
-        self.head_count_kv * self.head_dim()
+    pub fn k_width(&self) -> u32 {
+        self.head_count_kv * self.key_length
+    }
+
+    /// Width of the concatenated value vector for one position.
+    #[must_use]
+    pub fn v_width(&self) -> u32 {
+        self.head_count_kv * self.value_length
+    }
+
+    /// Width of the attention output before the output projection: every
+    /// query head contributes one value.
+    #[must_use]
+    pub fn attention_width(&self) -> u32 {
+        self.head_count * self.value_length
+    }
+
+    /// Width of the concatenated query vector for one position.
+    #[must_use]
+    pub fn q_width(&self) -> u32 {
+        self.head_count * self.key_length
     }
 
     /// Read the configuration out of a GGUF header.
@@ -116,23 +160,45 @@ impl ModelConfig {
         ensure!(head_count > 0, "attention.head_count is zero");
         ensure!(head_count_kv > 0, "attention.head_count_kv is zero");
         ensure!(
-            embedding_length.is_multiple_of(head_count),
-            "embedding_length {embedding_length} does not divide into {head_count} heads"
-        );
-        ensure!(
             head_count.is_multiple_of(head_count_kv),
             "{head_count} query heads do not group evenly over {head_count_kv} key/value heads"
         );
 
-        let head_dim = embedding_length / head_count;
+        let optional = |key: &str| -> Result<Option<u64>> {
+            gguf::metadata_u64(bytes, &format!("{architecture}.{key}"))
+        };
+        // A file that states how wide a head is gets believed over the
+        // division, because the two disagree in exactly the models where the
+        // division is wrong. Only when the key is absent does
+        // `embedding_length / head_count` have to come out whole -- demanding
+        // that unconditionally refuses a model that told us the answer, and
+        // the message blames the file for a key this engine never read.
+        let key_length = match optional("attention.key_length")? {
+            Some(width) => width as u32,
+            None => {
+                ensure!(
+                    embedding_length.is_multiple_of(head_count),
+                    "embedding_length {embedding_length} does not divide into {head_count} \
+                     heads, and the file does not declare \
+                     {architecture}.attention.key_length to say how wide one is"
+                );
+                embedding_length / head_count
+            }
+        };
+        let value_length =
+            optional("attention.value_length")?.unwrap_or(u64::from(key_length)) as u32;
+        ensure!(key_length > 0, "attention.key_length is zero");
+        ensure!(value_length > 0, "attention.value_length is zero");
+
         let rope_dimension_count =
-            gguf::metadata_u64(bytes, &format!("{architecture}.rope.dimension_count"))?
-                .unwrap_or(u64::from(head_dim)) as u32;
+            optional("rope.dimension_count")?.unwrap_or(u64::from(key_length)) as u32;
         ensure!(
-            rope_dimension_count <= head_dim && rope_dimension_count.is_multiple_of(2),
+            rope_dimension_count <= key_length && rope_dimension_count.is_multiple_of(2),
             "rope.dimension_count {rope_dimension_count} is not an even count within a \
-             {head_dim}-wide head"
+             {key_length}-wide head"
         );
+
+        Self::refuse_unimplemented_metadata(bytes, &architecture)?;
 
         Ok(ModelConfig {
             rope_style: *rope_style,
@@ -141,6 +207,8 @@ impl ModelConfig {
             head_count,
             head_count_kv,
             feed_forward_length,
+            key_length,
+            value_length,
             rope_dimension_count,
             // 1e-5 is the value llama.cpp uses when a file omits it.
             rms_norm_eps: gguf::metadata_f32(
@@ -161,6 +229,74 @@ impl ModelConfig {
                 .unwrap_or(0) as u32,
             architecture,
         })
+    }
+
+    /// Refuse a file whose header asks for arithmetic this build does not do.
+    ///
+    /// Every key here changes the forward pass rather than describing it, and
+    /// every one of them is silently ignorable: a model with a sliding window
+    /// attends to its whole history instead of the last few thousand tokens
+    /// and still produces fluent text, a model with a rope scaling factor
+    /// places every position wrong and still produces fluent text. There is no
+    /// output to inspect that says which happened. So the check is at load,
+    /// where it costs one metadata read and can name what is missing.
+    ///
+    /// This list grows the other way from most: an entry is *removed* when the
+    /// feature is implemented.
+    fn refuse_unimplemented_metadata(bytes: &[u8], architecture: &str) -> Result<()> {
+        const UNIMPLEMENTED_NUMERIC: &[(&str, &str)] = &[
+            (
+                "attention.sliding_window",
+                "attends over a window rather than the whole history",
+            ),
+            ("expert_count", "routes each token to a subset of experts"),
+            (
+                "attention.attn_logit_softcapping",
+                "bounds its attention scores with tanh",
+            ),
+            (
+                "final_logit_softcapping",
+                "bounds its output logits with tanh",
+            ),
+            (
+                "attention.max_alibi_bias",
+                "biases attention by distance instead of rotating positions",
+            ),
+        ];
+        for (key, what) in UNIMPLEMENTED_NUMERIC {
+            if let Some(value) = gguf::metadata_u64(bytes, &format!("{architecture}.{key}"))?
+                && value != 0
+            {
+                bail!(
+                    "this model {what} ({architecture}.{key} = {value}), which this engine \
+                     does not implement; running it would ignore that and generate fluent, \
+                     wrong text"
+                );
+            }
+        }
+        // Scaling is expressed either as a type string or, in older
+        // conversions, as a bare linear factor. Both are refused; "none" and a
+        // factor of 1 are the no-ops that mean the file wants nothing done.
+        if let Some(kind) =
+            gguf::metadata_string(bytes, &format!("{architecture}.rope.scaling.type"))?
+            && kind != "none"
+        {
+            bail!(
+                "this model scales rotary positions ({architecture}.rope.scaling.type = \
+                 {kind:?}), which this engine does not implement; running it would place \
+                 every position wrong and generate fluent, wrong text"
+            );
+        }
+        if let Some(factor) =
+            gguf::metadata_f32(bytes, &format!("{architecture}.rope.scale_linear"))?
+            && (factor - 1.0).abs() > f32::EPSILON
+        {
+            bail!(
+                "this model scales rotary positions ({architecture}.rope.scale_linear = \
+                 {factor}), which this engine does not implement"
+            );
+        }
+        Ok(())
     }
 
     /// Check that a stage's layer range is one this model has.
