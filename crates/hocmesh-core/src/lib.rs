@@ -6,6 +6,7 @@ pub mod limits;
 pub mod matrix;
 pub mod proximity;
 pub mod reputation;
+pub mod resources;
 pub mod roles;
 pub mod tensor;
 pub mod verify;

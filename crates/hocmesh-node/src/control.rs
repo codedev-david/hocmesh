@@ -168,7 +168,32 @@ pub struct DaemonMetrics {
     mcu_earned: AtomicI64,
     last_contact_unix: AtomicI64,
     coordinator_reachable: AtomicBool,
-    last_error: Mutex<Option<String>>,
+    /// Why the coordinator was last out of reach.
+    ///
+    /// Cleared the moment it answers again. A single stored error that nothing
+    /// ever cleared left the window reporting a blip from an hour ago as though
+    /// it were the node's current condition, and no amount of subsequent
+    /// success could take it back down.
+    link_error: Mutex<Option<String>>,
+    /// Why a shard this node took could not be finished.
+    ///
+    /// Deliberately *not* cleared. `jobs_failed` counts it, and this message is
+    /// the only record of what went wrong; a later success does not make the
+    /// failure un-happen the way a later reply makes a lost link un-lost.
+    work_error: Mutex<Option<String>>,
+}
+
+/// A poisoned metrics lock loses the message, never the daemon: these counters
+/// exist to be looked at, and a window that cannot render is worse than one
+/// missing a line.
+fn store_error(slot: &Mutex<Option<String>>, value: Option<String>) {
+    if let Ok(mut slot) = slot.lock() {
+        *slot = value;
+    }
+}
+
+fn read_error(slot: &Mutex<Option<String>>) -> Option<String> {
+    slot.lock().ok().and_then(|slot| slot.clone())
 }
 
 impl DaemonMetrics {
@@ -186,7 +211,7 @@ impl DaemonMetrics {
     /// Record a shard this node took and could not finish.
     pub fn record_failure(&self, error: impl std::fmt::Display) {
         self.jobs_failed.fetch_add(1, Ordering::Relaxed);
-        self.set_last_error(error);
+        store_error(&self.work_error, Some(error.to_string()));
     }
 
     /// Record an inference batch delivered.
@@ -199,22 +224,27 @@ impl DaemonMetrics {
     pub fn record_contact(&self) {
         self.last_contact_unix.store(now_unix(), Ordering::Relaxed);
         self.coordinator_reachable.store(true, Ordering::Relaxed);
+        store_error(&self.link_error, None);
     }
 
     /// Note that the coordinator did not answer, and why.
     pub fn record_unreachable(&self, error: impl std::fmt::Display) {
         self.coordinator_reachable.store(false, Ordering::Relaxed);
-        self.set_last_error(error);
+        store_error(&self.link_error, Some(error.to_string()));
     }
 
-    fn set_last_error(&self, error: impl std::fmt::Display) {
-        if let Ok(mut slot) = self.last_error.lock() {
-            *slot = Some(error.to_string());
-        }
-    }
-
+    /// The one error worth putting in front of a person.
+    ///
+    /// A link that is down *now* wins, because that is the node's condition
+    /// rather than its history. Once it is back, what remains is the last shard
+    /// that failed -- which is history, and stays.
     fn last_error(&self) -> Option<String> {
-        self.last_error.lock().ok().and_then(|slot| slot.clone())
+        if !self.coordinator_reachable.load(Ordering::Relaxed)
+            && let Some(error) = read_error(&self.link_error)
+        {
+            return Some(error);
+        }
+        read_error(&self.work_error)
     }
 
     /// Whether the coordinator is answering, allowing for a quiet stretch.
@@ -911,6 +941,39 @@ mod tests {
 
         note_exchange::<(), &str>(&metrics, &Ok(()));
         assert!(metrics.connected(now_unix()), "recovery is observable");
+    }
+
+    #[test]
+    fn a_link_that_came_back_stops_being_reported_as_broken() {
+        let metrics = DaemonMetrics::default();
+        metrics.record_unreachable("connection refused");
+        assert_eq!(metrics.last_error().as_deref(), Some("connection refused"));
+
+        metrics.record_contact();
+        assert_eq!(
+            metrics.last_error(),
+            None,
+            "one transient blip stuck to the node for the rest of its life, so              the window went on reporting a failure that had already recovered"
+        );
+    }
+
+    #[test]
+    fn a_shard_that_failed_is_still_reported_after_the_link_recovers() {
+        let metrics = DaemonMetrics::default();
+        metrics.record_failure("shard exploded");
+        metrics.record_unreachable("connection refused");
+        assert_eq!(
+            metrics.last_error().as_deref(),
+            Some("connection refused"),
+            "the live condition is the more useful thing to show"
+        );
+
+        metrics.record_contact();
+        assert_eq!(
+            metrics.last_error().as_deref(),
+            Some("shard exploded"),
+            "clearing the link error must not erase why work failed --              jobs_failed counts it and this is the only record of the reason"
+        );
     }
 
     #[test]

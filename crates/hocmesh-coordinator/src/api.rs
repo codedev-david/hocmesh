@@ -247,7 +247,7 @@ async fn plan_ai(
                 cached_chunks,
                 network_latency_ms: scoring_latency_ms(requester.as_ref(), &capabilities),
                 bandwidth_mbps: ranking_bandwidth_mbps(&capabilities),
-                load_fraction: (capabilities.accelerator_load_permille.min(1000) as f64) / 1000.0,
+                load_fraction: (capabilities.load_permille.min(1000) as f64) / 1000.0,
                 recent_failures: 0,
                 online: true,
                 memory_bandwidth_bytes_per_second: capabilities.memory_bandwidth_bytes_per_second,
@@ -291,10 +291,12 @@ fn protocol_gpu_to_device(gpu: &hocmesh_protocol::GpuCapability) -> Option<Devic
         supports_fp16: gpu.supports_fp16,
         supports_bf16: gpu.supports_bf16,
         supports_int8: gpu.supports_int8,
-        // The node already measured this when it registered. It used to stop
-        // here, so the planner -- the one thing in the system that needs to
-        // know how fast a device streams weights -- was the only thing that
-        // could not see it.
+        // Whatever the node measured on the device itself, which today is
+        // nothing: no caller of `benchmark_llama_cpp` exists yet, and the host
+        // memcpy that used to be reported here has been withdrawn because it
+        // was not a device measurement. `None` is the honest answer, and the
+        // planner already knows to fall back to the node's own main-memory
+        // figure when a device has not been measured.
         memory_bandwidth_bytes_per_second: gpu.benchmark_bytes_per_second,
     })
 }
@@ -1451,7 +1453,7 @@ fn ai_context(
             },
             network_latency_ms: scoring_latency_ms(requester.as_ref(), &capabilities),
             bandwidth_mbps: ranking_bandwidth_mbps(&capabilities),
-            load_fraction: capabilities.accelerator_load_permille.min(1000) as f64 / 1000.0,
+            load_fraction: capabilities.load_permille.min(1000) as f64 / 1000.0,
             recent_failures: 0,
             online: true,
             memory_bandwidth_bytes_per_second: capabilities.memory_bandwidth_bytes_per_second,
@@ -3561,7 +3563,7 @@ mod ai_api_tests {
             cached_model_manifests: Vec::new(),
             coordinator_latency_micros: latency,
             model_bandwidth_kbps: 100_000,
-            accelerator_load_permille: 0,
+            load_permille: 0,
             ai_runtime_ready: ai_ready,
             shared_logical_cpus: 4,
             shared_memory_bytes: 8 * 1024 * 1024 * 1024,

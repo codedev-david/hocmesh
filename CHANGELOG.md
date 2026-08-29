@@ -2,6 +2,95 @@
 
 ## 0.5.1
 
+### Lending CPU, memory and GPU means something a node enforces
+
+Until now "sharing" was advertisement. `--cpu-percent`, `--memory-percent` and
+`--gpu-percent` shaped the numbers a node published to the coordinator, and the
+only one of them that changed what the machine actually did was `--cpu-percent`,
+which set a worker count. Nothing checked memory before starting work. Nothing
+checked it after. `--gpu-percent 1` and `--gpu-percent 100` were the same
+setting: the value was read in exactly one place, as `> 0`.
+
+The clearest symptom was llama.cpp. The node passed it `--model`, `--prompt`,
+`--n-predict`, `--temp`, `--seed` and `--gpu-layers`, and no thread count -- so
+llama.cpp did what it does without one and used every core on the machine. An
+operator who lent four of sixteen cores lent four cores to the *scheduler* and
+all sixteen to the work.
+
+`hocmesh_core::resources` makes the lent budget a thing the node holds rather
+than a thing it says. A `ResourcePool` is built from the capabilities as
+advertised -- deliberately from those, not from the detected hardware, so the
+budget enforced and the budget published cannot drift apart. Work takes a
+`Lease` before it starts and gives the room back when the lease drops, including
+when the work panics. Both execution paths claim: a contribution shard for the
+working set `hocmesh_core::compute::declared_memory_bytes` derives exactly from
+its spec, and an inference assignment for the model size its manifest already
+states and validates.
+
+`--gpu-percent` is now a share of VRAM. A quarter of a 16 GiB card is 4 GiB, and
+1% is no longer indistinguishable from 100%.
+
+A claim larger than the entire budget is refused rather than queued. Waiting for
+capacity that can never arrive is a deadlock wearing the clothes of a slow node,
+and it is the same mistake as fail-closed bandwidth ranking, which would have
+made a node's first measurement depend on work it could only get by already
+having one. A refused contribution shard is left to expire and be reassigned --
+there is no channel to decline one -- and the worker waits out its idle delay
+first, because the coordinator still has that shard leased here and would hand
+back the same one on the next poll.
+
+### An error the node recovered from no longer sticks to it
+
+The daemon kept exactly one `last_error`, every failure wrote to it, and nothing
+ever cleared it. One refused connection during startup -- the kind a loaded
+machine produces and recovers from a second later -- left the desktop window
+reporting that error for the rest of the daemon's life, with no sequence of
+successes able to take it back down.
+
+There are two kinds of error here and they have opposite lifetimes. A link that
+is down is a *condition*: it ends, and the next reply ends it. A shard that
+failed is a *fact*: `jobs_failed` counts it, and this message is the only record
+of why. They now live in separate slots. A reply from the coordinator clears the
+link error; nothing clears the work error. What a person is shown is the link
+error while the link is actually down, and otherwise the last failed shard.
+
+### A node now reports how busy it is
+
+`accelerator_load_permille` was written once, in a struct initialiser, with the
+constant `0`. Nothing else ever wrote it. It was read twice, on both production
+ranking paths, and divided into a `load_fraction` worth a thousand points of
+placement score -- so the term meant to steer work away from a saturated machine
+steered nothing, and the busiest node in the mesh scored exactly as invitingly
+as an idle one.
+
+It is now `load_permille`, it is written from the resource pool on every
+heartbeat, and it is the fullest of the three budgets rather than their average:
+a node whose memory is exhausted is full, whatever its spare cores suggest. The
+rename is deliberate. The value is node load, and a field called *accelerator*
+load holding it would tell the next reader their card was saturated when their
+CPU workers were.
+
+### A host memory copy is no longer reported as a device's throughput
+
+`hocmesh_gpu::benchmark_memory` copies one host `Vec<u8>` into another. It never
+touches the accelerator; it only stamps the device's identity onto the result,
+and it tags itself `host_memory_copy_v1`. Every consumer dropped the tag.
+
+That figure was filled into `GpuCapability::benchmark_bytes_per_second`, sent to
+the coordinator, read there as "how fast a device streams weights", preferred
+over the node's own honest main-memory measurement because a device figure
+should beat a node figure -- and then used by `layer_spans` to decide how many
+transformer layers each machine in a pipeline should hold. Layers were being
+apportioned in proportion to host memcpy speed, under a name that said device
+bandwidth, and every dashboard agreed.
+
+Devices now report no benchmark until something measures one, which makes the
+planner fall back to `memory_bandwidth_bytes_per_second` -- a real read of main
+memory, and on a build whose stages execute on the CPU, the number that actually
+governs how fast weights stream. `benchmark_llama_cpp` is the real device
+benchmark; it exists, it has no callers yet, and its result belongs there when
+it does. `hocmesh gpu-info` still prints the host figure, now labelled as one.
+
 ### The file decides whether it can run, not the name in its header
 
 The engine gated on a list of four architecture strings, and the list's own doc

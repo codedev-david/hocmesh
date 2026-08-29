@@ -82,6 +82,7 @@ pub struct LlamaCppBackend {
     executable: PathBuf,
     device: DeviceCapability,
     gpu_layers: u32,
+    threads: usize,
 }
 
 impl LlamaCppBackend {
@@ -96,11 +97,29 @@ impl LlamaCppBackend {
             executable,
             device,
             gpu_layers,
+            threads: 0,
         })
     }
 
+    /// Confine this process to `threads` cores.
+    ///
+    /// Without it llama.cpp uses every core on the machine. That is the right
+    /// default for an operator running inference on their own computer, and the
+    /// wrong one for other people's work on a machine whose operator lent a
+    /// share of it: `--cpu-percent 25` produced a node that advertised four of
+    /// sixteen cores and then used all sixteen, so the setting an operator
+    /// reaches for to stay usable while contributing did nothing at all.
+    ///
+    /// Zero leaves llama.cpp to decide, which is what every caller got before
+    /// this existed.
+    #[must_use]
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+
     fn arguments(&self, model: &Path, request: &InferenceRequest) -> Vec<String> {
-        vec![
+        let mut arguments = vec![
             "--model".into(),
             model.display().to_string(),
             "--prompt".into(),
@@ -114,7 +133,12 @@ impl LlamaCppBackend {
             "--gpu-layers".into(),
             self.gpu_layers.to_string(),
             "--no-display-prompt".into(),
-        ]
+        ];
+        if self.threads > 0 {
+            arguments.push("--threads".into());
+            arguments.push(self.threads.to_string());
+        }
+        arguments
     }
 }
 
@@ -618,6 +642,7 @@ mod tests {
                 memory_bandwidth_bytes_per_second: None,
             },
             gpu_layers: 12,
+            threads: 0,
         };
         let args = backend.arguments(
             Path::new("model.gguf"),
@@ -645,6 +670,58 @@ mod tests {
                 "12",
                 "--no-display-prompt"
             ]
+        );
+    }
+
+    #[test]
+    fn the_memory_benchmark_says_it_measured_the_host() {
+        // This function copies one host Vec into another. The tag is the only
+        // thing standing between that and a caller filing the result under a
+        // device's throughput, which is what used to happen -- so if the tag
+        // ever stops saying "host", the callers need revisiting, not this test.
+        let report = benchmark_memory(&device(BackendKind::Cuda), 64 * 1024, 2);
+        assert_eq!(report.benchmark, "host_memory_copy_v1");
+        assert!(
+            report.benchmark.contains("host"),
+            "a benchmark that never touches the device stopped saying so"
+        );
+    }
+
+    #[test]
+    fn a_lent_share_of_the_cores_is_the_share_llama_cpp_gets() {
+        let device = device(BackendKind::Cpu);
+        let request = InferenceRequest {
+            prompt: "hello".into(),
+            max_tokens: 8,
+            temperature_milli: 250,
+            seed: 7,
+        };
+        let unbounded = LlamaCppBackend {
+            executable: PathBuf::from("llama-cli"),
+            device: device.clone(),
+            gpu_layers: 0,
+            threads: 0,
+        };
+        assert!(
+            !unbounded
+                .arguments(Path::new("model.gguf"), &request)
+                .iter()
+                .any(|argument| argument == "--threads"),
+            "an operator running inference on their own machine had it capped, \
+             which is not what they asked for"
+        );
+
+        let shared = unbounded.with_threads(4);
+        let args = shared.arguments(Path::new("model.gguf"), &request);
+        let threads = args
+            .iter()
+            .position(|argument| argument == "--threads")
+            .map(|at| args[at + 1].clone());
+        assert_eq!(
+            threads,
+            Some("4".to_string()),
+            "a node lending four of its sixteen cores handed llama.cpp all \
+             sixteen, so --cpu-percent changed only what the node advertised"
         );
     }
 

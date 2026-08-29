@@ -713,7 +713,7 @@ mod tests {
             cached_model_manifests: Vec::new(),
             coordinator_latency_micros: latency_micros,
             model_bandwidth_kbps: 100_000,
-            accelerator_load_permille: 0,
+            load_permille: 0,
             ai_runtime_ready: false,
             shared_logical_cpus: 4,
             shared_memory_bytes: 8 << 30,

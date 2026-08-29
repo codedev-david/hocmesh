@@ -92,8 +92,23 @@ pub struct NodeCapabilities {
     pub coordinator_latency_micros: u64,
     #[serde(default)]
     pub model_bandwidth_kbps: u64,
+    /// How full this node's lent budgets are, as the fullest of them.
+    ///
+    /// The fullest rather than the average: a node with every lent worker busy
+    /// is full whatever its spare memory says, and sending it more work on the
+    /// strength of that memory only lengthens a queue.
+    ///
+    /// This used to be called `accelerator_load_permille` and was written once,
+    /// with the constant zero, while a live placement term divided by it. The
+    /// name was the smaller of the two problems -- a node-wide figure reported
+    /// as accelerator load would have had an operator hunting a busy GPU that
+    /// was idle -- but a name nothing could ever set was how it went unnoticed.
+    ///
+    /// A peer too old to send it defaults to zero, which reads as idle. That is
+    /// the behaviour every node had until now, so an old peer is placed no
+    /// worse than it is today.
     #[serde(default)]
-    pub accelerator_load_permille: u16,
+    pub load_permille: u16,
     #[serde(default)]
     pub ai_runtime_ready: bool,
     /// Workers this node will actually run, after applying operator limits.

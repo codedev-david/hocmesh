@@ -860,13 +860,21 @@ stored at: {}",
             for device in devices {
                 let report = hocmesh_gpu::benchmark_memory(&device, 32 * 1024 * 1024, 16);
                 println!(
-                    "{}: {} via {:?}, memory={:?} MiB, throughput={:.2} GiB/s, p95={:.3} ms",
+                    "{}: {} via {:?}, memory={:?} MiB",
                     device.stable_id,
                     device.name,
                     device.backend,
                     device.memory_bytes.map(|bytes| bytes / 1024 / 1024),
+                );
+                // Named for what it measures. This copies host memory to host
+                // memory; it says nothing about the card above it, and reading
+                // it as device throughput is exactly the mistake this line used
+                // to invite by printing it as "throughput".
+                println!(
+                    "    host memory copy: {:.2} GiB/s, p95={:.3} ms ({})",
                     report.throughput_units_per_second / 1024.0 / 1024.0 / 1024.0,
-                    report.latency_p95_ms
+                    report.latency_p95_ms,
+                    report.benchmark
                 );
             }
         }

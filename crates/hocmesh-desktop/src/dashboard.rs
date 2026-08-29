@@ -356,7 +356,7 @@ mod tests {
             cached_model_manifests: Vec::new(),
             coordinator_latency_micros: 0,
             model_bandwidth_kbps: 0,
-            accelerator_load_permille: 0,
+            load_permille: 0,
             ai_runtime_ready: false,
             shared_logical_cpus: 8,
             shared_memory_bytes: 16 * 1024 * 1024 * 1024,

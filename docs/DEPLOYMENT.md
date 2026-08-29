@@ -275,10 +275,37 @@ of model it will be offered is bounded by `--memory-percent`, because the
 advertised device reports the lent slice rather than the whole machine.
 
 On a GPU box, `--gpu-percent` still governs the accelerator: at `0` the GPU is
-not advertised at all, and `--ai on` then offers CPU inference instead.
+not advertised at all, and `--ai on` then offers CPU inference instead. Above
+`0` it is a share of the card's memory -- `--gpu-percent 25` on a 16 GiB card
+lends 4 GiB, and an assignment needing more than that is refused rather than
+started and left to fail on the device.
 
 `--ai-runtime` overrides which executable is used. `--no-ai` declines AI work
 for one run without changing the stored limits.
+
+### What the three percentages actually do
+
+All three are enforced by the node, not merely published to the coordinator:
+
+| Flag | What is held back |
+| --- | --- |
+| `--cpu-percent` | The worker count, and the `--threads` the node hands to llama.cpp. Work gets the lent share of the cores, not the machine's. |
+| `--memory-percent` | A budget every unit of work claims before it starts: a contribution shard for the working set its spec implies, an inference assignment for the size its model manifest states. Work that would exceed what is left waits; work larger than the whole budget is refused outright, because waiting for room that was never lent does not end. |
+| `--gpu-percent` | A share of device memory, claimed by the layers an assignment offloads. |
+
+Two limits worth stating plainly. This is admission control over hocMESH's own
+work, not a sandbox: it bounds what the node agrees to start and accounts for
+what that work declares it will allocate. It does not cap the resident size of
+the llama.cpp process, and it does not stop anything else on the machine from
+using memory. And because no model importer records a layer count yet, the
+device budget under-counts partially-offloaded work -- deliberately, since the
+alternative would permanently refuse a model that was only ever going to put a
+fraction of itself on the card.
+
+A node reports how full those budgets are on every heartbeat, and the
+coordinator steers work away from a busy machine. That figure is the *fullest*
+of the three, not their average: a node whose lent memory is exhausted is full
+whatever its spare cores suggest.
 
 ---
 

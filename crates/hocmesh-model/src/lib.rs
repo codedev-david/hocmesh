@@ -42,7 +42,23 @@ pub struct ModelManifest {
     pub metadata: std::collections::BTreeMap<String, String>,
 }
 
+/// Metadata key holding the number of transformer blocks in the model.
+///
+/// Optional, because a manifest can be written from a file listing alone. It is
+/// the one number needed to turn `--gpu-layers N` into a quantity of bytes, so
+/// where it is absent that conversion cannot be done and must not be guessed.
+pub const LAYER_COUNT: &str = "layer_count";
+
 impl ModelManifest {
+    /// Transformer blocks in this model, where the manifest records them.
+    ///
+    /// `None` means the manifest was written without it, not that the model has
+    /// no layers.
+    #[must_use]
+    pub fn layer_count(&self) -> Option<u32> {
+        self.metadata.get(LAYER_COUNT)?.trim().parse().ok()
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(self.schema_version == 1, "unsupported manifest schema");
         ensure!(!self.model_id.trim().is_empty(), "model_id is empty");
@@ -519,5 +535,35 @@ mod tests {
         assert!(store.import_reader(&b""[..], 1).is_err());
         assert!(store.read("../not-a-digest").is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_without_a_layer_count_says_so_rather_than_reporting_none() {
+        let mut manifest = ModelManifest {
+            schema_version: 1,
+            model_id: "m".into(),
+            revision: "r".into(),
+            format: ModelFormat::Gguf,
+            architecture: "llama".into(),
+            parameter_count: None,
+            tensor_dtype: None,
+            total_size_bytes: 0,
+            chunks: Vec::new(),
+            metadata: Default::default(),
+        };
+        assert_eq!(manifest.layer_count(), None);
+        manifest
+            .metadata
+            .insert(LAYER_COUNT.into(), " 60 ".into());
+        assert_eq!(manifest.layer_count(), Some(60));
+        manifest
+            .metadata
+            .insert(LAYER_COUNT.into(), "many".into());
+        assert_eq!(
+            manifest.layer_count(),
+            None,
+            "an unparseable layer count was read as a number, which would size \
+             a memory budget from nonsense"
+        );
     }
 }

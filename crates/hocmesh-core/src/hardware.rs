@@ -1,4 +1,3 @@
-use hocmesh_gpu::benchmark_memory;
 use hocmesh_protocol::{GpuCapability, NodeCapabilities, PROTOCOL_VERSION};
 use std::time::Instant;
 use sysinfo::System;
@@ -25,7 +24,25 @@ pub fn detect_capabilities_with_models(
     let gpus = hocmesh_gpu::discover_devices()
         .into_iter()
         .map(|device| {
-            let benchmark = run_benchmark.then(|| benchmark_memory(&device, 8 * 1024 * 1024, 8));
+            // Deliberately not benchmarked here. The only device benchmark this
+            // build has -- `hocmesh_gpu::benchmark_memory` -- copies one host
+            // `Vec<u8>` into another and stamps the device's identity on the
+            // result; it never touches the card. Reporting it as the device's
+            // throughput sent a host figure to the planner, where it outranked
+            // the node's own honest measurement and was used to decide how many
+            // transformer layers each machine in a pipeline should hold. A
+            // measurement that does not measure the thing it is named after is
+            // worse than no measurement, because the code downstream cannot
+            // tell the difference and every dashboard agrees with it.
+            //
+            // Left as `None` so the planner falls back to
+            // `NodeCapabilities::memory_bandwidth_bytes_per_second`, which is a
+            // real read of main memory -- and, on a build whose stages execute
+            // on the CPU, the number that actually governs how fast weights
+            // stream. `hocmesh_gpu::benchmark_llama_cpp` is the real device
+            // benchmark; when something calls it, its result belongs here.
+            let _ = run_benchmark;
+            let benchmark: Option<hocmesh_gpu::BenchmarkReport> = None;
             GpuCapability {
                 stable_id: device.stable_id,
                 vendor: device.vendor,
@@ -66,7 +83,7 @@ pub fn detect_capabilities_with_models(
         // every node in the hocmesh report the same uplink, so any policy that
         // gated on it was gating on nothing while looking like it worked.
         model_bandwidth_kbps: 0,
-        accelerator_load_permille: 0,
+        load_permille: 0,
         ai_runtime_ready: false,
         // Fail safe: until an operator's limits are applied, advertise only the
         // conservative default share rather than the whole machine.
@@ -256,6 +273,23 @@ mod tests {
     }
 
     /// A machine with known hardware, before any operator limit is applied.
+    #[test]
+    fn a_device_is_not_credited_with_a_measurement_of_the_host() {
+        // Vacuous on a machine with no accelerator, which is the common case
+        // and is fine: the claim being pinned is that running the benchmarks
+        // never puts a host figure on a device, and the only way that regresses
+        // is by someone re-attaching `benchmark_memory` here.
+        let caps = detect_capabilities(true);
+        for gpu in &caps.gpus {
+            assert_eq!(
+                gpu.benchmark_bytes_per_second, None,
+                "{} reported a throughput nothing measured on it; the planner \
+                 sizes pipeline stages from this number",
+                gpu.stable_id
+            );
+        }
+    }
+
     fn a_machine() -> NodeCapabilities {
         let mut caps = detect_capabilities(false);
         caps.logical_cpus = 16;

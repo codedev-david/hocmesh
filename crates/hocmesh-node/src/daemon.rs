@@ -3,8 +3,9 @@ use crate::control::{ControlSeed, ControlServer, DaemonMetrics, note_exchange};
 use anyhow::{Context, Result, ensure};
 use hocmesh_ai::{InferenceAssignment, PromptOutput};
 use hocmesh_core::bandwidth::UplinkMeter;
-use hocmesh_core::compute::execute_work;
+use hocmesh_core::compute::{declared_memory_bytes, execute_work};
 use hocmesh_core::proximity::Vivaldi;
+use hocmesh_core::resources::{Claim, Lent, ResourcePool};
 use hocmesh_gpu::{InferenceBackend, InferenceRequest, LlamaCppBackend};
 use hocmesh_model::{ChunkStore, ModelRegistry};
 use hocmesh_protocol::NodeCapabilities;
@@ -105,6 +106,19 @@ async fn run_until<S: std::future::Future<Output = ()>>(
     );
     println!("Contribution workers: {}", workers);
 
+    // Built from the capabilities as advertised, so the budget enforced here
+    // and the budget published to the coordinator are the same numbers. A pool
+    // derived from the detected hardware instead would let the node accept work
+    // up to what the machine can do rather than up to what its operator lent.
+    let pool = ResourcePool::new(Lent::from_capabilities(&capabilities));
+    let lent = pool.lent();
+    println!(
+        "Lending {} worker(s), {} MiB of memory and {} MiB of GPU memory",
+        lent.logical_cpus,
+        lent.memory_bytes >> 20,
+        lent.device_memory_bytes >> 20
+    );
+
     let capabilities = Arc::new(RwLock::new(capabilities));
     let metrics = DaemonMetrics::new();
     // Registration succeeded, so the coordinator was reachable a moment ago.
@@ -121,6 +135,7 @@ async fn run_until<S: std::future::Future<Output = ()>>(
     let heartbeat_caps = capabilities.clone();
     let heartbeat_metrics = metrics.clone();
     let heartbeat_uplink = Arc::clone(&uplink);
+    let heartbeat_pool = pool.clone();
     let heartbeat = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
@@ -131,6 +146,11 @@ async fn run_until<S: std::future::Future<Output = ()>>(
             // the coordinator and the local dashboard read one figure rather
             // than two that drift apart.
             let measured = heartbeat_uplink.kbps().unwrap_or(0);
+            // Placement divides by this. It was a constant zero, so the term
+            // that was meant to steer work away from a busy node steered
+            // nothing, and the busiest machine in the mesh looked as inviting
+            // as an idle one.
+            let load = heartbeat_pool.load_permille();
             let snapshot = {
                 let Ok(mut caps) = heartbeat_caps.write() else {
                     tracing::error!("capability lock poisoned; stopping heartbeat");
@@ -138,6 +158,9 @@ async fn run_until<S: std::future::Future<Output = ()>>(
                 };
                 if caps.model_bandwidth_kbps != measured {
                     caps.model_bandwidth_kbps = measured;
+                }
+                if caps.load_permille != load {
+                    caps.load_permille = load;
                 }
                 caps.clone()
             };
@@ -205,8 +228,16 @@ async fn run_until<S: std::future::Future<Output = ()>>(
     for worker_id in 0..workers.max(1) {
         let worker_client = client.clone();
         let worker_metrics = metrics.clone();
+        let worker_pool = pool.clone();
         workers_set.spawn(async move {
-            worker_loop(worker_client, worker_id, poll_ms.max(100), worker_metrics).await
+            worker_loop(
+                worker_client,
+                worker_id,
+                poll_ms.max(100),
+                worker_metrics,
+                worker_pool,
+            )
+            .await
         });
     }
 
@@ -225,8 +256,9 @@ async fn run_until<S: std::future::Future<Output = ()>>(
     if let Some(config) = ai {
         let ai_client = client.clone();
         let ai_metrics = metrics.clone();
+        let ai_pool = pool.clone();
         workers_set.spawn(async move {
-            ai_worker_loop(ai_client, config, poll_ms.max(100), ai_metrics).await
+            ai_worker_loop(ai_client, config, poll_ms.max(100), ai_metrics, ai_pool).await
         });
     }
 
@@ -273,6 +305,7 @@ async fn ai_worker_loop(
     config: AiWorkerConfig,
     poll_ms: u64,
     metrics: Arc<DaemonMetrics>,
+    pool: ResourcePool,
 ) -> Result<()> {
     let idle_delay = Duration::from_millis(poll_ms);
     loop {
@@ -299,7 +332,7 @@ async fn ai_worker_loop(
             tracing::warn!(%assignment_id, "assignment cannot be priced; skipping");
             continue;
         };
-        match execute_inference_assignment(&config, assignment).await {
+        match execute_inference_assignment(&config, assignment, pool.clone()).await {
             Ok(outputs) => match client
                 .report_inference(
                     assignment_id.clone(),
@@ -337,6 +370,7 @@ async fn ai_worker_loop(
 async fn execute_inference_assignment(
     config: &AiWorkerConfig,
     assignment: InferenceAssignment,
+    pool: ResourcePool,
 ) -> Result<Vec<PromptOutput>> {
     assignment.manifest.validate()?;
     let store = ChunkStore::open(config.home.join("model-cache"))?;
@@ -379,6 +413,47 @@ async fn execute_inference_assignment(
     // what made a CPU-only node accept inference and then fail every batch.
     let device = hocmesh_gpu::resolve_device(&assignment.device_id)
         .context("assigned accelerator is no longer available")?;
+
+    // The manifest states the model's size exactly, which is the whole reason
+    // this is the right place to ask: llama.cpp maps the file, so the weights
+    // are the working set and no estimate is involved. The claim is taken
+    // before the first prompt and held across all of them, because the model
+    // stays resident between them -- claiming per prompt would count the same
+    // bytes once and then release them while they were still occupied.
+    //
+    // Layers pushed onto the GPU come out of the device budget. Layers left on
+    // the host stay in the host budget, which is why the claim splits rather
+    // than counting the file twice or, worse, once.
+    let weights = assignment.manifest.total_size_bytes;
+    let gpu_layers = hocmesh_gpu::gpu_layers_for(&device, config.gpu_layers);
+    let offloaded = offloaded_bytes(weights, gpu_layers, assignment.manifest.layer_count());
+    let lease = {
+        let pool = pool.clone();
+        // The host claim is the whole file whether or not layers are offloaded:
+        // llama.cpp maps it, so those bytes are addressable on the host either
+        // way. The device claim is the part that is additionally resident on
+        // the card.
+        let claim = Claim::host(1, weights).with_device(offloaded);
+        tokio::task::spawn_blocking(move || pool.claim(claim))
+            .await?
+            .map_err(|too_large| {
+                anyhow::anyhow!("this model does not fit inside this node's limits: {too_large}")
+            })?
+    };
+    // Other people's work gets the share the operator lent, not the machine --
+    // and specifically the part of that share nobody is currently using.
+    //
+    // Sizing this from the whole lent share instead would double-count: the
+    // contribution workers hold permits for the cores they are on, and handing
+    // llama.cpp the full share on top of that spends the operator's four cores
+    // twice. Sizing it from what is free keeps the two paths adding up to what
+    // was lent, and it adapts -- an idle node gives inference everything, a busy
+    // one gives it what is spare.
+    //
+    // Floored at one because zero threads is not a smaller share, it is a
+    // process that does not run.
+    let threads = inference_threads(pool.lent().logical_cpus, pool.usage().logical_cpus);
+
     let mut outputs = Vec::with_capacity(assignment.prompts.len());
     for (prompt_index, prompt) in assignment.prompts {
         let runtime = config.runtime.clone();
@@ -387,19 +462,18 @@ async fn execute_inference_assignment(
         let max_tokens = assignment.max_tokens;
         let temperature_milli = assignment.temperature_milli;
         let seed = assignment.seed.wrapping_add(prompt_index as u64);
-        // An operator who set --gpu-layers for their GPU must not have that
-        // number applied to a CPU assignment, which cannot offload anything.
-        let gpu_layers = hocmesh_gpu::gpu_layers_for(&device, config.gpu_layers);
         let output = tokio::task::spawn_blocking(move || {
-            LlamaCppBackend::new(runtime, device, gpu_layers)?.infer(
+            LlamaCppBackend::new(runtime, device, gpu_layers)?
+                .with_threads(threads)
+                .infer(
                 &model,
-                &InferenceRequest {
-                    prompt,
-                    max_tokens,
-                    temperature_milli,
-                    seed,
-                },
-            )
+                    &InferenceRequest {
+                        prompt,
+                        max_tokens,
+                        temperature_milli,
+                        seed,
+                    },
+                )
         })
         .await??;
         outputs.push(PromptOutput {
@@ -409,7 +483,55 @@ async fn execute_inference_assignment(
             duration_ms: output.elapsed_ms,
         });
     }
+    drop(lease);
     Ok(outputs)
+}
+
+/// Threads to hand llama.cpp for one assignment.
+///
+/// The share the operator lent, less what the contribution workers are holding
+/// right now. Handing over the whole lent share regardless would double-count
+/// it: those workers hold permits for the cores they are running on, so a node
+/// lending four cores would spend them twice and the operator would get eight
+/// cores' worth of load from a four-core promise.
+///
+/// `used` includes this assignment's own permit, which *is* the inference
+/// process, so it is discounted rather than charged -- without that, an idle
+/// node lending four cores would run llama.cpp on three.
+///
+/// Floored at one, because zero threads is not a smaller share; it is a process
+/// that does not run.
+fn inference_threads(lent: usize, used: usize) -> usize {
+    lent.saturating_sub(used.saturating_sub(1)).max(1)
+}
+
+/// How much of a model's weights `gpu_layers` puts on the device.
+///
+/// Proportional to the layer count, because layers are the granularity
+/// llama.cpp offloads at.
+///
+/// A limit stated rather than papered over: no importer records
+/// [`hocmesh_model::LAYER_COUNT`] yet, so in practice this returns zero today
+/// and the device budget is under-counted for offloaded work. The alternative
+/// -- charging the whole file to the card whenever any offload is asked for --
+/// would refuse a 30 GiB model on a 24 GiB card that was only ever going to
+/// hold ten of its sixty layers, and [`TooLarge`] refusals are permanent. An
+/// under-count admits work that should have been queued; an over-count refuses
+/// work that would have run. Between a budget that is slightly too generous and
+/// one that permanently rejects valid work, the generous one is recoverable.
+///
+/// [`TooLarge`]: hocmesh_core::resources::TooLarge
+fn offloaded_bytes(weights: u64, gpu_layers: u32, layers: Option<u32>) -> u64 {
+    if gpu_layers == 0 {
+        return 0;
+    }
+    let Some(layers) = layers.filter(|layers| *layers > 0) else {
+        return 0;
+    };
+    if gpu_layers >= layers {
+        return weights;
+    }
+    (u128::from(weights) * u128::from(gpu_layers) / u128::from(layers)) as u64
 }
 
 async fn worker_loop(
@@ -417,6 +539,7 @@ async fn worker_loop(
     worker_id: usize,
     poll_ms: u64,
     metrics: Arc<DaemonMetrics>,
+    pool: ResourcePool,
 ) -> Result<()> {
     let idle_delay = Duration::from_millis(poll_ms);
     loop {
@@ -449,7 +572,44 @@ async fn worker_loop(
         );
 
         let work = assignment.work.clone();
+        // Claimed before the work starts and released when the lease drops at
+        // the end of this iteration. One worker is one lent core, which the
+        // worker count already bounds; the memory is what that bound never
+        // covered -- N workers each holding a shard's working set is N times a
+        // number nothing was checking against what the operator lent.
+        let claim = Claim::host(1, declared_memory_bytes(&work));
+        let lease = {
+            let pool = pool.clone();
+            match tokio::task::spawn_blocking(move || pool.claim(claim)).await? {
+                Ok(lease) => lease,
+                Err(too_large) => {
+                    // Not a transient shortage: this shard will never fit here,
+                    // so waiting for capacity would be waiting forever. There
+                    // is no channel to decline a contribution assignment, so it
+                    // is left to expire and be reassigned -- the same path a
+                    // node that stops answering already takes. Logged loudly
+                    // because an operator whose limits are too tight for the
+                    // work on offer needs to be told, not left to wonder why
+                    // this node never earns anything.
+                    tracing::error!(
+                        worker_id = worker_id,
+                        assignment_id = %assignment.assignment_id,
+                        reason = %too_large,
+                        "assignment does not fit inside this node's limits; \
+                         leaving it to be reassigned"
+                    );
+                    // Waiting before asking again, because the coordinator
+                    // still has this assignment leased to this node and will
+                    // hand back the same one until it expires. Without the
+                    // pause that is a hot loop against the coordinator that
+                    // writes an error line per turn.
+                    tokio::time::sleep(idle_delay).await;
+                    continue;
+                }
+            }
+        };
         let result = tokio::task::spawn_blocking(move || execute_work(&work)).await?;
+        drop(lease);
 
         match client.report_result(&assignment, &result).await {
             Ok(settlement) => {
@@ -1121,5 +1281,56 @@ mod proximity_tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         false
+    }
+
+    #[test]
+    fn an_idle_node_gives_inference_every_core_it_lent() {
+        // `used` is 1: the inference assignment's own permit and nothing else.
+        assert_eq!(inference_threads(4, 1), 4);
+    }
+
+    #[test]
+    fn a_busy_node_gives_inference_what_is_left_rather_than_the_whole_share() {
+        // Two contribution workers running, plus this assignment.
+        assert_eq!(
+            inference_threads(4, 3),
+            2,
+            "llama.cpp was handed the full lent share while other work held \
+             cores, so a four-core promise produced six cores of load"
+        );
+    }
+
+    #[test]
+    fn a_fully_committed_node_still_runs_the_work_it_accepted() {
+        // Zero threads is not a smaller share, it is a process that does not
+        // run -- and the assignment has already been accepted by this point.
+        assert_eq!(inference_threads(4, 9), 1);
+        assert_eq!(inference_threads(0, 0), 1);
+    }
+
+    #[test]
+    fn offloading_half_the_layers_charges_half_the_weights_to_the_card() {
+        assert_eq!(offloaded_bytes(1000, 30, Some(60)), 500);
+    }
+
+    #[test]
+    fn offloading_every_layer_charges_the_whole_model_to_the_card() {
+        assert_eq!(offloaded_bytes(1000, 60, Some(60)), 1000);
+        // llama.cpp accepts a number past the end and offloads everything.
+        assert_eq!(offloaded_bytes(1000, 999, Some(60)), 1000);
+    }
+
+    #[test]
+    fn a_cpu_assignment_charges_nothing_to_a_card() {
+        assert_eq!(offloaded_bytes(1000, 0, Some(60)), 0);
+    }
+
+    #[test]
+    fn an_unknown_layer_count_is_not_guessed_at() {
+        // Charging the whole file to the card here is what would refuse a model
+        // that was only ever going to put ten of its sixty layers there -- and
+        // that refusal is permanent, where an under-count is not.
+        assert_eq!(offloaded_bytes(1000, 20, None), 0);
+        assert_eq!(offloaded_bytes(1000, 20, Some(0)), 0);
     }
 }

@@ -19,6 +19,40 @@ pub const REFERENCE_OPS_PER_MCU: u64 = 8_192;
 /// machine instead of hanging it forever.
 pub const COLLATZ_STEP_CEILING: u32 = 100_000;
 
+/// How much memory this shard will occupy while it runs.
+///
+/// Exact rather than estimated, which is the only reason it is worth asking
+/// for: the allow-list is three workloads whose working sets are decided
+/// entirely by the spec, so the number below is what the run allocates, not a
+/// guess with a safety factor bolted on. A workload whose size depended on its
+/// input would not belong in an admission check that runs before the input is
+/// read.
+///
+/// The scalar workloads carry a fixed cost -- sixty-four bucket counters and
+/// the trajectory state around them -- which rounds to nothing beside a shard
+/// of matrix rows but is not zero, and a claim of zero would say this work
+/// occupies no memory at all.
+#[must_use]
+pub fn declared_memory_bytes(work: &WorkSpec) -> u64 {
+    const SCALAR_WORKING_SET: u64 = 64 * 1024;
+    const ELEMENT: u64 = size_of::<u32>() as u64;
+    match work {
+        WorkSpec::PrimeCount { .. } | WorkSpec::CollatzPeak { .. } => SCALAR_WORKING_SET,
+        WorkSpec::MatrixMultiply {
+            dim,
+            row_start,
+            row_end,
+            ..
+        } => {
+            // `multiply_rows` hoists the whole of B into memory and writes one
+            // element per output cell; A is generated as it goes.
+            let dim = u64::from(*dim);
+            let rows = u64::from(row_end.saturating_sub(*row_start));
+            SCALAR_WORKING_SET + dim * dim * ELEMENT + rows * dim * ELEMENT
+        }
+    }
+}
+
 /// Execute one declarative hocMESH workload.
 ///
 /// A small allow-list, never arbitrary binaries: the code that runs on a
@@ -492,5 +526,45 @@ mod tests {
             cursor = *end;
         }
         assert_eq!(cursor, 305);
+    }
+
+    #[test]
+    fn a_shard_declares_what_it_will_actually_allocate() {
+        // multiply_rows holds all of B plus the rows it writes.
+        let work = WorkSpec::MatrixMultiply {
+            seed_a: 1,
+            seed_b: 2,
+            dim: 512,
+            row_start: 0,
+            row_end: 64,
+        };
+        let b = 512u64 * 512 * 4;
+        let out = 64u64 * 512 * 4;
+        assert_eq!(declared_memory_bytes(&work), 64 * 1024 + b + out);
+    }
+
+    #[test]
+    fn a_bigger_shard_of_the_same_matrix_declares_more() {
+        let of = |row_end| {
+            declared_memory_bytes(&WorkSpec::MatrixMultiply {
+                seed_a: 1,
+                seed_b: 2,
+                dim: 256,
+                row_start: 0,
+                row_end,
+            })
+        };
+        assert!(
+            of(128) > of(8),
+            "every shard of a matrix declared the same size, so an admission \
+             check on it would admit sixteen times the work it counted"
+        );
+    }
+
+    #[test]
+    fn work_that_allocates_little_still_declares_something() {
+        // A claim of zero says this work occupies no memory, which would let an
+        // unbounded number of them start at once.
+        assert!(declared_memory_bytes(&WorkSpec::PrimeCount { start: 0, end: 1 }) > 0);
     }
 }
